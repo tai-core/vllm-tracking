@@ -169,6 +169,8 @@ _fp8_einsum_impl: Callable[..., Any] | None = None
 _grouped_impl: Callable[..., Any] | None = None
 _grouped_masked_impl: Callable[..., Any] | None = None
 _grouped_fp4_impl: Callable[..., Any] | None = None
+_fp8_mqa_logits_impl: Callable[..., Any] | None = None
+_fp8_paged_mqa_logits_impl: Callable[..., Any] | None = None
 _fp8_fp4_mqa_logits_impl: Callable[..., Any] | None = None
 _fp8_fp4_paged_mqa_logits_impl: Callable[..., Any] | None = None
 _get_paged_mqa_logits_metadata_impl: Callable[..., Any] | None = None
@@ -249,6 +251,7 @@ def _lazy_init() -> None:
     global _cublaslt_gemm_nt_impl
     global _fp8_gemm_nt_impl, _fp8_einsum_impl
     global _grouped_impl, _grouped_masked_impl, _grouped_fp4_impl
+    global _fp8_mqa_logits_impl, _fp8_paged_mqa_logits_impl
     global _fp8_fp4_mqa_logits_impl, _fp8_fp4_paged_mqa_logits_impl
     global _get_paged_mqa_logits_metadata_impl
     global _fp8_fp4_sparse_mqa_logits_impl, _fp8_fp4_paged_sparse_mqa_logits_impl
@@ -271,6 +274,8 @@ def _lazy_init() -> None:
         or _grouped_impl is not None
         or _grouped_masked_impl is not None
         or _grouped_fp4_impl is not None
+        or _fp8_mqa_logits_impl is not None
+        or _fp8_paged_mqa_logits_impl is not None
         or _fp8_fp4_mqa_logits_impl is not None
         or _fp8_fp4_paged_mqa_logits_impl is not None
         or _get_paged_mqa_logits_metadata_impl is not None
@@ -312,6 +317,11 @@ def _lazy_init() -> None:
         _dg, "m_grouped_fp8_gemm_nt_masked", None
     ) or getattr(_dg, "fp8_m_grouped_gemm_nt_masked", None)
     _grouped_fp4_impl = getattr(_dg, "m_grouped_fp8_fp4_gemm_nt_contiguous", None)
+    # MUSA DeepGEMM 0.2.6 exposes the FP8-only names. Keep them as a strict
+    # compatibility path for callers whose q-scale is None; never use them
+    # for the newer packed FP4 query path.
+    _fp8_mqa_logits_impl = getattr(_dg, "fp8_mqa_logits", None)
+    _fp8_paged_mqa_logits_impl = getattr(_dg, "fp8_paged_mqa_logits", None)
     # DeepGEMM exposes fp8_fp4_*_mqa_logits as the canonical symbols that
     # handle both the FP8 and FP4 Q/K paths via a tuple-typed `q`.
     _fp8_fp4_mqa_logits_impl = getattr(_dg, "fp8_fp4_mqa_logits", None)
@@ -661,6 +671,19 @@ def fp8_fp4_mqa_logits(
     """
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
+        q_values, q_scale = q
+        if q_scale is None and _fp8_mqa_logits_impl is not None:
+            logger.info_once(
+                "Using legacy DeepGEMM fp8_mqa_logits for an FP8-only query."
+            )
+            return _fp8_mqa_logits_impl(
+                q_values,
+                kv,
+                weights,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+                clean_logits=clean_logits,
+            )
         return _missing()
     return _fp8_fp4_mqa_logits_impl(
         q,
@@ -768,15 +791,32 @@ def fp8_fp4_paged_mqa_logits(
 
     """
     _lazy_init()
-    if _fp8_fp4_paged_mqa_logits_impl is None:
-        return _missing()
-    # DeepGEMM asserts block_tables.stride(-1)==1. A trailing size-1 dim
-    # (e.g. block_table shape [B,1] for short seqs under a large block_size)
-    # can be a transposed view where .contiguous() is a no-op (torch treats the
-    # size-1 dim's stride as irrelevant) yet stride(-1)!=1, failing the kernel.
-    # clone to contiguous format to force stride(-1)==1.
+    # Both the unified and legacy kernels require stride(-1)==1. A trailing
+    # size-1 dimension can still report a non-unit stride while PyTorch treats
+    # the tensor as contiguous, so normalize before selecting an API variant.
     if block_tables.dim() >= 2 and block_tables.stride(-1) != 1:
         block_tables = block_tables.clone(memory_format=torch.contiguous_format)
+    if _fp8_fp4_paged_mqa_logits_impl is None:
+        q_values, q_scale = q
+        if (
+            q_scale is None
+            and indices is None
+            and _fp8_paged_mqa_logits_impl is not None
+        ):
+            logger.info_once(
+                "Using legacy DeepGEMM fp8_paged_mqa_logits for an FP8-only query."
+            )
+            return _fp8_paged_mqa_logits_impl(
+                q_values,
+                kv_cache,
+                weights,
+                context_lens,
+                block_tables,
+                schedule_metadata,
+                max_model_len,
+                clean_logits,
+            )
+        return _missing()
     kwargs = {} if indices is None else {"indices": indices}
     return _fp8_fp4_paged_mqa_logits_impl(
         q,
