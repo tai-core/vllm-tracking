@@ -8,6 +8,12 @@ import torch
 import vllm.utils.deep_gemm as deep_gemm
 
 
+def test_paged_mqa_page_sizes_match_platform_backend():
+    is_musa = getattr(torch.version, "musa", None) is not None
+    expected = (64,) if is_musa else (32, 64)
+    assert deep_gemm.PAGED_MQA_PAGE_SIZES == expected
+
+
 @pytest.fixture(autouse=True)
 def _reset_mqa_implementations(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(deep_gemm, "_lazy_init", lambda: None)
