@@ -520,13 +520,118 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 lower_bound=lower_bound,
             )
 
-        # --- core attention: non-spec path (prefill or plain decode) ---
+        # --- core attention: non-spec path ---
+        # Mixed non-spec batch WITHOUT speculation (plain decodes + prefills
+        # together): split the core so each request kind keeps its own
+        # execution path regardless of batch composition. Plain decodes run
+        # the recurrent kernel (raw beta + SIGMOID_BETA/COMPUTE_GATE, exactly
+        # like the pure-decode step, updating their own state slots in place
+        # and writing straight into their output-buffer rows); prefills run
+        # the chunked kernel (fp32 pre-sigmoided beta) on the decode-suffix
+        # slices, with cu_seqlens rebased to the suffix token count and
+        # gather/scatter touching ONLY the prefill-suffix slots so the decode
+        # states are never overwritten. With speculation the GDN builder
+        # already reclassifies decodes as prefills, so the spec branch below
+        # is untouched. (Port of the HCU mixed-KDA split fix; the conv path
+        # above is unchanged — causal_conv1d_fn is per-request via
+        # query_start_loc, so mixed conv routing is already correct.)
+        num_decodes_ns = attn_metadata_narrowed.num_decodes
+        num_prefills_ns = attn_metadata_narrowed.num_prefills
+        num_decode_tokens_ns = attn_metadata_narrowed.num_decode_tokens
+        mixed_ns = (
+            not use_spec
+            and num_decodes_ns > 0
+            and num_prefills_ns > 0
+            and num_decode_tokens_ns == num_decodes_ns
+        )
         core_attn_out_non_spec = None
         # Only the plain-decode recurrent kernel can write straight into the
         # layer output buffer; the chunked prefill kernel cannot, so this
         # stays None there and the merge copy below runs as before.
         ns_out = None
-        if attn_metadata_narrowed.num_prefills > 0:
+        if mixed_ns:
+            # Decodes are the decode-first prefix rows [0, num_decode_tokens)
+            # of the non-spec token stream; prefills are the suffix.
+            nd = num_decodes_ns
+            ntok_ns = qkv_ns.shape[0]
+            # --- decode prefix: recurrent kernel over its own rows ---
+            qkv_d = qkv_ns[:num_decode_tokens_ns]
+            q_d, k_d, v_d = qkv_d.split(self.local_projection_size, dim=-1)
+            decode_out = core_attn_out[0, :num_decode_tokens_ns].unsqueeze(0)
+            fused_recurrent_kda(
+                q=_rearr(q_d),
+                k=_rearr(k_d),
+                v=_rearr(v_d),
+                g=g1_ns[:, :num_decode_tokens_ns],
+                beta=beta_ns[:, :num_decode_tokens_ns],
+                initial_state=recurrent_state,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=non_spec_query_start_loc[: nd + 1],
+                ssm_state_indices=non_spec_state_indices_tensor[:nd],
+                out=decode_out,
+                sigmoid_beta=True,
+                a_log=self.A_log,
+                g_bias=self.dt_bias,
+                compute_gate=True,
+                lower_bound=lower_bound,
+            )
+            # --- prefill suffix: chunked kernel on rebased slices ---
+            # Rebase the cu_seqlens to the suffix token count (mirrors the
+            # GDN builder's prefill_query_start_loc derivation:
+            # non_spec_query_start_loc[num_decodes:] - num_decode_tokens).
+            prefill_qsl = non_spec_query_start_loc[nd:] - num_decode_tokens_ns
+            prefill_state_indices = non_spec_state_indices_tensor[nd:]
+            prefill_has_initial_state = (
+                has_initial_state[nd:]
+                if has_initial_state is not None
+                else None
+            )
+            qkv_p = qkv_ns[num_decode_tokens_ns:ntok_ns]
+            q_p, k_p, v_p = qkv_p.split(self.local_projection_size, dim=-1)
+            initial_state = gather_initial_states(
+                recurrent_state,
+                prefill_state_indices,
+                prefill_has_initial_state,
+            )
+            (
+                prefill_out,
+                last_recurrent_state,
+            ) = chunk_kda_with_fused_gate(
+                q=_rearr(q_p),
+                k=_rearr(k_p),
+                v=_rearr(v_p),
+                raw_g=g1_ns[:, num_decode_tokens_ns:ntok_ns],
+                # Chunk path wants the pre-sigmoided fp32 beta (its kernels
+                # don't sigmoid); the slice is raw bf16 from forward.
+                beta=_cast_sigmoid(
+                    beta_ns[:, num_decode_tokens_ns:ntok_ns].squeeze(0)
+                ).unsqueeze(0),
+                A_log=self.A_log,
+                g_bias=self.dt_bias,
+                initial_state=initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=prefill_qsl,
+                safe_gate=safe_gate,
+                lower_bound=lower_bound,
+            )
+            # Scatter ONLY the prefill suffix's final states; the decode
+            # prefix already updated its own slots in place above and must
+            # not be overwritten.
+            scatter_states(
+                recurrent_state,
+                last_recurrent_state,
+                prefill_state_indices,
+            )
+            # Merge back into token order: the decode prefix rows are already
+            # in core_attn_out (decode_out aliases it); copy the prefill
+            # suffix rows.
+            core_attn_out[0, num_decode_tokens_ns:ntok_ns] = prefill_out[
+                0, : ntok_ns - num_decode_tokens_ns
+            ]
+            core_attn_out_non_spec = core_attn_out
+            ns_out = decode_out  # decode rows wrote in place; no merge copy
+        elif attn_metadata_narrowed.num_prefills > 0:
             assert q_ns is not None
             assert non_spec_state_indices_tensor is not None
             assert has_initial_state is not None
