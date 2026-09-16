@@ -86,8 +86,16 @@ class OpenCVVideoBackendMixin:
         # exposes the true frame count without decoding anything. The seek
         # may land mid-stream on corrupt files, so only trust it when the
         # stream really ends there. A one-frame tolerance keeps mere header
-        # miscounts from being "corrected".
-        if total_frames_num > 0 and cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1.0):
+        # miscounts from being "corrected". A single-frame clip has no
+        # edit-list ambiguity worth probing, and the end-seek probe is
+        # not safely reversible on streamed (BytesIO) FFMPEG handles:
+        # the CAP_PROP_POS_FRAMES=0 reset is not honored on
+        # cv2 >= 5.0.0, leaving the handle unreadable so the subsequent
+        # read returns 0 frames. Multi-frame clips keep the edit-list
+        # cross-check (seek/reset works there).
+        if total_frames_num == 1:
+            pass
+        elif total_frames_num > 0 and cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1.0):
             visible_frames = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
             at_stream_end = not cap.grab()
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
