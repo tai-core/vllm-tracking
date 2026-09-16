@@ -1,0 +1,61 @@
+# GLM-5.3-Flash public-source v0.29 build candidate (BW1000/HCU)
+#
+# ROUTE: public-source only. The pinned base image is the PUBLIC DTK
+# toolchain reference (harbor.sourcefind.cn), which carries the DTK
+# 26.04 + Torch + Triton HCU stack. It is used ONLY as the build
+# environment — no binary-extension donor, no GLM runtime claim.
+# The vLLM tree is built from the public upstream commit 98ed0856
+# ([Model] add GLM-5.3-Flash support #53906; post-v0.29.0 master)
+# and the HCU plugin from the public bridge e1861907.
+#
+# No intranet resources are used (the upstream bridge Dockerfile's
+# PYPI_URL/RESOURCE_SERVER_URL/AICC_URL args are NOT needed: the
+# pinned base image already contains the compiler + das libraries).
+#
+# Codex executes this on a BW1000 node. Estimated build time on 32+
+# cores: vLLM extension compile 40-90 min; plugin ~5 min.
+
+ARG BASE_IMAGE=harbor.sourcefind.cn:5443/hcu/admin/base/custom@sha256:636005656b97927f93e04f03258e8380d650448e9a263e54929e281c47315670
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-c"]
+
+# --- context: source trees are COPYied, not git-cloned inside the image,
+# so the build is exactly reproducible from the audited trees.
+# docker build -f docker/public-build/Dockerfile.glm53-v029 \
+#   --build-arg BASE_IMAGE=<pinned-digest> \
+#   --build-arg VLLM_TREE=<path-to-v029-public-build-tree> .
+# (see build.sh; the args below default to the sibling layout)
+
+ARG VLLM_TREE=.
+ARG PLUGIN_TREE=../vllm-plugin-das-bridge
+
+# Uninstall the preinstalled OpenDAS-fork vllm (the base image's runtime),
+# keeping torch/triton/das libraries intact. The public vLLM is then built
+# from source against the SAME torch (no compiler/PyTorch replacement).
+RUN pip uninstall -y vllm vllm-hcu || true
+
+COPY ${VLLM_TREE} /workspace/vllm
+COPY ${PLUGIN_TREE} /workspace/vllm-plugin-das
+
+# --- vLLM @ 98ed0856 (public, includes GLM-5.3-Flash) ---
+# setuptools_scm derives 0.28.1rc0.devNNN+g98ed0856f3 from the tag
+# history, whose release line (0.28.1) satisfies the plugin's
+# compatibility gate (compatibility.py: epoch+release equality).
+RUN cd /workspace/vllm \
+    && python setup.py bdist_wheel \
+    && pip install --no-cache-dir dist/*.whl \
+    && rm -rf dist build
+
+# --- vLLM-HCU plugin @ e1861907 (public bridge) ---
+# Compiles vllm_hcu.hcu_ops against the installed torch (CUDAExtension
+# with torch.version.hip → HCU compiler contract; MAX_JOBS parallel).
+RUN cd /workspace/vllm-plugin-das \
+    && python setup.py bdist_wheel \
+    && pip install --no-cache-dir dist/*.whl \
+    && rm -rf dist build
+
+# --- synthetic no-weight smoke entrypoints (no model download) ---
+COPY scripts/public-build-smoke/ /workspace/smoke/
+
+WORKDIR /workspace

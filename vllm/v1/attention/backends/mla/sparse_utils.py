@@ -150,6 +150,187 @@ def _convert_req_index_to_global_index_kernel(
                 tl.store(valid_count_ptr + token_id, tile_valid_count)
             else:
                 tl.atomic_add(valid_count_ptr + token_id, tile_valid_count)
+    def dispatch(  # type: ignore[override]
+        self,
+        *,
+        BLOCK_SIZE: int,
+        BLOCK_STRIDE_ROWS: int,
+        BLOCK_N: int,
+        NUM_TOPK_TOKENS: int,
+        HAS_PREFILL_WORKSPACE: bool,
+        COUNT_VALID: bool,
+        COMPACT_TO_FRONT: bool,
+        DCP_SIZE: int,
+        DCP_RANK: int,
+        DCP_INTERLEAVE: int,
+        max_num_blocks_per_req: int,
+    ) -> CompileKey:
+        tiling = _remap_tiling(NUM_TOPK_TOKENS, BLOCK_N, COUNT_VALID)
+        return self.CompileKey(
+            block_size=BLOCK_SIZE,
+            block_stride_rows=BLOCK_STRIDE_ROWS,
+            block_n=tiling[1],
+            has_prefill_workspace=HAS_PREFILL_WORKSPACE,
+            count_valid=COUNT_VALID,
+            single_tile=tiling[0],
+            compact_to_front=COMPACT_TO_FRONT,
+            dcp_size=DCP_SIZE,
+            dcp_rank=DCP_RANK,
+            dcp_interleave=DCP_INTERLEAVE,
+            num_warps=tiling[3],
+            num_topk_tokens=NUM_TOPK_TOKENS,
+            block_table_stride=triton_scalar_specialization_rep(max_num_blocks_per_req),
+        )
+
+    def get_warmup_keys(
+        self,
+        vllm_config: VllmConfig,
+        *,
+        block_stride_rows: int,
+    ) -> list[CompileKey]:
+        block_size = vllm_config.cache_config.block_size
+        dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        dcp_interleave = vllm_config.parallel_config.cp_kv_cache_interleave_size
+        dcp_rank = get_dcp_group().rank_in_group if dcp_size > 1 else 0
+        num_topk_tokens = vllm_config.model_config.hf_config.index_topk
+        max_num_blocks = cdiv(
+            vllm_config.model_config.max_model_len,
+            block_size * dcp_size,
+        )
+        max_num_blocks_per_req = get_block_table_width(max_num_blocks, block_size)
+        return self._trace_dispatch(self.dispatch)(
+            zip_inputs(
+                dict(
+                    HAS_PREFILL_WORKSPACE=False,
+                    COUNT_VALID=False,
+                    COMPACT_TO_FRONT=False,
+                    DCP_SIZE=1,
+                    DCP_RANK=0,
+                    DCP_INTERLEAVE=1,
+                ),
+                dict(
+                    HAS_PREFILL_WORKSPACE=False,
+                    COUNT_VALID=True,
+                    COMPACT_TO_FRONT=True,
+                    DCP_SIZE=1,
+                    DCP_RANK=0,
+                    DCP_INTERLEAVE=1,
+                ),
+                dict(
+                    HAS_PREFILL_WORKSPACE=True,
+                    COUNT_VALID=True,
+                    COMPACT_TO_FRONT=True,
+                    DCP_SIZE=1,
+                    DCP_RANK=0,
+                    DCP_INTERLEAVE=1,
+                ),
+                dict(
+                    HAS_PREFILL_WORKSPACE=False,
+                    COUNT_VALID=True,
+                    COMPACT_TO_FRONT=False,
+                    DCP_SIZE=dcp_size,
+                    DCP_RANK=dcp_rank,
+                    DCP_INTERLEAVE=dcp_interleave,
+                ),
+                dict(
+                    HAS_PREFILL_WORKSPACE=False,
+                    COUNT_VALID=True,
+                    COMPACT_TO_FRONT=dcp_size > 1,
+                    DCP_SIZE=dcp_size,
+                    DCP_RANK=dcp_rank,
+                    DCP_INTERLEAVE=dcp_interleave,
+                ),
+            ),
+            BLOCK_SIZE=block_size,
+            BLOCK_STRIDE_ROWS=block_stride_rows,
+            BLOCK_N=128,
+            NUM_TOPK_TOKENS=num_topk_tokens,
+            max_num_blocks_per_req=max_num_blocks_per_req,
+        )
+
+    def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
+        int32_ptr = TritonWarmupTensor(torch.int32)
+        token_shape = (1, compile_key.num_topk_tokens)
+        token_strides = (16, 1)
+        return dict(
+            req_id=int32_ptr,
+            block_table=TritonWarmupTensor(
+                torch.int32,
+                shape=(1, compile_key.block_table_stride),
+            ),
+            token_indices=TritonWarmupTensor(
+                torch.int32,
+                shape=token_shape,
+                strides=token_strides,
+            ),
+            out=TritonWarmupTensor(
+                torch.int32,
+                shape=token_shape,
+                strides=token_strides,
+            ),
+            valid_counts=int32_ptr if compile_key.count_valid else None,
+            prefill_workspace_request_ids=(
+                int32_ptr if compile_key.has_prefill_workspace else None
+            ),
+            prefill_workspace_starts=(
+                int32_ptr if compile_key.has_prefill_workspace else None
+            ),
+            max_num_blocks_per_req=1,
+            BLOCK_SIZE=compile_key.block_size,
+            BLOCK_STRIDE_ROWS=compile_key.block_stride_rows,
+            BLOCK_N=compile_key.block_n,
+            NUM_TOPK_TOKENS=compile_key.num_topk_tokens,
+            HAS_PREFILL_WORKSPACE=compile_key.has_prefill_workspace,
+            COUNT_VALID=compile_key.count_valid,
+            COMPACT_TO_FRONT=compile_key.compact_to_front,
+            DCP_SIZE=compile_key.dcp_size,
+            DCP_RANK=compile_key.dcp_rank,
+            DCP_INTERLEAVE=compile_key.dcp_interleave,
+        )
+
+    @kernel_launcher
+    def __call__(
+        self,
+        req_id: torch.Tensor,
+        block_table: torch.Tensor,
+        token_indices: torch.Tensor,
+        out: torch.Tensor,
+        valid_counts: torch.Tensor | None,
+        prefill_workspace_request_ids: torch.Tensor | None,
+        prefill_workspace_starts: torch.Tensor | None,
+        *,
+        max_num_blocks_per_req: int,
+        BLOCK_SIZE: int,
+        BLOCK_STRIDE_ROWS: int,
+        BLOCK_N: int,
+        NUM_TOPK_TOKENS: int,
+        HAS_PREFILL_WORKSPACE: bool,
+        COUNT_VALID: bool,
+        COMPACT_TO_FRONT: bool,
+        DCP_SIZE: int,
+        DCP_RANK: int,
+        DCP_INTERLEAVE: int,
+    ) -> LaunchSpec:
+        single_tile, block_n, tiles_per_row, num_warps = _remap_tiling(
+            NUM_TOPK_TOKENS, BLOCK_N, COUNT_VALID
+        )
+        # Exact 2D grid: tokens × column tiles
+        return (req_id.shape[0], tiles_per_row), dict(
+            valid_count_ptr=valid_counts,
+            prefill_request_id_ptr=prefill_workspace_request_ids,
+            workspace_starts_ptr=prefill_workspace_starts,
+            BLOCK_N=block_n,
+            HAS_PREFILL=HAS_PREFILL_WORKSPACE,
+            SINGLE_TILE=single_tile,
+            # Strides in elements
+            bt_stride0=block_table.stride(0),
+            bt_stride1=block_table.stride(1),
+            ti_stride0=token_indices.stride(0),
+            ti_stride1=token_indices.stride(1),
+            out_stride0=out.stride(0),
+            out_stride1=out.stride(1),
+            num_warps=num_warps,
+        )
 
 
 def _remap_tiling(
@@ -239,7 +420,14 @@ def triton_convert_req_index_to_global_index(
     req_id_c = req_id.contiguous()
     block_table_c = block_table.contiguous()
     token_indices_c = token_indices.contiguous()
-    out = torch.empty_like(token_indices_c)
+    # When return_valid_counts, the kernel scatters valid entries to a
+    # contiguous prefix [0, valid_count) and leaves the tail unwritten, so
+    # pre-fill -1 there. flash_mla_sparse_fwd then bounds attention to
+    # [:topk_length] == exactly the valid set (no dropped tokens).
+    if return_valid_counts:
+        out = torch.full_like(token_indices_c, -1)
+    else:
+        out = torch.empty_like(token_indices_c)
 
     valid_counts: torch.Tensor | None = None
     if return_valid_counts:
@@ -271,25 +459,27 @@ def triton_convert_req_index_to_global_index(
         prefill_workspace_request_ids,
         prefill_workspace_starts,
         # shapes / constexprs
-        max_num_blocks_per_req,
-        BLOCK_SIZE,
-        BLOCK_STRIDE_ROWS if BLOCK_STRIDE_ROWS is not None else BLOCK_SIZE,
-        block_n,
-        HAS_PREFILL_WORKSPACE,
-        return_valid_counts,
-        single_tile,
-        False,  # COMPACT_TO_FRONT: keep input column == output column
+        max_num_blocks_per_req=max_num_blocks_per_req,
+        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_STRIDE_ROWS=(
+            BLOCK_STRIDE_ROWS if BLOCK_STRIDE_ROWS is not None else BLOCK_SIZE
+        ),
+        BLOCK_N=BLOCK_N,
+        NUM_TOPK_TOKENS=NUM_TOPK_TOKENS,
+        HAS_PREFILL=HAS_PREFILL_WORKSPACE,
+        COUNT_VALID=return_valid_counts,
+        COMPACT_TO_FRONT=return_valid_counts,
         # DCP disabled (no-op de-interleave)
-        1,
-        0,
-        1,
+        DCP_SIZE=1,
+        DCP_RANK=0,
+        DCP_INTERLEAVE=1,
         # strides
-        bt_stride0,
-        bt_stride1,
-        ti_stride0,
-        ti_stride1,
-        out_stride0,
-        out_stride1,
+        bt_stride0=bt_stride0,
+        bt_stride1=bt_stride1,
+        ti_stride0=ti_stride0,
+        ti_stride1=ti_stride1,
+        out_stride0=out_stride0,
+        out_stride1=out_stride1,
         num_warps=num_warps,
     )
 
