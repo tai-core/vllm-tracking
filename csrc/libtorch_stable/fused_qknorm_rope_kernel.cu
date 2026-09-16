@@ -39,17 +39,33 @@
 #ifdef USE_ROCM
   #define FINAL_MASK 0xffffffffffffffffULL
 
-  #if defined(HIP_VERSION) && HIP_VERSION < 70000000
-// On ROCm versions before 7.0, __syncwarp isn't defined. The below
-// implementation is copy/pasted from the implementation in ROCm 7.0
-__device__ inline void __syncwarp() {
+// Project-owned warp-sync helper. The kernel calls vllm_syncwarp BY
+// NAME so the lookup is unambiguous: a vendor HIP SDK can backport a
+// native __syncwarp under an OLDER version than the threshold below,
+// and a global __syncwarp definition here would then be a redefinition
+// (or an ambiguous pick). The dispatcher preserves the ORIGINAL guard
+// semantics exactly:
+//   - legacy ROCm (HIP_VERSION < 70000000): the preserved fallback
+//     sequence — release-fence -> wave-barrier -> acquire-fence —
+//     EVEN IF the SDK also provides a native __syncwarp;
+//   - modern HIP (>= 70000000) and CUDA: the native intrinsic.
+__device__ inline void vllm_syncwarp() {
+#if defined(HIP_VERSION) && HIP_VERSION < 70000000
+  // copy/pasted from the implementation in ROCm 7.0
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
   __builtin_amdgcn_wave_barrier();
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+#else
+  ::__syncwarp();
+#endif
 }
-  #endif
 #else
   #define FINAL_MASK 0xffffffff
+// CUDA (and any non-ROCm build): the helper simply delegates to the
+// native intrinsic — identical behavior to the previous direct calls.
+__device__ inline void vllm_syncwarp() {
+  ::__syncwarp();
+}
 #endif
 
 namespace tensorrt_llm::common {
@@ -261,7 +277,7 @@ __global__ void fusedQKNormRopeKernel(
         }
       } else {
         // Before data exchange with in warp, we need to sync.
-        __syncwarp();
+        vllm_syncwarp();
         int pairOffset = (rotary_dim / 2) / numElemsPerThread;
         // Get the data from the other half of the warp. Use pre-computed
         // cos/sin values.
@@ -282,7 +298,7 @@ __global__ void fusedQKNormRopeKernel(
           elements[i] = elements[i] * cos_val + elements2[i] * sin_val;
         }
         // __shfl_xor_sync does not provide memfence. Need to sync again.
-        __syncwarp();
+        vllm_syncwarp();
       }
     }
     // Store.
@@ -500,7 +516,7 @@ __global__ void fusedQKNormRopeKernelNTokenHeads(
             elements[idx1] = val0 * sin_val + val1 * cos_val;
           }
         } else {
-          __syncwarp();
+          vllm_syncwarp();
           int const pairOffset = (rotary_dim / 2) / numElemsPerThread;
 #pragma unroll
           for (int i = 0; i < numElemsPerThread; i++) {
@@ -513,7 +529,7 @@ __global__ void fusedQKNormRopeKernelNTokenHeads(
             float const sin_val = CacheConverter::convert(sin_smem[half_dim]);
             elements[i] = elements[i] * cos_val + elements2[i] * sin_val;
           }
-          __syncwarp();
+          vllm_syncwarp();
         }
       }
 

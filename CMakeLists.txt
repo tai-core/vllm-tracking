@@ -51,6 +51,50 @@ set(PYTHON_SUPPORTED_VERSIONS "3.10" "3.11" "3.12" "3.13" "3.14")
 # Supported AMD GPU architectures.
 set(HIP_SUPPORTED_ARCHS "gfx906;gfx908;gfx90a;gfx942;gfx950;gfx1250;gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201")
 
+# EXPERIMENTAL, EXPLICIT OPT-IN: allow building for the HCU gfx936 target
+# (BW1000 DCU). Default OFF — the default upstream arch behavior (list
+# above + intersection + empty-result rejection in override_gpu_arches)
+# is untouched. When ON, the HIP compiler must ACCEPT gfx936 (probed at
+# configure time by compiling a trivial offload source); a compiler
+# rejection FAILS the configure instead of silently dropping the arch.
+# This is a build-arch allowlist ONLY — it makes no runtime-support
+# claim, and gfx936 is never relabeled as gfx90a/gfx942.
+option(VLLM_HCU_EXPERIMENTAL_GFX936
+  "EXPERIMENTAL: build HIP kernels for the HCU gfx936 (BW1000 DCU) target. Requires a HIP compiler that accepts --offload-arch=gfx936 (probed at configure time). No runtime support is implied." OFF)
+
+# EXPERIMENTAL HCU macro-header seam (default empty = OFF). Names the
+# relative include path of the vendor SDK macro header that the vendor
+# translator auto-injects into generated HIP sources. Only legal with
+# the experimental HCU HIP profile (VLLM_HCU_EXPERIMENTAL_GFX936=ON).
+# NO SDK header contents are hardcoded or pasted; the supervisor
+# supplies the header path at node build time. The shim is generated
+# on-node from the installed header via compiler preprocessing.
+set(HCU_MACRO_HEADER "" CACHE STRING
+  "EXPERIMENTAL: relative include name of the vendor SDK macro header auto-injected into generated HIP sources (empty = off; requires VLLM_HCU_EXPERIMENTAL_GFX936=ON).")
+if(HCU_MACRO_HEADER)
+  if(NOT VLLM_HCU_EXPERIMENTAL_GFX936)
+    message(FATAL_ERROR
+      "HCU_MACRO_HEADER requires the experimental HCU HIP profile "
+      "(VLLM_HCU_EXPERIMENTAL_GFX936=ON). Rejecting the inconsistent "
+      "combination.")
+  endif()
+  if(HCU_MACRO_HEADER STREQUAL "" OR HCU_MACRO_HEADER MATCHES "^/")
+    message(FATAL_ERROR
+      "HCU_MACRO_HEADER must be a non-empty RELATIVE include path.")
+  endif()
+endif()
+
+# EARLY non-rocm rejection: the option is only meaningful for HIP builds.
+# This guard runs BEFORE the cpu/other-target early-return below, so
+# VLLM_HCU_EXPERIMENTAL_GFX936=ON with any VLLM_TARGET_DEVICE other than
+# rocm is rejected explicitly instead of returning silently.
+if(VLLM_HCU_EXPERIMENTAL_GFX936 AND NOT VLLM_TARGET_DEVICE STREQUAL "rocm")
+  message(FATAL_ERROR
+    "VLLM_HCU_EXPERIMENTAL_GFX936=ON requires VLLM_TARGET_DEVICE=rocm, "
+    "but VLLM_TARGET_DEVICE is '${VLLM_TARGET_DEVICE}'. Rejecting the "
+    "inconsistent target combination.")
+endif()
+
 # ROCm installation prefix. Default to /opt/rocm but allow override via
 # -DROCM_PATH=/your/rocm/path when invoking cmake.
 if(NOT DEFINED ROCM_PATH)
@@ -207,8 +251,53 @@ elseif(HIP_FOUND OR PYTORCH_FOUND_HIP)
     message(WARNING "Pytorch version >= ${TORCH_SUPPORTED_VERSION_ROCM} "
       "expected for ROCm build, saw ${Torch_VERSION} instead.")
   endif()
+
+  if(VLLM_HCU_EXPERIMENTAL_GFX936)
+    # EXPLICIT OPT-IN experimental HCU gfx936 path (HIP-only by
+    # construction: this branch is only reached for HIP builds; a CUDA
+    # or CPU build with the option ON is rejected below).
+    # Configure-time HIP compiler acceptance probe: compile a trivial
+    # offload source for gfx936. Compiler rejection FAILS configure —
+    # the arch is never silently dropped.
+    set(_gfx936_probe_src "${CMAKE_BINARY_DIR}/vllm_hcu_gfx936_probe.hip")
+    # Self-contained valid HIP translation unit: the runtime header is
+    # included explicitly so kernel acceptance does not depend on
+    # incidental implicit declarations by the compiler driver.
+    file(WRITE "${_gfx936_probe_src}"
+"#include <hip/hip_runtime.h>
+__global__ void vllm_hcu_gfx936_probe_kernel(float* x) { x[0] = 0.f; }
+int main() { return 0; }
+")
+    execute_process(
+      COMMAND ${CMAKE_HIP_COMPILER} --offload-arch=gfx936 -c "${_gfx936_probe_src}" -o "${CMAKE_BINARY_DIR}/vllm_hcu_gfx936_probe.o"
+      RESULT_VARIABLE _gfx936_probe_result
+      OUTPUT_VARIABLE _gfx936_probe_stdout
+      ERROR_VARIABLE _gfx936_probe_stderr)
+    if(NOT _gfx936_probe_result EQUAL 0)
+      message(FATAL_ERROR
+        "VLLM_HCU_EXPERIMENTAL_GFX936=ON but the HIP compiler "
+        "${CMAKE_HIP_COMPILER} REJECTED the gfx936 target "
+        "(probe rc=${_gfx936_probe_result}). Experimental HCU gfx936 "
+        "build requires a compiler that accepts --offload-arch=gfx936. "
+        "Refusing to silently drop the architecture. Probe stderr: "
+        "${_gfx936_probe_stderr}")
+    endif()
+    list(APPEND HIP_SUPPORTED_ARCHS gfx936)
+    message(STATUS
+      "EXPERIMENTAL HCU gfx936 ENABLED (compiler probe passed; "
+      "build-arch allowlist only — NO runtime support implied)")
+  endif()
 else()
   message(FATAL_ERROR "Can't find CUDA or HIP installation.")
+endif()
+
+# Reject inconsistent non-HIP combinations for the experimental option:
+# the option is only meaningful for HIP builds.
+if(VLLM_HCU_EXPERIMENTAL_GFX936 AND NOT VLLM_GPU_LANG STREQUAL "HIP")
+  message(FATAL_ERROR
+    "VLLM_HCU_EXPERIMENTAL_GFX936=ON requires a HIP build "
+    "(VLLM_GPU_LANG=HIP), but this is a ${VLLM_GPU_LANG} build. "
+    "Rejecting the inconsistent target combination.")
 endif()
 
 

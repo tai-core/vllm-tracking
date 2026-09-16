@@ -42,22 +42,39 @@ __device__ __forceinline__ void atomicAdd_half2(half2* address, half2 val) {
 }
 
 //
+// GPTQ atomicAdd dispatch: q_gemm.cu calls gptq_atomicAdd BY NAME so the
+// lookup is unambiguous. A HIP SDK may backport native half/half2
+// atomicAdd before the version threshold below; with an UNQUALIFIED
+// atomicAdd call, ordinary lookup + ADL could see both the SDK native
+// overloads and the namespace fallbacks above. The named dispatchers
+// below preserve the ORIGINAL guard semantics exactly:
+//   - old-HIP (USE_ROCM, pre-713) and old-CUDA (CC < 700/600): CAS
+//     fallback bodies (atomicAdd_half / atomicAdd_half2) — this is the
+//     intended existing choice EVEN IF the SDK also provides native
+//     overloads;
+//   - modern HIP (>= 713) and modern CUDA (CC >= 700/600): the native
+//     ::atomicAdd.
+__device__ __forceinline__ void gptq_atomicAdd(half* address, half val) {
 #if defined(__CUDA_ARCH__) || \
     (defined(USE_ROCM) && (HIP_VERSION_MAJOR * 100 + HIP_VERSION_MINOR) < 713)
   #if __CUDA_ARCH__ < 700 || defined(USE_ROCM)
-
-__device__ __forceinline__ void atomicAdd(half* address, half val) {
   atomicAdd_half(address, val);
-}
-
-    #if __CUDA_ARCH__ < 600 || defined(USE_ROCM)
-__device__ __forceinline__ void atomicAdd(half2* address, half2 val) {
-  atomicAdd_half2(address, val);
-}
-    #endif
-
+  return;
   #endif
 #endif
+  ::atomicAdd(address, val);
+}
+
+__device__ __forceinline__ void gptq_atomicAdd(half2* address, half2 val) {
+#if defined(__CUDA_ARCH__) || \
+    (defined(USE_ROCM) && (HIP_VERSION_MAJOR * 100 + HIP_VERSION_MINOR) < 713)
+  #if __CUDA_ARCH__ < 600 || defined(USE_ROCM)
+  atomicAdd_half2(address, val);
+  return;
+  #endif
+#endif
+  ::atomicAdd(address, val);
+}
 
 }  // namespace gptq
 }  // namespace vllm

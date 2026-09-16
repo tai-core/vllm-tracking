@@ -113,10 +113,91 @@ function (vllm_finalize_hipify_target)
   list(REMOVE_DUPLICATES ALL_BYPRODUCTS)
 
   set(CSRC_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR}/csrc)
+
+  # EXPERIMENTAL HCU macro-header seam (empty HCU_MACRO_HEADER -> the
+  # command is EXACTLY the previous one; no extra arguments). When set,
+  # generate the numeric-only shim + dispatch header on-node and pass
+  # the seam options to hipify.py. Dependency ordering for the shared
+  # hipify_all target is preserved: the shim step runs BEFORE the
+  # hipify command in the same custom target's command list, and the
+  # shim/dispatch directory is added to the include path.
+  set(_HIPIFY_EXTRA_ARGS "")
+  set(_HCU_SEAM_DEPENDS "")
+  if(HCU_MACRO_HEADER)
+    set(_HCU_SEAM_DIR ${CMAKE_CURRENT_BINARY_DIR}/hcu_macro_seam)
+    set(_HCU_SHIM ${_HCU_SEAM_DIR}/hcu_macro_shim.h)
+    set(_HCU_DISPATCH ${_HCU_SEAM_DIR}/hcu_macro_dispatch.h)
+    # Shim generation: preprocess the INSTALLED SDK header in
+    # NON-stable context with the C++ compiler found by CMake; the
+    # script rejects unsupported layouts (fail-closed).
+    #
+    # Include roots: TORCH_INCLUDE_DIRS (the Torch header search path
+    # the extensions themselves compile against) plus the source csrc/
+    # root — NOT CMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES (which may be
+    # empty and is not the Torch path). Repeated --include-dir=<dir>
+    # arguments form an explicit argv (VERBATIM; no shell string).
+    #
+    # HIP context: the non-stable DISCOVERY preprocessing defines
+    # USE_ROCM so the SDK header's active (legacy/HIP) branch is the
+    # one discovered. This define exists ONLY in the discovery
+    # preprocessor invocation — real compilation never inherits an
+    # ABI undef or this define from the seam.
+    set(_HCU_SHIM_INCLUDE_ARGS)
+    set(_HCU_SEAM_INCLUDE_DIRS ${TORCH_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR}/csrc)
+    foreach(_dir ${_HCU_SEAM_INCLUDE_DIRS})
+      if(_dir)
+        list(APPEND _HCU_SHIM_INCLUDE_ARGS "--include-dir=${_dir}")
+      endif()
+    endforeach()
+    # Resolve the SELECTED header to a concrete FILE at configure time
+    # so the shim generation DEPENDS on the actual header file (an
+    # in-place edit of the header regenerates the numeric shim) and on
+    # the compiler executable itself — not merely on include DIRECTORIES.
+    set(_HCU_RESOLVED_HEADER "")
+    foreach(_dir ${_HCU_SEAM_INCLUDE_DIRS})
+      if(_dir AND EXISTS "${_dir}/${HCU_MACRO_HEADER}")
+        set(_HCU_RESOLVED_HEADER "${_dir}/${HCU_MACRO_HEADER}")
+        break()
+      endif()
+    endforeach()
+    if(NOT _HCU_RESOLVED_HEADER)
+      message(FATAL_ERROR
+        "HCU_MACRO_HEADER='${HCU_MACRO_HEADER}' was not found under any "
+        "seam include root (TORCH_INCLUDE_DIRS / csrc). The shim "
+        "generation requires the resolved header file as a dependency.")
+    endif()
+    add_custom_command(
+      OUTPUT ${_HCU_SHIM}
+      COMMAND ${Python_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/hcu_macro_shim.py
+              --compiler ${CMAKE_CXX_COMPILER}
+              --header ${HCU_MACRO_HEADER}
+              ${_HCU_SHIM_INCLUDE_ARGS}
+              --compiler-arg=-DUSE_ROCM=1
+              --output ${_HCU_SHIM}
+      DEPENDS ${CMAKE_SOURCE_DIR}/cmake/hcu_macro_shim.py
+              ${_HCU_RESOLVED_HEADER}
+              ${CMAKE_CXX_COMPILER}
+      COMMENT "Generating numeric-only HCU macro shim (EXPERIMENTAL)"
+      VERBATIM)
+    # The dispatch header is emitted by hipify.py's seam pass next to
+    # the shim; make both available to generated TUs.
+    include_directories(${_HCU_SEAM_DIR})
+    set(_HIPIFY_EXTRA_ARGS
+      --hcu-macro-header ${HCU_MACRO_HEADER}
+      --hcu-dispatch-header ${_HCU_DISPATCH})
+    # The DISPATCH is a hipify byproduct (hipify.py emits it). The SHIM
+    # is NOT a byproduct: it has exactly ONE producer — the custom
+    # command above — and hipify_all DEPENDS on that output so the shim
+    # is generated FIRST; the dispatch can never reference an
+    # ungenerated shim at build time.
+    list(APPEND ALL_BYPRODUCTS ${_HCU_DISPATCH})
+    set(_HCU_SEAM_DEPENDS ${_HCU_SHIM})
+  endif()
+
   add_custom_target(
     hipify_all
-    COMMAND ${Python_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/hipify.py -p ${CMAKE_SOURCE_DIR}/csrc -o ${CSRC_BUILD_DIR} ${ALL_SRCS}
-    DEPENDS ${CMAKE_SOURCE_DIR}/cmake/hipify.py ${ALL_SRCS}
+    COMMAND ${Python_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/hipify.py -p ${CMAKE_SOURCE_DIR}/csrc -o ${CSRC_BUILD_DIR} ${ALL_SRCS} ${_HIPIFY_EXTRA_ARGS}
+    DEPENDS ${CMAKE_SOURCE_DIR}/cmake/hipify.py ${ALL_SRCS} ${_HCU_SEAM_DEPENDS}
     BYPRODUCTS ${ALL_BYPRODUCTS}
     COMMENT "Running hipify on all extension source files.")
 endfunction()

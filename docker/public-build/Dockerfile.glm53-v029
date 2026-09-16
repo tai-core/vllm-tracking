@@ -1,61 +1,105 @@
-# GLM-5.3-Flash public-source v0.29 build candidate (BW1000/HCU)
+# GLM-5.3-Flash public-source v0.29 build candidate — stage 1 (reviewed)
 #
-# ROUTE: public-source only. The pinned base image is the PUBLIC DTK
-# toolchain reference (harbor.sourcefind.cn), which carries the DTK
-# 26.04 + Torch + Triton HCU stack. It is used ONLY as the build
-# environment — no binary-extension donor, no GLM runtime claim.
-# The vLLM tree is built from the public upstream commit 98ed0856
-# ([Model] add GLM-5.3-Flash support #53906; post-v0.29.0 master)
-# and the HCU plugin from the public bridge e1861907.
+# Build context = the export produced by docker/public-build/export_source.sh:
+#   build-context/{Dockerfile, vllm.tar, vllm-plugin-das.tar, MANIFEST.json}
+# Audited Git archives ONLY (no worktree, no .git, no venvs, no artifacts).
 #
-# No intranet resources are used (the upstream bridge Dockerfile's
-# PYPI_URL/RESOURCE_SERVER_URL/AICC_URL args are NOT needed: the
-# pinned base image already contains the compiler + das libraries).
+# LEGACY-BUILDER COMPATIBLE: no RUN heredocs, no BuildKit-only syntax.
+# Build-logic python lives in tracked scripts inside the frozen archive
+# (docker/public-build/scripts/) and is invoked as plain RUN commands
+# after unpack.
 #
-# Codex executes this on a BW1000 node. Estimated build time on 32+
-# cores: vLLM extension compile 40-90 min; plugin ~5 min.
+# BASE IMAGE: pinned public DTK toolchain reference by digest. It is a
+# TOOLCHAIN BASE CANDIDATE ONLY — the public image is known (registry
+# top-layer inspection) to REPLACE the vllm Python tree, contain NO
+# vllm/models/glm5next, and DELETE vllm_hcu dist-info. It is NOT assumed
+# to carry the HCU bridge or GLM. Override BASE_IMAGE with an
+# already-audited local toolchain image identity if components are
+# missing (existing-DTK reuse is the first route).
+#
+# TOOLCHAIN RISK (documented): the target's requirements/build/rocm.txt
+# pins torch==2.12.0+rocm7.14.0 / triton==3.7.1+git0263a6a6 (AMD repo
+# index). Building against the base image's EXISTING DTK torch/triton
+# is an EXPLORATORY compatibility build, NOT requirements-equivalent
+# support. We do NOT install AMD wheels or upgrade Torch/Triton to
+# satisfy those pins (--no-deps everywhere; nothing is replaced).
+# Actual compilation/import results decide feasibility; a mismatch is
+# a concrete finding, not a silent pass.
 
 ARG BASE_IMAGE=harbor.sourcefind.cn:5443/hcu/admin/base/custom@sha256:636005656b97927f93e04f03258e8380d650448e9a263e54929e281c47315670
 FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-c"]
 
-# --- context: source trees are COPYied, not git-cloned inside the image,
-# so the build is exactly reproducible from the audited trees.
-# docker build -f docker/public-build/Dockerfile.glm53-v029 \
-#   --build-arg BASE_IMAGE=<pinned-digest> \
-#   --build-arg VLLM_TREE=<path-to-v029-public-build-tree> .
-# (see build.sh; the args below default to the sibling layout)
+# Bounded build: parallelism + target gfx. MAX_JOBS caps ninja; HCU_GFX
+# targets the gfx936 codegen (set explicitly; adjust only with a
+# documented reason).
+ARG MAX_JOBS=32
+ARG HCU_GFX=936
+# EXPERIMENTAL macro-header seam: relative include name of the vendor
+# SDK macro header (empty = off). Supplied by the supervisor at node
+# build time -- NO vendor paths/values are embedded in this recipe.
+# Requires the experimental gfx936 opt-in (enforced in CMake).
+ARG HCU_MACRO_HEADER=
+ENV MAX_JOBS=${MAX_JOBS} HCU_GFX=${HCU_GFX}
 
-ARG VLLM_TREE=.
-ARG PLUGIN_TREE=../vllm-plugin-das-bridge
+# Forward the optional seam input to CMake (legacy-builder compatible:
+# plain environment + CMAKE_ARGS; empty value -> identical behavior).
+ENV HCU_MACRO_HEADER=${HCU_MACRO_HEADER}
 
-# Uninstall the preinstalled OpenDAS-fork vllm (the base image's runtime),
-# keeping torch/triton/das libraries intact. The public vLLM is then built
-# from source against the SAME torch (no compiler/PyTorch replacement).
-RUN pip uninstall -y vllm vllm-hcu || true
+# --- staged source unpack (audited archives only) ---
+COPY vllm.tar /tmp/vllm.tar
+COPY vllm-plugin-das.tar /tmp/vllm-plugin-das.tar
+COPY MANIFEST.json /workspace/MANIFEST.json
+# Archives keep their vllm/ and vllm-plugin-das/ prefixes so paths land
+# exactly as the archive manifest records.
+RUN mkdir -p /workspace \
+    && tar -xf /tmp/vllm.tar -C /workspace \
+    && tar -xf /tmp/vllm-plugin-das.tar -C /workspace \
+    && rm /tmp/vllm.tar /tmp/vllm-plugin-das.tar
 
-COPY ${VLLM_TREE} /workspace/vllm
-COPY ${PLUGIN_TREE} /workspace/vllm-plugin-das
+# --- prebuild step 1: deliberate preexisting-dist detection + exact removal ---
+# (tracked script from the frozen archive; fails closed on unexpected
+# nonzero pip uninstall — verifiable absence is the only exemption)
+RUN python /workspace/vllm/docker/public-build/scripts/prebuild_dist_state.py
 
-# --- vLLM @ 98ed0856 (public, includes GLM-5.3-Flash) ---
-# setuptools_scm derives 0.28.1rc0.devNNN+g98ed0856f3 from the tag
-# history, whose release line (0.28.1) satisfies the plugin's
-# compatibility gate (compatibility.py: epoch+release equality).
+# --- prebuild step 2: explicit build-dependency validation (fail on missing) ---
+# (tracked script; a missing item is a concrete missing-input finding)
+RUN python /workspace/vllm/docker/public-build/scripts/prebuild_dep_check.py
+
+# --- vLLM: official v0.29.0 + GLM transplant, built from source ---
+# TRUTHFUL identity: 0.29.0 base + local provenance suffix (NOT
+# relabeled to the plugin's 0.28.1 audited line; the plugin's gate was
+# adapted in source to accept this exact line, marked runtime-
+# UNVERIFIED). --no-deps: never resolve/replace torch/triton.
+#
+# EXPERIMENTAL HCU gfx936 (BW1000 DCU) target: the upstream
+# HIP_SUPPORTED_ARCHS list excludes gfx936; this recipe EXPLICITLY
+# opts into the narrowly scoped experimental path
+# (-DVLLM_HCU_EXPERIMENTAL_GFX936=ON + PYTORCH_ROCM_ARCH=gfx936).
+# The opt-in runs a configure-time HIP compiler acceptance probe for
+# gfx936 — compiler rejection FAILS the build; the arch is never
+# silently dropped and never relabeled (gfx90a/gfx942). Build-arch
+# allowlist only: NO runtime support is claimed. Default upstream arch
+# behavior is unchanged when the option is OFF.
 RUN cd /workspace/vllm \
-    && python setup.py bdist_wheel \
-    && pip install --no-cache-dir dist/*.whl \
+    && SETUPTOOLS_SCM_PRETEND_VERSION="0.29.0.post1+glm53hcu" \
+       CMAKE_ARGS="-DVLLM_HCU_EXPERIMENTAL_GFX936=ON -DHCU_MACRO_HEADER=${HCU_MACRO_HEADER}" \
+       PYTORCH_ROCM_ARCH="gfx936" \
+       python setup.py bdist_wheel \
+    && pip install --no-cache-dir --no-deps dist/*.whl \
     && rm -rf dist build
 
-# --- vLLM-HCU plugin @ e1861907 (public bridge) ---
-# Compiles vllm_hcu.hcu_ops against the installed torch (CUDAExtension
-# with torch.version.hip → HCU compiler contract; MAX_JOBS parallel).
+# --- vLLM-HCU plugin: public bridge + gate adaptation ---
+# Same contract: --no-deps, existing torch/compiler only.
 RUN cd /workspace/vllm-plugin-das \
     && python setup.py bdist_wheel \
-    && pip install --no-cache-dir dist/*.whl \
+    && pip install --no-cache-dir --no-deps dist/*.whl \
     && rm -rf dist build
 
-# --- synthetic no-weight smoke entrypoints (no model download) ---
-COPY scripts/public-build-smoke/ /workspace/smoke/
-
+# --- synthetic no-weight smoke entrypoints (tracked in the archive) ---
+# Gate levels: IMPORT (module loads), COMPILE (triton kernel compiles),
+# CPU (processor/logic runs), GPU (device kernels). No weights, no
+# network, no downloads at build or smoke time.
 WORKDIR /workspace
+CMD ["bash", "/workspace/vllm/scripts/public-build-smoke/run_smoke.sh"]
