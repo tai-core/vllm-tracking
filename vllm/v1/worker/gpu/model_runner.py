@@ -67,6 +67,8 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     KVCacheConfig,
+    KVCacheSpec,
+    KpoolTailSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -168,6 +170,25 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import use_workspace_lane
 
 logger = init_logger(__name__)
+
+
+
+def spec_uses_generic_token_slot_mapping(layer_spec: KVCacheSpec) -> bool:
+    """Whether the generic per-token slot-mapping kernel may run for a
+    cache group whose layers are described by ``layer_spec``.
+
+    KpoolTailSpec groups are excluded: the tail row is a single ring
+    block (8/32 columns after 128-token alignment) while the generic
+    kernel's global-position indices (``pos // kernel_block_size``)
+    reach up to ``max_model_len // kpool`` columns — an out-of-bounds
+    block-table read. The dedicated KpoolTailMetadataBuilder fully
+    overrides the slot row with the column-0 circular mapping
+    (``own_block * kpool + pos % kpool``), so disabling the generic path
+    only removes the invalid reads (indices clamp to a valid column 0
+    and slot ids become PAD_SLOT_ID).
+    """
+    return not isinstance(layer_spec, (CircularBufferSpec, KpoolTailSpec))
+
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -560,7 +581,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             layer_spec = (
                 spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
             )
-            slot_mapping_enabled.append(not isinstance(layer_spec, CircularBufferSpec))
+            slot_mapping_enabled.append(
+                spec_uses_generic_token_slot_mapping(layer_spec)
+            )
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
             max_num_blocks = spec.max_num_blocks_per_req(

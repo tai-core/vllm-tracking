@@ -167,6 +167,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheSpecKind,
+    KpoolTailSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
@@ -290,6 +291,23 @@ def nans_to_dict(counts: list[int], req_id_to_index: dict[str, int]) -> dict[str
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
+
+def spec_uses_generic_token_slot_mapping_v1(kv_cache_spec: KVCacheSpec) -> bool:
+    """V1 counterpart: whether a cache group's per-token slot-mapping
+    kernel should run. Mamba-like state caches and KpoolTail rings do
+    not use generic token slot mappings (see
+    ``gpu/model_runner.spec_uses_generic_token_slot_mapping`` for the
+    KpoolTail rationale)."""
+    if isinstance(kv_cache_spec, KpoolTailSpec):
+        return False
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs) and all(
+        isinstance(spec, KpoolTailSpec)
+        for spec in kv_cache_spec.kv_cache_specs.values()
+    ):
+        return False
+    return True
+
+
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
         self,
@@ -7353,8 +7371,16 @@ class GPUModelRunner(
             block_sizes.append(block_size)
             if kv_cache_spec_kind == KVCacheSpecKind.MAMBA:
                 slot_mapping_modes.append(SlotMappingMode.NONE)
-            else:
+            elif spec_uses_generic_token_slot_mapping_v1(kv_cache_spec):
                 slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)
+            else:
+                # KpoolTail rings: the generic slot kernel would index the
+                # narrow single-ring-block row with global positions
+                # (pos // kpool columns vs an 8/32-column row) — an
+                # out-of-bounds read. The dedicated KpoolTail metadata
+                # builder computes the circular mapping itself, so the
+                # generic kernel is skipped entirely.
+                slot_mapping_modes.append(SlotMappingMode.NONE)
             max_num_blocks_per_req = kv_cache_spec.max_num_blocks_per_req(
                 self.vllm_config, max_model_len
             )
