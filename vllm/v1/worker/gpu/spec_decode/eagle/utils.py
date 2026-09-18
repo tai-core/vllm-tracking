@@ -7,6 +7,7 @@ from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.model_loader.utils import get_draft_load_config
 
 
 def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
@@ -47,6 +48,9 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                 cache_dtype=speculative_config.kv_cache_dtype,
             ),
         )
+    draft_load_config = get_draft_load_config(vllm_config)
+    if draft_load_config is not vllm_config.load_config:
+        vllm_config = replace(vllm_config, load_config=draft_load_config)
     with set_model_tag("eagle_head"):
         eagle_model = get_model(
             vllm_config=vllm_config, model_config=draft_model_config

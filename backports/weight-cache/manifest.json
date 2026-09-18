@@ -7,8 +7,8 @@
     "sha": "98dff2a81d747d1dba01a47f939f48c3526d4206"
   },
   "fork_base": "11df7d1d629d9a8da6cd22d8971bf54062bc5988",
-  "scope": "Single-node TP-only target-model weight cache; HCU/SlimQuant validation is separate.",
-  "implementation_status": "PASS for bounded TP8/C1/64K W8A8 text+image acceptance: disk baseline plus two cache-only engine lifetimes, exact token/message match, selected shared MLA fingerprints stable, final VRAM reclaimed. See validation-20260918.md for exact revisions and limits.",
+  "scope": "Single-node TP-only target plus same-TP MTP draft weight-cache groups; current HCU target configuration is TP8/PP1/DP1/DCP1. Multi-node, other speculative model families and EP are not accepted by this extension.",
+  "implementation_status": "Node 08 bounded W8A8 TP8/PP1/DP1/DCP1, 64K/C8, MTP k4 local argmax, AITER-RNE, KV 8 GiB, zero_copy/fallback=false engineering acceptance, warm restart and resource recovery PASS. Node 10 deployment accepted-with-video-limitation by explicit user decision: service running/health 200, all 16 owner sockets present and all 8 engine worker RNE mappings/selection logs verified, independent C8 gate 8/8 and 6 basic cases PASS; original two-color video and a separately repeated diagnostic request fail to produce a final answer, reformulation remains known_answer FAIL. Business retries were zero. No Torch mHC control was run; video behavior is not attributed to RNE, MTP or the model itself. Historical RNE strict numeric failures remain. GitHub CI NOT_RUN due to account payment/spending-limit restriction. See mtp-validation-20260918.md; no aggregate video-quality or all-request PASS claim.",
   "upstream_commits": [
     {
       "sha": "a69e75b9b6d6a26d90b6790e2eb75b3419a47c16",
@@ -47,6 +47,38 @@
       "depends_on": [
         "dbf49dad11e30ec5d464be74b715a9a9e31c2c5a"
       ]
+    },
+    {
+      "sha": "52dd0d7562adb3c2d556ce6fe7ca7c3226e1976b",
+      "pr": 55468,
+      "title": "Daemon local-rank and independent master-port launcher dependency",
+      "depends_on": [
+        "dbf49dad11e30ec5d464be74b715a9a9e31c2c5a"
+      ],
+      "notes": "Direct launcher dependency of PR57312. Reusing its upstream structure does not assert multi-node hardware acceptance."
+    },
+    {
+      "sha": "13a3b1077cd40659f252b18d8fec7603a1ced916",
+      "pr": 57312,
+      "title": "Separate speculative draft daemon groups and loader routing",
+      "depends_on": [
+        "52dd0d7562adb3c2d556ce6fe7ca7c3226e1976b",
+        "567f745c1b14ffaf09bfa71b7c4d0177a7994c04"
+      ],
+      "source_parent_sha": "8538017f4b1d01b543345f5dbe1993cb66c80fa9",
+      "upstream_pr_state": "OPEN",
+      "upstream_merged": false
+    },
+    {
+      "sha": "e5d0102f88f019a921888ec22bbe6a36736e88af",
+      "pr": 57312,
+      "title": "Preserve target VllmConfig for draft construction and export ownership flags",
+      "depends_on": [
+        "13a3b1077cd40659f252b18d8fec7603a1ced916"
+      ],
+      "upstream_pr_state": "OPEN",
+      "upstream_merged": false,
+      "notes": "Pinned reviewed PR head, not a merged upstream feature. EAGLE/EAGLE3 code retained from the complete feature; HCU acceptance is MTP-only."
     }
   ],
   "local_adaptations": [
@@ -89,20 +121,26 @@
     {
       "id": "daemon-workspace-initialization",
       "repository": "tai-core/vllm-glm53-bw1000",
-      "implementation_status": "IMPLEMENTED; regression and real TP8 daemon model load PASS",
+      "implementation_status": "IMPLEMENTED; regression, target-only TP8 load and node 08 all 16 target/draft role constructor checks PASS",
       "notes": "Standalone daemon skips GPUWorker; initialize WorkspaceManager on its current GPU before constructing the model. Initialization itself allocates no scratch tensor. Independently reassess after an upstream upgrade."
     },
     {
       "id": "daemon-spawn-general-plugins",
       "repository": "tai-core/vllm-glm53-bw1000",
-      "implementation_status": "IMPLEMENTED; regression and actual eight-rank daemon/cache engine load PASS",
-      "notes": "Real config-unpickling/spawn probe lacked GLM, INT8 and MLA callbacks before load_general_plugins; explicit loading restored parent-equivalent symbols. Initialize general plugins before each rank constructs its daemon. Probe sampling completed but its original five-second child-exit gate failed; full lifecycle remains pending."
+      "implementation_status": "IMPLEMENTED; regression and node 08 role checks PASS; node 10 all 16 owner sockets present, and actual RNE mappings plus selection logs verified for all 8 engine workers",
+      "notes": "Real config-unpickling/spawn probe lacked GLM, INT8 and MLA callbacks before load_general_plugins; explicit loading restored parent-equivalent symbols. Initialize general plugins before each rank constructs its daemon. The historical diagnostic five-second child-exit failure is distinct from later successful runtime role checks; node 10 deployment retains documented video-quality limitations."
     },
     {
       "id": "glm-router-parameter-reference-rebind",
       "repository": "tai-core/vllm-plugin-das-glm53-bw1000",
-      "implementation_status": "IMPLEMENTED; real binder CPU red/green and two GPU cache-only lifetimes PASS",
+      "implementation_status": "IMPLEMENTED; prior target-only CPU/GPU checks PASS; plugin 49ea0bed extends MTP hook coverage and node 08 all 16 role constructor/hook checks plus target+draft shared-state audits PASS",
       "notes": "GroupedTopKRouter is not an nn.Module and retains a meta correction-bias Parameter after the IPC binder re-registers restored parameters. A cache-only GLM post-load hook rebinds router bias to the restored registered Parameter and chains any original model hook. Reassess if upstream binder preserves parameter identity or router ownership changes."
+    },
+    {
+      "id": "v029-mtp-loader-and-daemon-context",
+      "repository": "tai-core/vllm-glm53-bw1000",
+      "implementation_status": "IMPLEMENTED; 13 CPU contracts and node 08 engineering/warm-restart/recovery PASS; node 10 running with independent C8 gate 8/8 and 6 basic cases PASS, deployment accepted-with-video-limitation; not full video-quality acceptance",
+      "notes": "Preserve general-plugin initialization in every spawned daemon role and workspace initialization on local_rank. Retain original v0.29 PP behavior without importing absent get_pp_safe_draft_load_config from PR54416; all MRV2 call sites use get_draft_load_config directly. Preserve prior regression cases with the new daemon role/model-config signatures. Owner and consumer must run the same new protocol; old target-only owners cannot be reused."
     }
   ],
   "excluded_upstream_prs": [
@@ -119,8 +157,12 @@
       "reason": "FP4 feature and related EP/readiness behavior are outside this TP-only scope."
     },
     {
-      "pr": 55468,
-      "reason": "Multi-node launcher is outside scope; scripts must not use its master-port flag."
+      "pr": 54416,
+      "reason": "MRV2 pipeline-parallel loader changes are outside the PP1 acceptance scope; use the existing v0.29 configuration shape and route draft loading directly."
+    },
+    {
+      "pr": 55337,
+      "reason": "The MRV2 draft-load-config fix is included by complete PR57312 routing; do not apply a duplicate patch."
     }
   ]
 }
