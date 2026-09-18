@@ -17,6 +17,7 @@ import threading
 import time
 
 import pytest
+
 from vllm import SamplingParams
 from vllm.platforms import current_platform
 

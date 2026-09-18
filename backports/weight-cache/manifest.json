@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "feature": "gpu-weight-cache",
+  "upstream_repository": "https://github.com/vllm-project/vllm",
+  "upstream_base": {
+    "tag": "v0.29.0",
+    "sha": "98dff2a81d747d1dba01a47f939f48c3526d4206"
+  },
+  "fork_base": "11df7d1d629d9a8da6cd22d8971bf54062bc5988",
+  "scope": "Single-node TP-only target-model weight cache; HCU/SlimQuant validation is separate.",
+  "implementation_status": "PASS for bounded TP8/C1/64K W8A8 text+image acceptance: disk baseline plus two cache-only engine lifetimes, exact token/message match, selected shared MLA fingerprints stable, final VRAM reclaimed. See validation-20260918.md for exact revisions and limits.",
+  "upstream_commits": [
+    {
+      "sha": "a69e75b9b6d6a26d90b6790e2eb75b3419a47c16",
+      "pr": 54921,
+      "title": "Fast Start GPU weight cache",
+      "depends_on": []
+    },
+    {
+      "sha": "49632fb3ac8fa92de2b4626bb8f140ffcc4ab8d3",
+      "pr": 56010,
+      "title": "Reject unsupported IPC platforms",
+      "depends_on": [
+        "a69e75b9b6d6a26d90b6790e2eb75b3419a47c16"
+      ]
+    },
+    {
+      "sha": "533dbe424b9bdde6a7ffe100d507a69a24dfee1a",
+      "pr": 55656,
+      "title": "Validate preprocessed-weight support per quantization method",
+      "depends_on": [
+        "49632fb3ac8fa92de2b4626bb8f140ffcc4ab8d3"
+      ]
+    },
+    {
+      "sha": "dbf49dad11e30ec5d464be74b715a9a9e31c2c5a",
+      "pr": 56669,
+      "title": "Use physical GPU UUID for cache socket identity",
+      "depends_on": [
+        "533dbe424b9bdde6a7ffe100d507a69a24dfee1a"
+      ]
+    },
+    {
+      "sha": "567f745c1b14ffaf09bfa71b7c4d0177a7994c04",
+      "pr": 56472,
+      "title": "Export IPC tensor handles separately for each client",
+      "depends_on": [
+        "dbf49dad11e30ec5d464be74b715a9a9e31c2c5a"
+      ]
+    }
+  ],
+  "local_adaptations": [
+    {
+      "id": "core-v029-context-compatibility",
+      "repository": "tai-core/vllm-glm53-bw1000",
+      "implementation_status": "IMPLEMENTED; five runtime compatibility tests and bounded GPU cache acceptance PASS",
+      "decisions": [
+        {
+          "pr": 54921,
+          "path": "vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py",
+          "notes": "Preserve baseline ROCm _maybe_pad_weight .data assignment semantics and add upstream preprocessed-weight early return."
+        },
+        {
+          "pr": 55656,
+          "notes": "Remove the old quantization allowlist while retaining per-method support gates. Omit the absent log_online_quantization call and retain baseline model-inspection logging."
+        },
+        {
+          "pr": 56669,
+          "notes": "Retain glob readiness detection without importing unrelated ImageAsset/Kimi FP4 tests. Restore the test helper self.tp_size attribute in a separate compatibility commit because the omitted FP4 series supplied it upstream."
+        },
+        {
+          "pr": 56472,
+          "notes": "Retain sent-tensors logging alongside fresh per-client IPC exports."
+        }
+      ]
+    },
+    {
+      "id": "hcu-device-identity",
+      "repository": "tai-core/vllm-plugin-das-glm53-bw1000",
+      "implementation_status": "IMPLEMENTED; real eight-device identity and HIP reorder 7,0 PASS",
+      "notes": "Implement and validate stable physical device UUID mapping on HCU. Revalidate after every upstream platform change."
+    },
+    {
+      "id": "slimquant-preprocessed-weight-restore",
+      "repository": "tai-core/vllm-plugin-das-glm53-bw1000",
+      "implementation_status": "IMPLEMENTED; 47 CPU behavior tests, TP1/TP8 method gates, and two cache-only GPU engine lifetimes PASS",
+      "notes": "Skip weight repacking on IPC restore while reconstructing process-local runtime state. Declaring support alone is insufficient; model and restart checks remain mandatory."
+    },
+    {
+      "id": "daemon-workspace-initialization",
+      "repository": "tai-core/vllm-glm53-bw1000",
+      "implementation_status": "IMPLEMENTED; regression and real TP8 daemon model load PASS",
+      "notes": "Standalone daemon skips GPUWorker; initialize WorkspaceManager on its current GPU before constructing the model. Initialization itself allocates no scratch tensor. Independently reassess after an upstream upgrade."
+    },
+    {
+      "id": "daemon-spawn-general-plugins",
+      "repository": "tai-core/vllm-glm53-bw1000",
+      "implementation_status": "IMPLEMENTED; regression and actual eight-rank daemon/cache engine load PASS",
+      "notes": "Real config-unpickling/spawn probe lacked GLM, INT8 and MLA callbacks before load_general_plugins; explicit loading restored parent-equivalent symbols. Initialize general plugins before each rank constructs its daemon. Probe sampling completed but its original five-second child-exit gate failed; full lifecycle remains pending."
+    },
+    {
+      "id": "glm-router-parameter-reference-rebind",
+      "repository": "tai-core/vllm-plugin-das-glm53-bw1000",
+      "implementation_status": "IMPLEMENTED; real binder CPU red/green and two GPU cache-only lifetimes PASS",
+      "notes": "GroupedTopKRouter is not an nn.Module and retains a meta correction-bias Parameter after the IPC binder re-registers restored parameters. A cache-only GLM post-load hook rebinds router bias to the restored registered Parameter and chains any original model hook. Reassess if upstream binder preserves parameter identity or router ownership changes."
+    }
+  ],
+  "excluded_upstream_prs": [
+    {
+      "pr": 51285,
+      "reason": "Online-quantization logging/config feature is outside scope; do not introduce it solely for a moved log call."
+    },
+    {
+      "pr": 51392,
+      "reason": "Combined online/prequantized behavior is outside scope."
+    },
+    {
+      "pr": 55465,
+      "reason": "FP4 feature and related EP/readiness behavior are outside this TP-only scope."
+    },
+    {
+      "pr": 55468,
+      "reason": "Multi-node launcher is outside scope; scripts must not use its master-port flag."
+    }
+  ]
+}

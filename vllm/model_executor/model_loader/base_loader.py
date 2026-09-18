@@ -48,7 +48,6 @@ class BaseModelLoader(ABC):
             model_config=model_config,
             prefix=prefix,
         )
-        log_online_quantization(vllm_config)
         log_model_inspection(model)
         return model
 
@@ -70,7 +69,6 @@ class BaseModelLoader(ABC):
                     model_config=model_config,
                     prefix=prefix,
                 )
-
 
             logger.debug("Loading weights on %s ...", load_device)
             self.load_weights(model, model_config)
