@@ -198,6 +198,159 @@ class OpenAIServingChat(GenerateBaseServing):
             .chat_template_kwargs
         )
 
+    def _request_tools_dicts(
+        self, request: ChatCompletionRequest
+    ) -> list[dict[str, Any]] | None:
+        """The tools context the renderer will use for this request,
+        mirroring OnlineRenderer.render_chat's tool handling."""
+        if request.tools is None or (
+            request.tool_choice == "none"
+            and self.exclude_tools_when_tool_choice_none
+        ):
+            return None
+        return [t.model_dump() for t in request.tools]
+
+    def _is_glm53_always_thinking_default_profile(
+        self, request: ChatCompletionRequest
+    ) -> bool:
+        """Conservative GLM-5.3-Flash always-thinking detection.
+
+        True only when BOTH hold:
+        1. the resolved model config is ``glm5_next`` (the GLM-5.3-Flash
+           family), and
+        2. the template that will actually render this request is the
+           MODEL-PROVIDED or SERVER-DEFAULT template — i.e. no request-level
+           ``chat_template`` override — and that template declares
+           ``reasoning_effort`` but no ``enable_thinking`` switch. The
+           template is resolved through the SAME ``resolve_chat_template``
+           chain and tools context the renderer uses for this request, so a
+           deployment without ``--chat-template`` (the normal case, where the
+           tokenizer/processor provides the model's own template) is covered.
+
+        Custom request templates (any override) OPT OUT entirely: their
+        capabilities are not inferred from variable names, so they keep the
+        generic pre-existing behavior. An operator-provided server template
+        (``--chat-template``) is validated the same way as the model default;
+        both are "the deployment's effective default", distinguished in docs
+        from request-level overrides.
+        """
+        if getattr(self.model_config.hf_config, "model_type", None) != "glm5_next":
+            return False
+        if request.chat_template is not None:
+            return False  # request-level custom template: generic behavior
+        from vllm.renderers.hf import (
+            _cached_resolve_chat_template_kwargs,
+            resolve_chat_template,
+        )
+
+        template = resolve_chat_template(
+            self.renderer.tokenizer,
+            chat_template=self.chat_template,  # None -> model/processor chain
+            tools=self._request_tools_dicts(request),
+            model_config=self.model_config,
+        )
+        if not isinstance(template, str) or not template:
+            return False
+        template_vars = set(_cached_resolve_chat_template_kwargs(template))
+        return ("reasoning_effort" in template_vars
+                and "enable_thinking" not in template_vars)
+
+    def _validate_thinking_contract(
+        self, request: ChatCompletionRequest, chat_template_kwargs: dict[str, Any]
+    ) -> ErrorResponse | None:
+        """GLM-5.3-Flash default profile (always-thinking): reject requests
+        that would effectively disable thinking — ``enable_thinking=false``,
+        the ``thinking=false`` alias, ``reasoning_effort='none'`` (an
+        unsupported semantic for this profile), or contradictory alias
+        combinations — with an OpenAI-compatible HTTP 400 naming the actual
+        offending/conflicting parameter(s), BEFORE any engine call or
+        rendering. Non-bool values for either alias are type-checked only
+        inside this scope. Other models, custom templates and raw completions
+        are unchanged."""
+        if not self._is_glm53_always_thinking_default_profile(request):
+            return None
+
+        user_kwargs = request.chat_template_kwargs or {}
+        enable_thinking = chat_template_kwargs.get("enable_thinking")
+        thinking = chat_template_kwargs.get("thinking")
+        effort = request.reasoning_effort
+
+        # --- alias type validation (scoped only) ---
+        bad_types: list[tuple[str, Any]] = []
+        if "enable_thinking" in chat_template_kwargs and \
+                not isinstance(enable_thinking, bool):
+            bad_types.append(("chat_template_kwargs.enable_thinking",
+                              enable_thinking))
+        if "thinking" in chat_template_kwargs and \
+                not isinstance(thinking, bool):
+            bad_types.append(("chat_template_kwargs.thinking", thinking))
+        if bad_types:
+            name, v = bad_types[0]
+            return self.create_error_response(
+                message=(
+                    f"{name} must be a boolean; got {type(v).__name__}. This "
+                    "model profile does not support disabling thinking; use "
+                    "reasoning_effort ('low' lowers the budget, it does not "
+                    "disable thinking)."
+                ),
+                param=name,
+            )
+
+        # --- reasoning_effort='none' is its own unsupported semantic ---
+        if effort == "none":
+            conflicts = []
+            if enable_thinking is True:
+                conflicts.append("chat_template_kwargs.enable_thinking=true")
+            if thinking is True:
+                conflicts.append("chat_template_kwargs.thinking=true")
+            detail = (
+                "Unsupported request: reasoning_effort='none' asks to disable "
+                "thinking, but this GLM-5.3-Flash profile is always-thinking "
+                "(only reasoning_effort 'low'/'high'/'max' are supported, "
+                "where 'low' lowers the reasoning budget without disabling "
+                "thinking)."
+            )
+            if conflicts:
+                detail += (" It also conflicts with "
+                           + " and ".join(conflicts) + ".")
+            return self.create_error_response(
+                message=detail,
+                param="reasoning_effort",
+            )
+
+        # --- effective thinking-disable via the two aliases ---
+        disabled_by: list[str] = []
+        if enable_thinking is False:
+            disabled_by.append("chat_template_kwargs.enable_thinking=false")
+        if thinking is False:
+            disabled_by.append("chat_template_kwargs.thinking=false")
+        if disabled_by:
+            # Name only the fields that actually disable thinking; a sibling
+            # true-valued alias is a contradiction, mentioned but not blamed.
+            conflicts = []
+            if enable_thinking is True:
+                conflicts.append("chat_template_kwargs.enable_thinking=true")
+            if thinking is True:
+                conflicts.append("chat_template_kwargs.thinking=true")
+            detail = (
+                "Unsupported request: "
+                + " and ".join(disabled_by)
+                + " disable thinking, but this GLM-5.3-Flash profile is "
+                "always-thinking (its chat template has no enable_thinking "
+                "switch; only reasoning_effort 'low'/'high'/'max' are "
+                "supported, where 'low' lowers the reasoning budget without "
+                "disabling thinking). Disabling thinking here would only "
+                "disable reasoning parsing and leak thinking text into the "
+                "answer."
+            )
+            if conflicts:
+                detail += (" It contradicts " + " and ".join(conflicts) + ".")
+            return self.create_error_response(
+                message=detail,
+                param=disabled_by[0].split("=")[0],
+            )
+        return None
+
     def _engine_chat_template_kwargs(
         self, chat_template_kwargs: dict[str, Any]
     ) -> dict[str, Any]:
@@ -264,6 +417,11 @@ class OpenAIServingChat(GenerateBaseServing):
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
+        thinking_error = self._validate_thinking_contract(
+            request, chat_template_kwargs
+        )
+        if thinking_error is not None:
+            return thinking_error
         parser: Parser | None = None
         if self.parser_cls is not None:
             parser = self.parser_cls(
