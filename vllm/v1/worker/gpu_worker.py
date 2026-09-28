@@ -952,9 +952,24 @@ class Worker(WorkerBase):
         if self.use_v2_model_runner:  # noqa: SIM102
             if self.vllm_config.kernel_config.enable_jit_warmup:
                 # A workspace resize after capture frees what the graphs point at.
-                warmup_kernels(
-                    self.model_runner, self.execute_model, self.sample_tokens
+                # The dummy decode warmup corrupts Qwen3.5-family weights on MUSA
+                # before graph capture. The validated dense and MoE paths can
+                # capture directly after the existing model and kernel warmups.
+                skip_musa_qwen35_warmup = (
+                    self.device_config.device_type == "musa"
+                    and getattr(self.model_config.hf_config, "model_type", None)
+                    in ("qwen3_5", "qwen3_5_moe")
                 )
+                if skip_musa_qwen35_warmup:
+                    logger.warning_once(
+                        "Skipping v2 warmup for MUSA Qwen3.5-family models"
+                    )
+                elif os.environ.get("VLLM_SKIP_KERNEL_WARMUP") == "1":
+                    logger.info_once("Skipping v2 warmup by VLLM_SKIP_KERNEL_WARMUP=1")
+                else:
+                    warmup_kernels(
+                        self.model_runner, self.execute_model, self.sample_tokens
+                    )
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
