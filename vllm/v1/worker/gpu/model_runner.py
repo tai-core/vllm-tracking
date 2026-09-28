@@ -227,6 +227,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
 
         self.output_copy_stream = torch.cuda.Stream(self.device)
+        # MUSA: a copy-stream wait queued for a later step delays an earlier step's
+        # copy event until that later step finishes, so each in-flight step gets
+        # its own stream.
+        self._output_copy_streams = [self.output_copy_stream]
+        self._output_copy_streams.extend(
+            torch.cuda.Stream(self.device)
+            for _ in range(max(1, vllm_config.max_concurrent_batches - 1))
+        )
+        self._output_copy_stream_idx = 0
 
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -2186,7 +2195,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampler_output=sampler_output,
             num_sampled_tokens=num_sampled,
             main_stream=self.main_stream,
-            copy_stream=self.output_copy_stream,
+            copy_stream=self._next_output_copy_stream(),
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
         )
@@ -2279,6 +2288,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         return async_output
 
+    def _next_output_copy_stream(self) -> torch.cuda.Stream:
+        streams = self._output_copy_streams
+        stream = streams[self._output_copy_stream_idx]
+        self._output_copy_stream_idx = (self._output_copy_stream_idx + 1) % len(streams)
+        return stream
+
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.draft_tokens_handler.get_draft_tokens()
 
@@ -2320,7 +2335,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             pooler_output=pooler_output,
             finished_mask=finished_mask,
             main_stream=self.main_stream,
-            copy_stream=self.output_copy_stream,
+            copy_stream=self._next_output_copy_stream(),
         )
 
         self.postprocess_num_computed_tokens(input_batch)
