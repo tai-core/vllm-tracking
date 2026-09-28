@@ -1427,7 +1427,6 @@ class KVCacheTensor:
     block_stride: int
     offset: int = 0  # byte offset of layers[0]'s block 0
     host_resident: bool = False
-    musa_mamba_pool: bool = False  # MUSA: backs the separate mamba state pool
 
 
 class KVCacheGroupRole(str, Enum):
@@ -1474,8 +1473,6 @@ class KVCacheConfig:
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
     prefix_cache_retention_interval: int | None = None
-    # MUSA: block count of the separate mamba state pool when dedicated policy is selected.
-    musa_mamba_num_blocks: int | None = None
     """Resolved retention policy for local prefix-cache checkpoints."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
@@ -1559,14 +1556,6 @@ class KVCacheConfig:
     def num_blocks_of(self, tensor: KVCacheTensor) -> int:
         """Number of blocks addressable by the pool backing ``tensor``."""
         if not tensor.host_resident:
-            if self.musa_mamba_num_blocks is not None:
-                tensor_layers = set(tensor.layers)
-                if any(
-                    isinstance(group.kv_cache_spec, MambaSpec)
-                    and tensor_layers.intersection(group.layer_names)
-                    for group in self.kv_cache_groups
-                ):
-                    return self.musa_mamba_num_blocks
             return self.num_blocks
         assert self.hisparse_host_num_blocks is not None
         return self.hisparse_host_num_blocks

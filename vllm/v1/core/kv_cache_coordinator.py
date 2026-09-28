@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
+    is_mamba_group,
 )
 from vllm.v1.request import Request
 
@@ -128,10 +129,40 @@ class KVCacheCoordinator(ABC):
         self.musa_mamba_block_pools: dict[int, BlockPool] = {}
         musa_mamba_num_blocks = kv_cache_config.musa_mamba_num_blocks
         if musa_mamba_separate_pool_enabled() and musa_mamba_num_blocks:
+            # The state tensor is sized for one block-id window per KDA rank;
+            # requests may only allocate inside this rank's own window.
+            alloc_num_blocks = (
+                kv_cache_config.musa_mamba_alloc_num_blocks or musa_mamba_num_blocks
+            )
+            lease_start = kv_cache_config.musa_mamba_lease_start
+            shared_ids = kv_cache_config.musa_mamba_shared_ids
+            admission_leases = shared_ids and lease_start is None
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
-                if isinstance(group.kv_cache_spec, MambaSpec):
+                if not is_mamba_group(group):
+                    continue
+                if shared_ids:
+                    # Globally addressed pool: block 0 is the shared null
+                    # block. Cross-request retention stays off in both modes --
+                    # another rank reusing the slot would invalidate the cached
+                    # state. Static leases restrict the free queue to this
+                    # rank's range; admission leases keep no free queue at all
+                    # and redeem blocks by id instead.
                     self.musa_mamba_block_pools[group_id] = BlockPool(
                         num_gpu_blocks=musa_mamba_num_blocks,
+                        enable_caching=False,
+                        hash_block_size=hash_block_size,
+                        enable_kv_cache_events=False,
+                        metrics_collector=None,
+                        allocatable_block_ids=(
+                            range(0, 0)
+                            if admission_leases
+                            else range(lease_start, lease_start + alloc_num_blocks)
+                        ),
+                        lease_only=admission_leases,
+                    )
+                else:
+                    self.musa_mamba_block_pools[group_id] = BlockPool(
+                        num_gpu_blocks=alloc_num_blocks,
                         enable_caching=enable_caching,
                         hash_block_size=hash_block_size,
                         enable_kv_cache_events=False,
@@ -187,6 +218,9 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             if isinstance(manager, MambaManager):
                 manager._dedicated_pool = manager.block_pool is not self.block_pool
+                manager._shared_global_pool = (
+                    manager._dedicated_pool and kv_cache_config.musa_mamba_shared_ids
+                )
         # Match Mamba checkpoints to Eagle's attention replay boundary.
         if use_eagle:
             for manager in self.single_type_managers:
@@ -276,6 +310,72 @@ class KVCacheCoordinator(ABC):
                     prefill_end=prefill_end,
                 )
         return num_blocks_to_allocate
+
+    def set_mamba_state_lease(self, request_id: str, slot: int) -> None:
+        for manager in self.single_type_managers:
+            if isinstance(manager, MambaManager) and manager._shared_global_pool:
+                manager.set_state_lease(request_id, slot)
+
+    def clear_mamba_state_lease(self, request_id: str) -> None:
+        for manager in self.single_type_managers:
+            if isinstance(manager, MambaManager):
+                manager.clear_state_lease(request_id)
+
+    def get_num_blocks_to_allocate_by_pool(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+        prefill_end: int = 0,
+    ) -> tuple[tuple[BlockPool, int], ...]:
+        """Return allocation requirements grouped by owning block pool.
+
+        The upstream coordinator has one ``BlockPool``, so its aggregate
+        admission count is sufficient.  MUSA hybrid models may place Mamba
+        groups in independent pools; omitting those groups from the aggregate
+        count avoids constraining attention admission, but used to let the
+        later Mamba allocation fail inside ``BlockPool.get_new_blocks``.  Keep
+        the legacy aggregate API unchanged and expose the per-pool counts for
+        the scheduler's admission gate.
+        """
+        requirements: dict[int, tuple[BlockPool, int]] = {}
+        if self.retention_interval != 0:
+            prefill_end = 0
+        for i, manager in enumerate(self.single_type_managers):
+            if isinstance(manager, CrossAttentionManager):
+                required = manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_encoder_tokens,
+                    [],
+                    0,
+                    0,
+                    num_encoder_tokens,
+                    apply_admission_cap=apply_admission_cap,
+                )
+            else:
+                required = manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    new_computed_blocks[i],
+                    total_computed_tokens,
+                    num_local_computed_tokens,
+                    num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap,
+                    prefill_end=prefill_end,
+                )
+            pool = manager.block_pool
+            pool_id = id(pool)
+            previous = requirements.get(pool_id)
+            if previous is None:
+                requirements[pool_id] = (pool, required)
+            else:
+                requirements[pool_id] = (pool, previous[1] + required)
+        return tuple(requirements.values())
 
     def allocate_new_computed_blocks(
         self,
