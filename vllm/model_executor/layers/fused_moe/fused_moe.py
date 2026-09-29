@@ -14,6 +14,7 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
+    ApplyMoEActivationConfig,
     MoEActivation,
     apply_moe_activation,
 )
@@ -1473,6 +1474,7 @@ def fused_experts_op(
     block_shape: list[int] | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -1499,6 +1501,7 @@ def fused_experts_op(
         block_shape,
         w1_bias,
         w2_bias,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -1527,6 +1530,7 @@ def fused_experts_op_fake(
     block_shape: list[int] | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -1628,6 +1632,7 @@ def fused_experts(
         block_shape=quant_config.block_shape,
         w1_bias=quant_config.w1_bias,
         w2_bias=quant_config.w2_bias,
+        gemm1_clamp_limit=quant_config.gemm1_clamp_limit,
     )
 
 
@@ -1674,6 +1679,7 @@ def fused_experts_impl(
     block_shape: list[int] | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> torch.Tensor:
     if ocp_mx_scheme is not None:
         raise NotImplementedError(
@@ -1809,7 +1815,15 @@ def fused_experts_impl(
     )
 
     apply_moe_activation(
-        activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
+        activation_enum,
+        intermediate_cache2,
+        intermediate_cache1.view(-1, N),
+        activation_config=(
+            ApplyMoEActivationConfig(clamp_limit=gemm1_clamp_limit)
+            if gemm1_clamp_limit is not None
+            and activation_enum == MoEActivation.SILU
+            else None
+        ),
     )
 
     qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
