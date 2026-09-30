@@ -1425,6 +1425,11 @@ class Qwen2VLForConditionalGeneration(
                 architectures=["Qwen2ForCausalLM"],
             )
 
+        if getattr(torch.version, "musa", None) is not None:
+            from vllm_musa.optimization_contract.rotary import install_model_rotary
+
+            install_model_rotary(self, vllm_config)
+
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
