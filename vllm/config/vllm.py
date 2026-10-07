@@ -2865,8 +2865,12 @@ class VllmConfig:
             if self.model_config is not None and self.model_config.architecture not in (
                 "KimiLinearForCausalLM",
                 "KimiK3ForConditionalGeneration",
+                "Glm5NextForCausalLM",
+                "Glm5NextForConditionalGeneration",
             ):
-                raise ValueError("RecoverSSM is only supported for Kimi-K3 KDA")
+                raise ValueError(
+                    "RecoverSSM is only supported for Kimi-K3 and GLM5Next KDA"
+                )
             if self.mamba_config.enable_stochastic_rounding:
                 raise ValueError(
                     "RecoverSSM supports bfloat16/float32 "
@@ -2888,6 +2892,18 @@ class VllmConfig:
                 raise ValueError(
                     "RecoverSSM currently requires pipeline_parallel_size=1"
                 )
+        if self.model_config is not None and self.model_config.architecture in (
+            "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
+        ):
+            if not self.cache_config.use_kda_recoverssm:
+                raise ValueError("GLM5Next RecoverSSM requires speculative decoding")
+            if not self.use_v2_model_runner:
+                raise ValueError(
+                    "GLM5Next RecoverSSM requires VLLM_USE_V2_MODEL_RUNNER=1"
+                )
+            if self.cache_config.mamba_cache_mode != "none":
+                raise ValueError("GLM5Next RecoverSSM requires prefix caching disabled")
         elif self.cache_config.mamba_cache_mode == "all":
             raise ValueError(
                 "--use-replayssm supports prefix caching only in align mode; "

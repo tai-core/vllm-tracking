@@ -44,8 +44,8 @@ from vllm.v1.attention.backend import AttentionCGSupport
 DEVICE_TYPE = current_platform.device_type
 
 
-def test_kda_recoverssm_derivation_is_revalidated():
-    config = SimpleNamespace(
+def _recoverssm_config(architecture="KimiLinearForCausalLM"):
+    return SimpleNamespace(
         cache_config=SimpleNamespace(
             use_replayssm=True,
             use_kda_recoverssm=False,
@@ -54,7 +54,7 @@ def test_kda_recoverssm_derivation_is_revalidated():
         num_speculative_tokens=3,
         model_config=SimpleNamespace(
             supports_replayssm=True,
-            architecture="KimiLinearForCausalLM",
+            architecture=architecture,
         ),
         mamba_config=SimpleNamespace(
             backend=MambaBackendEnum.TRITON,
@@ -65,6 +65,9 @@ def test_kda_recoverssm_derivation_is_revalidated():
         use_v2_model_runner=True,
     )
 
+
+def test_kda_recoverssm_derivation_is_revalidated():
+    config = _recoverssm_config()
     VllmConfig.validate_mamba_cached_kernel(config)
     assert config.cache_config.use_replayssm
     assert config.cache_config.use_kda_recoverssm
@@ -81,13 +84,38 @@ def test_kda_recoverssm_derivation_is_revalidated():
     config.cache_config.mamba_cache_mode = "none"
 
     config.model_config.architecture = "NemotronHForCausalLM"
-    with pytest.raises(ValueError, match="only supported for Kimi-K3 KDA"):
+    with pytest.raises(ValueError, match="only supported for Kimi-K3 and GLM5Next KDA"):
         VllmConfig.validate_mamba_cached_kernel(config)
 
     config.model_config.architecture = "KimiLinearForCausalLM"
     config.parallel_config.pipeline_parallel_size = 2
     with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
         VllmConfig.validate_mamba_cached_kernel(config)
+
+
+@pytest.mark.parametrize(
+    "architecture", ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"]
+)
+def test_glm_recoverssm_validates_state_commit_requirements(architecture):
+    config = _recoverssm_config(architecture)
+    VllmConfig.validate_mamba_cached_kernel(config)
+    assert config.cache_config.use_kda_recoverssm
+
+    config.num_speculative_tokens = 0
+    with pytest.raises(ValueError, match="requires speculative decoding"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+    config.num_speculative_tokens = 3
+    config.use_v2_model_runner = False
+    with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER=1"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+    config.use_v2_model_runner = True
+    config.cache_config.mamba_cache_mode = "align"
+    with pytest.raises(ValueError, match="prefix caching disabled"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+    config.cache_config.use_replayssm = False
+    VllmConfig.validate_mamba_cached_kernel(config)
+    assert not config.cache_config.use_kda_recoverssm
 
 
 def test_per_request_spec_decode_metrics_requires_spec_decode():

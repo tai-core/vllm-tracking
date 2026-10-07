@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi-K3 RecoverSSM speculative verify and accepted-state recovery."""
+"""KDA RecoverSSM speculative verify and accepted-state recovery."""
 
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -23,7 +23,7 @@ def _kda_gate(
 ):
     gate_input = raw_g + dt_bias
     if USE_LOWER_BOUND:
-        return lower_bound * tl.sigmoid(A * gate_input)
+        return lower_bound / (1.0 + tl.exp(-(A * gate_input)))
     softplus_gate = tl.where(
         gate_input > 20.0,
         gate_input,
@@ -44,7 +44,7 @@ def _kda_recurrent_step(
     lower_bound,
     USE_LOWER_BOUND: tl.constexpr,
 ):
-    normalized_k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
+    normalized_k = k / tl.sqrt(tl.sum(k * k) + 1e-6)
     gate = _kda_gate(
         raw_g,
         dt_bias,
@@ -169,7 +169,8 @@ def _kda_recoverssm_verify_kernel(
             other=0.0,
         ).to(tl.float32)
 
-        q *= tl.rsqrt(tl.sum(q * q) + 1e-6) * (K**-0.5)
+        q = q / tl.sqrt(tl.sum(q * q) + 1e-6)
+        q = q * (K**-0.5)
         dt_bias = tl.load(dt_bias_ptr + pid_h * K + offs_k, mask=mask_k, other=0.0).to(
             tl.float32
         )
@@ -509,13 +510,10 @@ def _commit_kda_state_kernel(
         mask=mask_k,
         other=0.0,
     ).to(tl.float32)
-    final_decay = tl.full([BK], 1.0, tl.float32)
-    final_correction = tl.zeros([BV, BK], tl.float32)
-    boundary_decay = tl.full([BK], 1.0, tl.float32)
-    boundary_correction = tl.zeros([BV, BK], tl.float32)
+    state = initial_state
+    boundary_state = initial_state
 
-    for reverse_offset in range(commit_len):
-        token_offset = commit_len - reverse_offset - 1
+    for token_offset in range(commit_len):
         correction_ptr = (
             correction_cache_ptr + token_offset * stride_correction_cache_pos
         )
@@ -535,7 +533,7 @@ def _commit_kda_state_kernel(
             mask=mask_k,
             other=0.0,
         ).to(tl.float32)
-        normalized_k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
+        normalized_k = k / tl.sqrt(tl.sum(k * k) + 1e-6)
         gate = _kda_gate(
             raw_g,
             dt_bias,
@@ -543,20 +541,14 @@ def _commit_kda_state_kernel(
             lower_bound,
             USE_LOWER_BOUND,
         )
-        update = correction[:, None] * normalized_k[None, :]
-        decay = tl.exp(gate)
-        final_correction += update * final_decay[None, :]
-        final_decay *= decay
+        # Replay accepted steps in order to preserve native rounding.
+        decayed_state = state * tl.exp(gate)[None, :]
+        state = decayed_state + correction[:, None] * normalized_k[None, :]
         if ALIGN_MODE:
-            before_boundary = token_offset < boundary_recovery_len
-            boundary_correction += tl.where(
-                before_boundary,
-                update * boundary_decay[None, :],
-                0.0,
+            boundary_state = tl.where(
+                token_offset + 1 == boundary_recovery_len, state, boundary_state
             )
-            boundary_decay *= tl.where(before_boundary, decay, 1.0)
 
-    state = initial_state * final_decay[None, :] + final_correction
     if ALIGN_MODE:
         boundary_ptrs = (
             state_ptr
@@ -565,7 +557,6 @@ def _commit_kda_state_kernel(
             + offs_v[:, None] * stride_state_v
             + offs_k[None, :] * stride_state_k
         )
-        boundary_state = initial_state * boundary_decay[None, :] + boundary_correction
         tl.store(
             boundary_ptrs,
             boundary_state,
@@ -722,7 +713,7 @@ def kda_recoverssm_verify(
         BV=block_v,
         SPEC_QUERY_LEN=spec_query_len,
         USE_LOWER_BOUND=lower_bound is not None,
-        num_warps=4,
+        num_warps=1,
         num_stages=2,
     )
     return out
@@ -776,7 +767,8 @@ class KDARecoverSSMCommitContext:
         checkpoints = [layer.kv_cache[1] for layer in layers]
         correction_caches = [layer.kv_cache[2] for layer in layers]
         kg_caches = [layer.kv_cache[3] for layer in layers]
-        A_log = [layer.A_log for layer in layers]
+        # GLM checkpoints expose the same per-head parameter as [1, 1, H, 1].
+        A_log = [layer.A_log.view(-1) for layer in layers]
         dt_bias = [
             layer.dt_bias.view(layer.local_num_heads, layer.head_dim)
             for layer in layers
@@ -1059,7 +1051,7 @@ class KDARecoverSSMCommitContext:
             NUM_HEADS=num_heads,
             USE_LOWER_BOUND=self.lower_bound is not None,
             ALIGN_MODE=block_table is not None,
-            num_warps=4,
+            num_warps=1,
             num_stages=2,
         )
 
