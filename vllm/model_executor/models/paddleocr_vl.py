@@ -978,6 +978,9 @@ class PaddleOCRVLForConditionalGeneration(nn.Module, SupportsMultiModal, Support
                 if not isinstance(layer, PPMissingLayer):
                     layer.self_attn.rotary_emb.is_neox_style = True
 
+        from vllm_musa.optimization_contract.rotary import install_model_rotary
+        install_model_rotary(self, vllm_config)
+
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
