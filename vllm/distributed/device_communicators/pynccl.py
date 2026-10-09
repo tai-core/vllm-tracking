@@ -63,6 +63,8 @@ class PyNcclCommunicator:
         group: ProcessGroup | StatelessProcessGroup,
         device: int | str | torch.device,
         library_path: str | None = None,
+        *,
+        enabled: bool | None = None,
     ):
         """
         Args:
@@ -72,9 +74,21 @@ class PyNcclCommunicator:
                 it will be bound to f"cuda:{local_rank}".
             library_path: the path to the NCCL library. If None, it will
                 use the default library path.
+            enabled: per-communicator override for the
+                ``VLLM_DISABLE_PYNCCL`` decision. ``None`` (default)
+                keeps the existing global env behavior exactly. ``True``
+                overrides only the env-disable decision for THIS
+                communicator (world_size == 1 still never initializes
+                NCCL); ``False`` disables this instance regardless of the
+                env. The env variable itself and other communicators are
+                never modified.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device.
         """
+        if enabled is not None and not isinstance(enabled, bool):
+            raise TypeError(
+                f"enabled must be bool | None, got {type(enabled).__name__}"
+            )
         if not isinstance(group, StatelessProcessGroup):
             assert dist.is_initialized()
             assert dist.get_backend(group) != dist.Backend.NCCL, (
@@ -90,7 +104,10 @@ class PyNcclCommunicator:
         self.group = group
 
         # if world_size == 1, no need to create communicator
-        if self.world_size == 1 or envs.VLLM_DISABLE_PYNCCL:
+        # `enabled=True` overrides only the env-disable decision; it can
+        # never force NCCL initialization for a single-rank group.
+        env_disabled = bool(envs.VLLM_DISABLE_PYNCCL)
+        if self.world_size == 1 or (env_disabled if enabled is None else not enabled):
             self.available = False
             self.disabled = True
             return
