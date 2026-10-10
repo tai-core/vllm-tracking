@@ -89,7 +89,9 @@ def compress_norm_rope_store_triton(
             cos_sin_cache=cos_sin_cache,
             kv_cache=kv_cache,
             k_cache_metadata=k_cache_metadata,
-            pdl_kwargs=pdl_kwargs,
+            pdl_kwargs=_musa_deepseek_v4_compress_cache_pdl_kwargs(
+                state_cache, pdl_kwargs
+            ),
             head_dim=head_dim,
             rope_head_dim=rope_head_dim,
             compress_ratio=compress_ratio,
