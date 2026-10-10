@@ -402,9 +402,12 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         # under cudagraph replay.
         with mk_alignment_scope(align_used):
             mm1_out = _resize_cache(workspace2, (M_sum, N))
+            # MUSA mate ragged_moe_gemm_8bit asserts scale tensors are contiguous.
+            a1q_scale = a1q_scale.contiguous()
+            w1_scale = self.w1_scale.contiguous()
             m_grouped_fp8_gemm_nt_contiguous(
                 (a1q, a1q_scale),
-                (w1, self.w1_scale),
+                (w1, w1_scale),
                 mm1_out,
                 grouped_layout,
                 **gemm_kwargs,
@@ -423,9 +426,12 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             )
 
             mm2_out = _resize_cache(workspace2, (M_sum, K))
+            # MUSA mate ragged_moe_gemm_8bit asserts scale tensors are contiguous.
+            a2q_scale = a2q_scale.contiguous()
+            w2_scale = self.w2_scale.contiguous()
             m_grouped_fp8_gemm_nt_contiguous(
                 (a2q, a2q_scale),
-                (w2, self.w2_scale),
+                (w2, w2_scale),
                 mm2_out,
                 grouped_layout,
                 **gemm_kwargs,

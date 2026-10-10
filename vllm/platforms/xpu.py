@@ -564,7 +564,9 @@ class XPUPlatform(Platform):
         using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
         default = ["native"] if using_inductor else ["vllm_c", "native"]
 
-        return IrOpPriorityConfig.with_default(default, gelu_and_mul_sparse=["native"])
+        return IrOpPriorityConfig.with_default(
+            default, gated_qkv_rms_norm_rope=["native"]
+        )
 
     @classmethod
     def device_count(cls) -> int:

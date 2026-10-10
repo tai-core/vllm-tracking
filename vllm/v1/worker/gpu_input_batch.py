@@ -311,6 +311,8 @@ class InputBatch:
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
 
+        self._num_reqs_padded: int | None = None
+
     @property
     def req_ids(self) -> list[str]:
         # None elements should only be present transiently
@@ -717,6 +719,7 @@ class InputBatch:
             self._req_ids.clear()
             self.req_output_token_ids.clear()
             self.spec_token_ids.clear()
+            self._num_reqs_padded = None
             return
 
         # NOTE(woosuk): This function assumes that the empty_req_indices
@@ -831,6 +834,9 @@ class InputBatch:
 
     def refresh_metadata(self):
         """Apply any batch updates to sampling metadata."""
+
+        self._num_reqs_padded = None
+
         if self.is_pooling_model:
             batch_changed = self.batch_update_builder.reset()
             if batch_changed:
@@ -931,6 +937,19 @@ class InputBatch:
                     req_index = self.req_id_to_index[req_id]
                     logprob_token_ids_by_index[req_index] = token_ids
 
+        uniform_top_k = None
+        if self.vocab_size in (151936, 248320) and not self.no_top_k and num_reqs > 0:
+            top_k_cpu = self.top_k_cpu[:num_reqs]
+            candidate_top_k = int(top_k_cpu[0])
+            if candidate_top_k == 50 and np.all(top_k_cpu == candidate_top_k):
+                uniform_top_k = candidate_top_k
+
+        uniform_temperature = None
+        if self.vocab_size in (151936, 248320) and self.all_random and num_reqs > 0:
+            temperature_cpu = self.temperature_cpu[:num_reqs]
+            if np.all(temperature_cpu == np.float32(1.0)):
+                uniform_temperature = 1.0
+
         return SamplingMetadata(
             temperature=temperature,
             all_greedy=self.all_greedy,
@@ -951,6 +970,8 @@ class InputBatch:
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
             thinking_budget_state_holder=self.thinking_budget_state_holder,
+            uniform_top_k=uniform_top_k,
+            uniform_temperature=uniform_temperature,
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:
@@ -1103,6 +1124,16 @@ class InputBatch:
     @property
     def num_reqs(self) -> int:
         return len(self.req_id_to_index)
+
+    @property
+    def num_reqs_padded(self) -> int:
+        if self._num_reqs_padded is None:
+            return self.num_reqs
+        return self._num_reqs_padded
+
+    @num_reqs_padded.setter
+    def num_reqs_padded(self, num_reqs_padded: int) -> None:
+        self._num_reqs_padded = num_reqs_padded
 
     @property
     def all_greedy(self) -> bool:

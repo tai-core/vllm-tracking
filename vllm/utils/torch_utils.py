@@ -885,6 +885,12 @@ def weak_ref_tensor(tensor: Any) -> Any:
     This ignores 0-size tensors as those don't allocate any memory.
     """
     if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+        if not hasattr(torch.ops._C, "weak_ref_tensor"):
+            from vllm.platforms import current_platform
+
+            if current_platform.is_musa():
+                current_platform.import_kernels()
+
         return torch.ops._C.weak_ref_tensor(tensor)
     else:
         return tensor

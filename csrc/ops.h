@@ -11,8 +11,14 @@
 #include <torch/csrc/stable/ops.h>
 
 inline torch::stable::Tensor weak_ref_tensor(torch::stable::Tensor& tensor) {
+#if defined(USE_MUSA)
+  // Ensure tensor is on MUSA
+  STD_TORCH_CHECK(tensor.device().is_privateuseone(),
+                  "Tensor must be on MUSA device");
+#else
   // Ensure tensor is on CUDA
   STD_TORCH_CHECK(tensor.device().is_cuda(), "Tensor must be on CUDA device");
+#endif
 
   // Get the raw data pointer
   void* data_ptr = tensor.mutable_data_ptr();

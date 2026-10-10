@@ -114,6 +114,53 @@ from .utils import request_memory
 logger = init_logger(__name__)
 
 
+def _musa_deepseek_v4_mtp_sparse_prefill_reserve_bytes(
+    vllm_config: VllmConfig,
+) -> int:
+    if not current_platform.is_musa():
+        return 0
+    config = vllm_config.model_config.hf_config
+    architectures = set(getattr(config, "architectures", []) or [])
+    if not any("DeepseekV4" in architecture for architecture in architectures):
+        return 0
+    spec_config = vllm_config.speculative_config
+    if spec_config is None or spec_config.num_speculative_tokens <= 0:
+        return 0
+    if vllm_config.parallel_config.tensor_parallel_size != 8:
+        return 0
+
+    model_config = vllm_config.model_config
+    scheduler_config = vllm_config.scheduler_config
+    cache_config = vllm_config.cache_config
+    num_layers = model_config.get_num_layers(
+        vllm_config.parallel_config
+    )
+    sparse_layers = sum(
+        1
+        for layer_idx in range(num_layers)
+        if layer_idx >= getattr(config, "first_k_dense_replace", num_layers)
+        and (layer_idx + 1) % max(1, getattr(config, "k_dense_replace", 1)) != 0
+    )
+    if sparse_layers == 0:
+        return 0
+
+    max_tokens = scheduler_config.max_num_batched_tokens
+    compress_ratio = 4
+    top_k = getattr(config, "index_topk", 2048)
+    window_size = getattr(config, "sliding_window", 0) or 0
+    combined_topk = ((top_k + window_size + 127) // 128) * 128
+    max_model_len = model_config.max_model_len
+    n = (max_model_len + compress_ratio - 1) // compress_ratio
+    m = n + window_size + max_tokens
+    head_dim = getattr(config, "kv_lora_rank", 512)
+
+    per_layer_bytes = (
+        max_tokens * combined_topk * 4
+        + max_tokens * m * head_dim * 2
+    )
+    return int(per_layer_bytes * sparse_layers * cache_config.gpu_memory_utilization)
+
+
 def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
     spec_config = vllm_config.speculative_config
     return (
@@ -436,7 +483,7 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
-        if self.device_config.device_type == "cuda":
+        if self.device_config.device_type in ("cuda", "musa"):
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             parallel_config = self.parallel_config
@@ -744,6 +791,19 @@ class Worker(WorkerBase):
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
         )
+        sparse_prefill_reserve = _musa_deepseek_v4_mtp_sparse_prefill_reserve_bytes(
+            self.vllm_config
+        )
+        if sparse_prefill_reserve:
+            self.available_kv_cache_memory_bytes = max(
+                0,
+                self.available_kv_cache_memory_bytes - sparse_prefill_reserve,
+            )
+            logger.info(
+                "Reserved %s GiB for DeepSeek-V4 TP8 MTP sparse-prefill "
+                "scratch headroom.",
+                format_gib(sparse_prefill_reserve),
+            )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(

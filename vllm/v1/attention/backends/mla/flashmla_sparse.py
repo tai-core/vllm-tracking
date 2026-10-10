@@ -771,6 +771,9 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             self.supports_dense_mha_prefill = False
 
         vllm_config = get_current_vllm_config()
+        from vllm_musa.optimization_contract import OptimizationFeature, bind_optimization_contract
+        optimization_contract = bind_optimization_contract(self, vllm_config)
+        self._is_glm_dsa = optimization_contract.prefers(OptimizationFeature.GLM5_SPARSE_MLA_MATE_PREFILL)
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         q_concat_heads = num_heads
         if not is_quantized_kv_cache(kv_cache_dtype):
@@ -1304,7 +1307,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             softmax_scale=self.softmax_scale,
         )
 
-        # Slice output and lse back to actual head count if we padded
+        # Slice output back to actual head count if we padded
         if actual_num_heads < padded_num_heads:
             out = out[:, :, :actual_num_heads, :]
             lse = lse[:, :actual_num_heads, :]
@@ -1408,18 +1411,20 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         actual_num_heads = self.num_heads
         if isinstance(q, tuple):
             ql_nope, q_pe = q
-            q_concat_buffer, *_ = current_workspace_manager().get_simultaneous(
-                *self.workspace_specs
-            )
-            q = q_concat_buffer[: ql_nope.shape[0]]
             if q_pe.size(-1) == 0:
+                q_concat_buffer, *_ = current_workspace_manager().get_simultaneous(
+                    *self.workspace_specs
+                )
+                q = q_concat_buffer[: ql_nope.shape[0]]
                 # NoPE (GLM5Next): concat_mla_q requires rope_dim == 64,
                 # copy directly into the head-padded buffer instead.
                 q[:, : ql_nope.shape[1], : self.kv_lora_rank].copy_(ql_nope)
                 if self.q_head_size > self.kv_lora_rank:
                     q[..., self.kv_lora_rank :].zero_()
             else:
-                ops.concat_mla_q(ql_nope, q_pe, q)
+                # MUSA: concat_mla_q leaves the reused q_concat_buffer partially
+                # written (stale NaN/garbage); use a fresh full-write cat instead.
+                q = torch.cat([ql_nope, q_pe], dim=-1)
         else:
             actual_num_heads = q.shape[1]
             if q.shape[-1] < self.q_head_size:

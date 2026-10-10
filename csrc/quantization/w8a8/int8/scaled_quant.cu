@@ -8,7 +8,9 @@
 #include "../../../cub_helpers.h"
 
 static inline __device__ int8_t float_to_int8_rn(float x) {
-#ifdef USE_ROCM
+// MUSA: mcc cannot assemble the NVIDIA-only `cvt.rni.sat.s8.f32` PTX below
+// (it emits wrong int8s), so take the portable nearbyint+saturate path ROCm uses.
+#if defined(USE_ROCM) || defined(USE_MUSA)
   static constexpr auto i8_min =
       static_cast<float>(std::numeric_limits<int8_t>::min());
   static constexpr auto i8_max =
@@ -37,7 +39,8 @@ static inline __device__ int8_t float_to_int8_rn(float x) {
 }
 
 static inline __device__ int32_t float_to_int32_rn(float x) {
-#ifdef USE_ROCM
+// MUSA: same as float_to_int8_rn -- avoid the NVIDIA-only cvt PTX on mcc.
+#if defined(USE_ROCM) || defined(USE_MUSA)
   // int32_max is not exactly representable as float.
   // Therefore, we need to be careful and manually return int32_max on overflow.
   // For symmetry, we also do the same for int32_min, even though it is exactly
@@ -72,7 +75,8 @@ static inline __device__ int32_t float_to_int32_rn(float x) {
 }
 
 static inline __device__ int8_t int32_to_int8(int32_t x) {
-#ifdef USE_ROCM
+// MUSA: same as float_to_int8_rn -- avoid the NVIDIA-only cvt PTX on mcc.
+#if defined(USE_ROCM) || defined(USE_MUSA)
   static constexpr auto i8_min =
       static_cast<int32_t>(std::numeric_limits<int8_t>::min());
   static constexpr auto i8_max =

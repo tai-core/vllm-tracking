@@ -34,6 +34,16 @@ logger = init_logger(__name__)
 # - Add model type to MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS in transformers (better)
 # - Fix tokenizer_class on the hub for the affected models (best)
 _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS: set[str] = {
+    # DeepSeek-OCR advertises a LlamaTokenizerFast in tokenizer_config.json,
+    # but the model config is deepseek_vl_v2.  Loading it through the regular
+    # HF class selects the slow LlamaTokenizer in vLLM's cached wrapper.  Its
+    # convert_tokens_to_string implementation concatenates byte-level token
+    # markers (``Ġ``/``Ċ``), producing malformed OCR/text responses.  Force
+    # the generic fast TokenizersBackend, which honors the tokenizer.json
+    # decoder and preserves the OCR control tokens.
+    # vLLM's config adapter normalizes the raw HF model_type
+    # ``deepseek_vl_v2`` to ``deepseek_ocr`` before this registry is called.
+    "deepseek_ocr",
     "internlm2",
     "step3_vl",
     "step3p7",

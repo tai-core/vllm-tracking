@@ -53,3 +53,6 @@ class SamplingMetadata:
     # When non-None, use ``holder.has_tracked_requests()`` to see if this batch applies
     # thinking-token-budget logits (holder may exist with an empty tracking set).
     thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None
+    # CPU-side hints for exact-gated platform sampler specializations.
+    uniform_top_k: int | None = None
+    uniform_temperature: float | None = None

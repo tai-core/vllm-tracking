@@ -226,6 +226,26 @@ class MemoryProfilingResult:
         )
 
 
+def _calculate_non_kv_cache_memory(result: MemoryProfilingResult) -> int:
+    """Return the profiled memory that is unavailable to the KV cache.
+
+    The free-memory-delta accounting was introduced for CUDA CuMem allocators.
+    MUSA does not use that allocator and its runtime/JIT workspaces can remain
+    visible to ``get_memory_info`` after profiling even though they are reused
+    by serving. Treating that whole delta as persistent double counts those
+    workspaces and can reject configurations that fit and served on v0.24.
+    """
+    is_musa = getattr(current_platform, "is_musa", None)
+    if callable(is_musa) and is_musa():
+        return (
+            result.non_torch_increase
+            + result.torch_peak_increase
+            + result.weights_memory
+        )
+
+    return result.total_consumed + result.transient_peak_headroom
+
+
 @contextlib.contextmanager
 def memory_profiling(
     baseline_snapshot: MemorySnapshot,
@@ -318,4 +338,4 @@ def memory_profiling(
     result.transient_peak_headroom = (
         result.after_profile.torch_peak - result.after_profile.torch_allocated
     )
-    result.non_kv_cache_memory = result.total_consumed + result.transient_peak_headroom
+    result.non_kv_cache_memory = _calculate_non_kv_cache_memory(result)

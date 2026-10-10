@@ -146,7 +146,16 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.num_nans: np.ndarray | None = None
             if sampler_output.num_nans is not None:
                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
-            self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
+            host_num_sampled_tokens = getattr(
+                num_sampled_tokens,
+                "_vllm_musa_uniform_num_sampled_tokens_host",
+                None,
+            )
+            self.num_sampled_tokens_np = (
+                async_copy_to_np(num_sampled_tokens)
+                if host_num_sampled_tokens is None
+                else host_num_sampled_tokens
+            )
             self.sampling_mask_tensors: SamplingMaskTensors | None = None
             if sampler_output.sampling_mask_tensors is not None:
                 self.sampling_mask_tensors = (

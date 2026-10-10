@@ -60,6 +60,9 @@ class GDNAttentionMetadata:
     non_spec_query_start_loc: torch.Tensor | None = (
         None  # shape: [batch - num_spec_decodes + 1,]
     )
+    # MUSA: CPU copy of non_spec_query_start_loc so the tilelang conv1d wrapper
+    # derives seq_lens without a per-call device->host sync.
+    non_spec_query_start_loc_cpu: torch.Tensor | None = None
 
     spec_state_indices_tensor: torch.Tensor | None = None  # shape: [batch, num_spec]
     non_spec_state_indices_tensor: torch.Tensor | None = (
@@ -409,7 +412,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     query_lens,
                     output_size=query_start_loc_cpu[-1].item(),
                 )
-                index = torch.argsort(spec_token_masks, stable=True)
+                sort_key = (
+                    spec_token_masks.to(torch.int32)
+                    if spec_token_masks.device.type == "musa"
+                    else spec_token_masks
+                )
+                index = torch.argsort(sort_key, stable=True)
                 num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
                 non_spec_token_indx = index[:num_non_spec_tokens]
                 spec_token_indx = index[num_non_spec_tokens:]
@@ -582,20 +590,30 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
         if self._stage_decode(num_prefills, num_decodes, num_spec_decodes):
-            self.non_spec_state_indices_tensor[:num_decodes].copy_(
-                non_spec_state_indices_tensor, non_blocking=True
+            reuse_common_decode_tensors = (
+                self.vllm_config.cache_config.mamba_cache_mode == "none"
+                and num_decodes == batch_size
             )
-            non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
-                :batch_size
-            ]
-            non_spec_state_indices_tensor[num_decodes:].fill_(NULL_BLOCK_ID)
+            if not reuse_common_decode_tensors:
+                self.non_spec_state_indices_tensor[:num_decodes].copy_(
+                    non_spec_state_indices_tensor, non_blocking=True
+                )
+                non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
+                    :batch_size
+                ]
+                non_spec_state_indices_tensor[num_decodes:].fill_(NULL_BLOCK_ID)
 
-            self.non_spec_query_start_loc[: num_decodes + 1].copy_(
-                non_spec_query_start_loc, non_blocking=True
-            )
-            non_spec_num_query_tokens = non_spec_query_start_loc[-1]  # type: ignore[index]
-            non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
-            non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
+                self.non_spec_query_start_loc[: num_decodes + 1].copy_(
+                    non_spec_query_start_loc, non_blocking=True
+                )
+                non_spec_query_start_loc = self.non_spec_query_start_loc[
+                    : batch_size + 1
+                ]
+                if num_decodes < batch_size:
+                    assert non_spec_query_start_loc_cpu is not None
+                    non_spec_query_start_loc[num_decodes + 1 :].fill_(
+                        non_spec_query_start_loc_cpu[-1].item()
+                    )
 
         attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
@@ -615,6 +633,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             aiter_prefill_metadata=aiter_prefill_metadata,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
+            non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             spec_sequence_masks=spec_sequence_masks,

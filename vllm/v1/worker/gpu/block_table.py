@@ -246,7 +246,7 @@ def _gather_block_tables_kernel(
 
     stride = tl.load(block_table_strides + group_id)
     max_num_blocks = stride  # stride equals max_num_blocks for this group.
-    dst_block_table_ptr = _load_ptr(dst_block_table_ptrs + group_id, tl.int32)
+    dst_block_table_ptr = _load_int32_ptr(dst_block_table_ptrs + group_id)
     dst_row_ptr = dst_block_table_ptr + batch_idx * stride
 
     if batch_idx >= num_reqs:
@@ -260,7 +260,7 @@ def _gather_block_tables_kernel(
     group_num_blocks_ptr = num_blocks_ptr + group_id * num_blocks_stride
     num_blocks = tl.load(group_num_blocks_ptr + req_idx)
 
-    src_block_table_ptr = _load_ptr(src_block_table_ptrs + group_id, tl.int32)
+    src_block_table_ptr = _load_int32_ptr(src_block_table_ptrs + group_id)
     src_row_ptr = src_block_table_ptr + req_idx * stride
 
     for i in tl.range(0, num_blocks, BLOCK_SIZE):
@@ -304,7 +304,7 @@ def _compute_slot_mappings_kernel(
             tl.store(slot_mapping_ptr + offset, PAD_ID, mask=offset < max_num_tokens)
         return
 
-    block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
+    block_table_ptr = _load_int32_ptr(block_table_ptrs + group_id)
     block_table_stride = tl.load(block_table_strides + group_id)
     kv_block_size = tl.load(block_sizes + group_id)
     mapping_enabled = tl.load(slot_mapping_enabled + group_id)
@@ -351,3 +351,10 @@ def _compute_slot_mappings_kernel(
 
         slot_ids = tl.where(mapping_enabled & is_real_req, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
+
+
+@triton.jit
+def _load_int32_ptr(ptr_to_ptr):
+    ptr = tl.load(ptr_to_ptr)
+    ptr = ptr.to(tl.pointer_type(tl.int32))
+    return tl.multiple_of(ptr, 16)

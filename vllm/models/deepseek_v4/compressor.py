@@ -390,6 +390,47 @@ class DeepseekCompressor(nn.Module):
             else {"launch_pdl": False}
         )
 
+        if (
+            self.head_dim == 512
+            and not self.use_fp4_cache
+            and self.compress_ratio in (4, 128)
+            and (
+                current_platform.is_musa()
+                or getattr(state_cache.device, "type", None) == "musa"
+            )
+        ):
+            from vllm_musa.kernels.deepseek_v4_sparse_compressor import (
+                try_musa_deepseek_v4_sparse_compressor,
+            )
+
+            k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
+            k_cache_layer = self._static_forward_context[self.k_cache_prefix]
+            kv_cache = k_cache_layer.kv_cache
+            handled, _ = try_musa_deepseek_v4_sparse_compressor(
+                state_cache=state_cache,
+                token_to_req_indices=token_to_req_indices,
+                positions=positions,
+                state_slot_mapping=slot_mapping,
+                block_table=block_table,
+                rms_norm_weight=self.norm.weight,
+                cos_sin_cache=rotary_emb.cos_sin_cache,
+                kv_cache=kv_cache,
+                kv_slot_mapping=k_cache_metadata.slot_mapping,
+                rms_eps=self.rms_norm_eps,
+                state_block_size=block_size,
+                state_width=state_width,
+                kv_block_size=kv_cache.shape[1],
+                compress_ratio=self.compress_ratio,
+                token_stride=self._token_stride,
+                scale_dim=self._scale_dim,
+                quant_block=self._quant_block,
+                kv_states=kv,
+                score_states=score,
+                ape=self.ape,
+            )
+            if handled:
+                return
+
         # Store the KV and score (with fused APE addition) in the state.
         # NOTE: PDL is disabled — both this kernel and the compress kernels
         # below depend on preceding kernel outputs (kv/score from the cublas

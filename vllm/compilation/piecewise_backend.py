@@ -6,6 +6,7 @@ import io
 import json
 import pickle
 from collections.abc import Callable
+from contextlib import nullcontext
 from pickle import Pickler
 from typing import Any
 
@@ -219,7 +220,12 @@ class PiecewiseBackend:
 
         def serialize(fn: Callable[..., Any]) -> bytes:
             assert hasattr(fn, "serialize"), "fn must have serialize method"
-            with torch._functorch.config.patch("bundled_autograd_cache", True):
+            functorch_cache_ctx = (
+                torch._functorch.config.patch("bundled_autograd_cache", True)
+                if hasattr(torch._functorch.config, "bundled_autograd_cache")
+                else nullcontext()
+            )
+            with functorch_cache_ctx:
                 entry = fn.serialize()
 
                 f = io.BytesIO()

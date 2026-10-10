@@ -258,10 +258,22 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
         raise NotImplementedError
 
     def destroy(self):
+        # Detach handles before native teardown. The MUSA DeepEP Buffer
+        # relies on its C++ destructor and does not expose ``destroy``.
         with self.handle_cache._lock:
-            for _, handle in self.handle_cache._cache.items():
-                handle.destroy()
+            handles = list(self.handle_cache._cache.values())
             self.handle_cache._cache.clear()
+
+        while handles:
+            handle = handles.pop()
+            try:
+                destroy = getattr(handle, "destroy", None)
+                if callable(destroy):
+                    destroy()
+            finally:
+                # Drop legacy MUSA Buffer references while all worker ranks
+                # are still in the explicit shutdown path.
+                del handle
 
 
 class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
@@ -293,7 +305,6 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
             num_rdma_bytes=num_rdma_bytes,
             low_latency_mode=False,
             num_qps_per_rank=num_qps_per_rank,
-            explicitly_destroy=True,
         )
         return kwargs
 
@@ -374,7 +385,6 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
             num_qps_per_rank=num_qps_per_rank,
             allow_nvlink_for_low_latency_mode=True,
             allow_mnnvl=envs.VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL,
-            explicitly_destroy=True,
             enable_shrink=self.support_fault_tolerance,
         )
         return kwargs

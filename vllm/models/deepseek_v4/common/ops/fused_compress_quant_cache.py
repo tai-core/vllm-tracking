@@ -43,6 +43,20 @@ else:
 from .fused_indexer_q import _fp32x2_to_fp4x2
 
 
+def _musa_deepseek_v4_compress_cache_pdl_kwargs(
+    tensor: torch.Tensor,
+    pdl_kwargs: dict | None,
+) -> dict:
+    active_pdl_kwargs = dict(pdl_kwargs or {})
+    if (
+        current_platform.is_musa()
+        or getattr(torch.version, "musa", None) is not None
+        or getattr(tensor.device, "type", None) == "musa"
+    ):
+        active_pdl_kwargs.pop("launch_pdl", None)
+    return active_pdl_kwargs
+
+
 def compress_norm_rope_store_triton(
     state_cache: torch.Tensor,
     num_actual: int,
@@ -72,6 +86,73 @@ def compress_norm_rope_store_triton(
     Picks one of the three kernels in this module based on ``head_dim`` and
     ``use_fp4_cache``. Identical launch signature for all three.
     """
+    if (
+        head_dim == 128
+        and not use_fp4_cache
+        and compress_ratio == 4
+        and overlap
+        and (
+            current_platform.is_musa()
+            or getattr(state_cache.device, "type", None) == "musa"
+        )
+    ):
+        from vllm_musa.kernels.deepseek_v4_c4_indexer_compressor import (
+            try_musa_deepseek_v4_c4_indexer_compressor,
+        )
+
+        handled, _ = try_musa_deepseek_v4_c4_indexer_compressor(
+            state_cache=state_cache,
+            token_to_req_indices=token_to_req_indices,
+            positions=positions,
+            state_slot_mapping=slot_mapping,
+            block_table=block_table,
+            rms_norm_weight=rms_norm_weight,
+            cos_sin_cache=cos_sin_cache,
+            kv_cache=kv_cache,
+            kv_slot_mapping=k_cache_metadata.slot_mapping,
+            rms_eps=rms_norm_eps,
+            state_block_size=block_size,
+            state_width=state_width,
+            kv_block_size=kv_cache.shape[1],
+        )
+        if handled:
+            return
+
+    if (
+        head_dim == 512
+        and not use_fp4_cache
+        and compress_ratio in (4, 128)
+        and (
+            current_platform.is_musa()
+            or getattr(state_cache.device, "type", None) == "musa"
+        )
+    ):
+        from vllm_musa.kernels.deepseek_v4_sparse_compressor import (
+            try_musa_deepseek_v4_sparse_compressor,
+        )
+
+        handled, _ = try_musa_deepseek_v4_sparse_compressor(
+            state_cache=state_cache,
+            token_to_req_indices=token_to_req_indices,
+            positions=positions,
+            state_slot_mapping=slot_mapping,
+            block_table=block_table,
+            rms_norm_weight=rms_norm_weight,
+            cos_sin_cache=cos_sin_cache,
+            kv_cache=kv_cache,
+            kv_slot_mapping=k_cache_metadata.slot_mapping,
+            rms_eps=rms_norm_eps,
+            state_block_size=block_size,
+            state_width=state_width,
+            kv_block_size=kv_cache.shape[1],
+            compress_ratio=compress_ratio,
+            token_stride=token_stride,
+            scale_dim=scale_dim,
+            quant_block=quant_block,
+        )
+        if handled:
+            return
+
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
         num_warps = 4
@@ -141,7 +222,7 @@ def compress_norm_rope_store_triton(
         KV_BLOCK_STRIDE=kv_cache.stride(0),
         num_warps=num_warps,
         **kernel_kwargs,
-        **pdl_kwargs,
+        **_musa_deepseek_v4_compress_cache_pdl_kwargs(state_cache, pdl_kwargs),
     )
 
 
@@ -240,7 +321,14 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
         mask=combined_mask,
         other=float("-inf"),
     )
-    score = tl.softmax(score, dim=0)
+    # MUSA Triton does not accept the upstream tl.softmax(dim=0) kwarg.
+    score_max = tl.max(score, axis=0)
+    score_max = tl.where(mask, score_max, 0.0)
+    score_exp = tl.exp(score - score_max)
+    score_exp = tl.where(mask[None, :], score_exp, 0.0)
+    score_denom = tl.sum(score_exp, axis=0)
+    score_denom = tl.where(score_denom > 0.0, score_denom, 1.0)
+    score = score_exp / score_denom
 
     kv = tl.load(
         row_base[:, None] + block[None, :],
@@ -802,7 +890,14 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
         mask=combined_mask,
         other=float("-inf"),
     )
-    score = tl.softmax(score, dim=0)
+    # MUSA Triton does not accept the upstream tl.softmax(dim=0) kwarg.
+    score_max = tl.max(score, axis=0)
+    score_max = tl.where(mask, score_max, 0.0)
+    score_exp = tl.exp(score - score_max)
+    score_exp = tl.where(mask[None, :], score_exp, 0.0)
+    score_denom = tl.sum(score_exp, axis=0)
+    score_denom = tl.where(score_denom > 0.0, score_denom, 1.0)
+    score = score_exp / score_denom
 
     kv = tl.load(
         row_base[:, None] + block[None, :],
@@ -989,7 +1084,14 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
         mask=combined_mask,
         other=float("-inf"),
     )
-    score = tl.softmax(score, dim=0)
+    # MUSA Triton does not accept the upstream tl.softmax(dim=0) kwarg.
+    score_max = tl.max(score, axis=0)
+    score_max = tl.where(mask, score_max, 0.0)
+    score_exp = tl.exp(score - score_max)
+    score_exp = tl.where(mask[None, :], score_exp, 0.0)
+    score_denom = tl.sum(score_exp, axis=0)
+    score_denom = tl.where(score_denom > 0.0, score_denom, 1.0)
+    score = score_exp / score_denom
 
     kv = tl.load(
         row_base[:, None] + block[None, :],

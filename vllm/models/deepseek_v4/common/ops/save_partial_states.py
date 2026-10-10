@@ -12,8 +12,23 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
     VllmTritonJitKernel,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import next_power_of_2
+
+
+def _musa_deepseek_v4_save_partial_pdl_kwargs(
+    tensor: torch.Tensor,
+    pdl_kwargs: dict | None,
+) -> dict:
+    active_pdl_kwargs = dict(pdl_kwargs or {})
+    if (
+        current_platform.is_musa()
+        or getattr(torch.version, "musa", None) is not None
+        or getattr(tensor.device, "type", None) == "musa"
+    ):
+        active_pdl_kwargs.pop("launch_pdl", None)
+    return active_pdl_kwargs
 
 
 class SavePartialStatesKernel(
@@ -186,7 +201,7 @@ class SavePartialStatesKernel(
             TRITON_BLOCK_SIZE=next_power_of_2(head_size),
             STATE_WIDTH=state_width,
             COMPRESS_RATIO=compress_ratio,
-            **(pdl_kwargs or {}),
+            **_musa_deepseek_v4_save_partial_pdl_kwargs(kv, pdl_kwargs),
         )
 
 

@@ -123,10 +123,10 @@ class Fp8BlockScaledMMLinearKernel(
             q_input = input_2d
             # Provide a concrete placeholder so apply_block_scaled_mm args are
             # always Tensors. Subclasses with apply_input_quant=False must not
-            # use As in apply_block_scaled_mm.
-            input_scale = (
-                input_scale if input_scale is not None else input_2d.new_empty(1)
-            )
+            # use As in apply_block_scaled_mm. Reuse an existing scale tensor
+            # because MUSA cannot allocate a new placeholder during graph
+            # capture.
+            input_scale = input_scale if input_scale is not None else weight_scale
 
         output = self.apply_block_scaled_mm(
             A=q_input,

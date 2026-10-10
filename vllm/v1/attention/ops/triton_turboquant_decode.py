@@ -218,7 +218,7 @@ def _tq_decode_stage1(
             n_hi = tl.load(KV_cache_ptr + norm_bases + 1, mask=kv_mask, other=0).to(
                 tl.uint16
             )
-            vec_norms = (n_lo | (n_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            vec_norms = ((n_lo | (n_hi << 8)) & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
 
             scores = vec_norms * term1 * ATTN_SCALE
             scores = tl.where(kv_mask, scores, -float("inf"))
@@ -258,7 +258,7 @@ def _tq_decode_stage1(
                 tl.uint16
             )
             v_scales = (
-                (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+                ((sc_lo | (sc_hi << 8)) & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
             )
             zr_lo = tl.load(KV_cache_ptr + sc_bases + 2, mask=kv_mask, other=0).to(
                 tl.uint16
@@ -266,7 +266,7 @@ def _tq_decode_stage1(
             zr_hi = tl.load(KV_cache_ptr + sc_bases + 3, mask=kv_mask, other=0).to(
                 tl.uint16
             )
-            v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            v_zeros = ((zr_lo | (zr_hi << 8)) & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
             values = v_idx * v_scales[:, None] + v_zeros[:, None]
         else:  # VQB == 4
             vb_idx = d_offs // 2
@@ -287,7 +287,7 @@ def _tq_decode_stage1(
                 tl.uint16
             )
             v_scales = (
-                (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+                ((sc_lo | (sc_hi << 8)) & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
             )
             zr_lo = tl.load(KV_cache_ptr + sc_bases + 2, mask=kv_mask, other=0).to(
                 tl.uint16
@@ -295,7 +295,7 @@ def _tq_decode_stage1(
             zr_hi = tl.load(KV_cache_ptr + sc_bases + 3, mask=kv_mask, other=0).to(
                 tl.uint16
             )
-            v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            v_zeros = ((zr_lo | (zr_hi << 8)) & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
             values = v_idx * v_scales[:, None] + v_zeros[:, None]
 
         # ============================================================
@@ -403,7 +403,7 @@ def _tq_full_dequant_kv(
         norm_base = slot_base + MSE_BYTES
         n_lo = tl.load(KV_cache_ptr + norm_base).to(tl.uint16)
         n_hi = tl.load(KV_cache_ptr + norm_base + 1).to(tl.uint16)
-        vec_norm = (n_lo | (n_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+        vec_norm = ((n_lo | (n_hi << 8)) & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
 
         k_recon = vec_norm * k_mse
         tl.store(K_out_ptr + ko_base + d_offs, k_recon.to(tl.float16), mask=d_mask)
@@ -421,10 +421,10 @@ def _tq_full_dequant_kv(
         sc_base = val_base + VAL_DATA_BYTES
         sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
         sc_hi = tl.load(KV_cache_ptr + sc_base + 1).to(tl.uint16)
-        v_scale = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+        v_scale = ((sc_lo | (sc_hi << 8)) & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
         zr_lo = tl.load(KV_cache_ptr + sc_base + 2).to(tl.uint16)
         zr_hi = tl.load(KV_cache_ptr + sc_base + 3).to(tl.uint16)
-        v_zero = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+        v_zero = ((zr_lo | (zr_hi << 8)) & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
         v_vals = v_idx * v_scale + v_zero
     elif VQB == 3:
         # 3-bit value unpack: 8 values per 3 bytes
@@ -443,10 +443,10 @@ def _tq_full_dequant_kv(
         sc_base = val_base + VAL_DATA_BYTES
         sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
         sc_hi = tl.load(KV_cache_ptr + sc_base + 1).to(tl.uint16)
-        v_scale = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+        v_scale = ((sc_lo | (sc_hi << 8)) & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
         zr_lo = tl.load(KV_cache_ptr + sc_base + 2).to(tl.uint16)
         zr_hi = tl.load(KV_cache_ptr + sc_base + 3).to(tl.uint16)
-        v_zero = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+        v_zero = ((zr_lo | (zr_hi << 8)) & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
         v_vals = v_idx * v_scale + v_zero
     else:
         v_vals = tl.zeros([BLOCK_D], dtype=tl.float32)

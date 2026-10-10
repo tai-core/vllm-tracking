@@ -1372,7 +1372,9 @@ class MooncakeConnectorWorker:
 
     def shutdown(self):
         """Cleanup background threads on destruction."""
-        self.async_zmq_ctx.term()
+        async_zmq_ctx = getattr(self, "async_zmq_ctx", None)
+        if async_zmq_ctx is not None:
+            async_zmq_ctx.term()
         if not self.is_kv_consumer:
             self._sender_executor.shutdown(wait=False)
             if self.sender_loop.is_running():

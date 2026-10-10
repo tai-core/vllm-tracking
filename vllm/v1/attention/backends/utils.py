@@ -1,3 +1,4 @@
+import functools
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
@@ -254,6 +255,24 @@ def record_kv_cache_layout(cache_config: CacheConfig, layout_name: str) -> None:
             f"cannot change it to {layout.name}."
         )
     cache_config.kv_cache_layout = layout.name
+
+
+_KV_CACHE_LAYOUT_OVERRIDE: str | None = None
+
+
+@functools.lru_cache
+def get_kv_cache_layout() -> str:
+    """Compatibility accessor for MUSA backends ported from v0.28."""
+    if _KV_CACHE_LAYOUT_OVERRIDE is not None:
+        return _KV_CACHE_LAYOUT_OVERRIDE
+    requested = getattr(envs, "VLLM_KV_CACHE_LAYOUT", None)
+    return requested or "NHD"
+
+
+def set_kv_cache_layout(layout: str | None) -> None:
+    global _KV_CACHE_LAYOUT_OVERRIDE
+    _KV_CACHE_LAYOUT_OVERRIDE = layout
+    get_kv_cache_layout.cache_clear()
 
 
 def resolve_kv_cache_layout(

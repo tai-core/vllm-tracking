@@ -78,6 +78,11 @@ from .deepseek_vl2 import MlpProjector
 _IMAGE_TOKEN = "<image>"
 
 
+def _is_musa_runtime() -> bool:
+    """Return whether this process is running with the MUSA torch build."""
+    return getattr(torch.version, "musa", None) is not None
+
+
 class DeepseekOCRImagePixelInputs(TensorSchema):
     """Dimensions:
     - b: Batch size
@@ -422,6 +427,18 @@ class DeepseekOCRForCausalLM(
             self.tile_tag = config.tile_tag
             self.global_view_pos = config.global_view_pos
 
+            # The DeepSeek-OCR reference implementation is numerically
+            # unstable in BF16 on MUSA in the vision tower (the same
+            # checkpoint produces correct OCR in FP32).  Keep the language
+            # model in its configured dtype, but run the SAM/CLIP/projector
+            # path in FP32 on MUSA.  The multimodal merge casts the resulting
+            # embeddings back to the language-model dtype.
+            self.vision_dtype = torch.float32 if _is_musa_runtime() else self.model_config.dtype
+            if self.vision_dtype == torch.float32:
+                self.sam_model.float()
+                self.vision_model.float()
+                self.projector.float()
+
             # special token for image token sequence format
             n_embed = self.projector_config.n_embed
             embed_std = 1 / torch.sqrt(torch.tensor(n_embed, dtype=torch.float32))
@@ -477,6 +494,7 @@ class DeepseekOCRForCausalLM(
         )
 
     def _encode_global_features(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        image_tensor = image_tensor.to(dtype=self.vision_dtype)
         global_features_1 = self.sam_model(image_tensor)
         global_features_2 = self.vision_model(image_tensor, global_features_1)
         features = torch.cat(
@@ -502,6 +520,7 @@ class DeepseekOCRForCausalLM(
         if torch.sum(patches).item() == 0:
             return None
 
+        patches = patches.to(dtype=self.vision_dtype)
         local_features_1 = self.sam_model(patches)
         local_features_2 = self.vision_model(patches, local_features_1)
         features = torch.cat(

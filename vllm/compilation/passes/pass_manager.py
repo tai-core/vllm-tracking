@@ -47,8 +47,13 @@ if current_platform.is_cuda_alike():
     from .fusion.rope_kvcache_fusion import RopeKVCacheFusionPass
     from .utility.scatter_split_replace import ScatterSplitReplacementPass
 
-if current_platform.is_cuda():
+if current_platform.is_cuda() or current_platform.is_musa():
     from .fusion.allreduce_rms_fusion import AllReduceFusionPass
+
+if current_platform.is_musa():
+    from vllm_musa._inductor.musa_allreduce_rms_fusion import (
+        MusaAllReduceRMSNormFusionPass,
+    )
 
 if current_platform.is_xpu():
     from .fusion.act_quant_fusion import ActivationQuantFusionPass
@@ -163,6 +168,9 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 # Run the more specific RMSNorm+router-pad fusion before
                 # AR+RMS, since both consume fused_add_rms_norm.
                 self.passes += [RocmAiterTritonAddRMSNormPadFusionPass(config)]
+
+            if current_platform.is_musa() and self.pass_config.fuse_allreduce_rms:
+                self.passes += [MusaAllReduceRMSNormFusionPass(config)]
 
             if self.pass_config.fuse_allreduce_rms:
                 if rocm_aiter_ops.is_enabled():

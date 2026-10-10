@@ -34,12 +34,26 @@ from vllm.model_executor.layers.fused_moe.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.musa import is_musa_triton_32
 from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.platform_utils import get_device_name_as_file_name
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+# Triton 3.2 does not expose the tensor-descriptor builtin. Keep descriptor
+# creation behind a module-level symbol so the JIT dependency walker can hash
+# this kernel even when USE_TD is false (as it is for quantized MUSA MoE).
+if hasattr(tl, "make_tensor_descriptor"):
+    make_tensor_descriptor = tl.make_tensor_descriptor
+elif hasattr(tl, "_experimental_make_tensor_descriptor"):
+    make_tensor_descriptor = tl._experimental_make_tensor_descriptor
+else:
+
+    @triton.jit
+    def make_tensor_descriptor(base, shape, strides, block_shape, _builder=None):
+        return None
 
 
 @triton.jit
@@ -350,6 +364,7 @@ def fused_moe_kernel(
     per_channel_quant: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     SWAP_AB: tl.constexpr,
+    even_Ks: tl.constexpr,
     # Tensor-descriptor path for the A gather and B load in the K-loop.
     USE_TD: tl.constexpr = False,
 ):
@@ -445,13 +460,13 @@ def fused_moe_kernel(
     if USE_TD:
         # ``tt.descriptor_gather`` requires block_shape[0] == 1 and i32 idx.
         m_td = num_valid_tokens // top_k
-        a_desc = tl.make_tensor_descriptor(
+        a_desc = make_tensor_descriptor(
             base=a_ptr,
             shape=(m_td, K),
             strides=(stride_am, stride_ak),
             block_shape=(1, BLOCK_SIZE_K),
         )
-        b_desc = tl.make_tensor_descriptor(
+        b_desc = make_tensor_descriptor(
             base=b_ptr + off_experts * stride_be,
             shape=(N, K),
             strides=(stride_bn, stride_bk),
@@ -486,7 +501,10 @@ def fused_moe_kernel(
         # block-wise
         if group_k > 0 and group_n > 0:
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
-            offs_bsn = offs_bn // group_n
+            if BLOCK_SIZE_N > group_n:
+                offs_bsn = offs_bn // group_n
+            else:
+                offs_bsn = pid_n * BLOCK_SIZE_N // group_n
             b_scale_ptrs = (
                 b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
             )
@@ -523,17 +541,32 @@ def fused_moe_kernel(
             a = a_desc.gather(gather_idx, k * BLOCK_SIZE_K)
             b = b_desc.load([pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K]).T
         elif SWAP_AB:
-            a_mask = (offs_k[:, None] < K - k * BLOCK_SIZE_K) & token_mask[None, :]
-            b_mask = offs_k[None, :] < K - k * BLOCK_SIZE_K
-            a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-            b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+            if even_Ks:
+                a = tl.load(a_ptrs, mask=token_mask[None, :], other=0.0)
+                b = tl.load(b_ptrs)
+            else:
+                a_mask = (
+                    offs_k[:, None] < K - k * BLOCK_SIZE_K
+                ) & token_mask[None, :]
+                b_mask = offs_k[None, :] < K - k * BLOCK_SIZE_K
+                a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+                b = tl.load(b_ptrs, mask=b_mask, other=0.0)
         else:
-            a = tl.load(
-                a_ptrs,
-                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-                other=0.0,
-            )
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+            if even_Ks:
+                a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+                b = tl.load(b_ptrs)
+            else:
+                a = tl.load(
+                    a_ptrs,
+                    mask=token_mask[:, None]
+                    & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                    other=0.0,
+                )
+                b = tl.load(
+                    b_ptrs,
+                    mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
+                    other=0.0,
+                )
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -546,9 +579,23 @@ def fused_moe_kernel(
                 )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
                 if SWAP_AB:
-                    accumulator += tl.dot(b, a) * b_scale[:, None] * a_scale[None, :]
+                    if BLOCK_SIZE_N > group_n:
+                        accumulator += (
+                            tl.dot(b, a) * b_scale[:, None] * a_scale[None, :]
+                        )
+                    else:
+                        accumulator += tl.dot(b, a) * (
+                            b_scale * a_scale[None, :]
+                        )
                 else:
-                    accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                    if BLOCK_SIZE_N > group_n:
+                        accumulator += (
+                            tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                        )
+                    else:
+                        accumulator += tl.dot(a, b) * (
+                            a_scale[:, None] * b_scale
+                        )
             else:
                 if use_fp8_w8a8:
                     # acc used to enable fp8_fast_accum
@@ -843,6 +890,7 @@ def invoke_fused_moe_triton_kernel(
     BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
     if block_shape is not None:
         BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0], block_shape[1]))
+    even_Ks = B.size(2) % BLOCK_SIZE_K == 0
     if use_td and A.size(1) % BLOCK_SIZE_K != 0:
         # TD gather/load feeding tl.dot with a non-block-aligned K
         # miscompiles (~74% of output elements wrong) on real HW;
@@ -902,6 +950,7 @@ def invoke_fused_moe_triton_kernel(
         per_channel_quant=per_channel_quant,
         naive_block_assignment=(sorted_token_ids is None),
         HAS_BIAS=HAS_BIAS,
+        even_Ks=even_Ks,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         SWAP_AB=SWAP_AB,
         USE_TD=use_td,
@@ -1401,7 +1450,20 @@ def get_default_config(
         if current_platform.is_rocm():
             num_stages = num_stages_rocm
         elif M <= 32:
-            num_stages = 4
+            # MUSA: 4 pipelining stages collapse occupancy for tiny-M MoE on S5000.
+            # At the Nemotron-3.5 MTP6 decode shape (7 tokens x topk 6 = 42 useful
+            # rows over 13-41 of 128 experts, one 16-row tile each) the tiny-M default
+            # is 4 stages / BLOCK_K=128, which reserves ~4x the shared memory per
+            # block and costs most of the resident blocks.  Measured on S5000, same
+            # container and image, 4096-in/128-out, one request: 11.635 ms/token at
+            # 4 stages vs 9.563 ms/token at 1 stage (-17.80%), byte-identical output
+            # (same SHA over all 9 measured requests) and unchanged TTFT (1648 vs
+            # 1678 ms).  BLOCK_SIZE_N=128 alone regresses (+8.46%), so staging is the
+            # whole effect.  CUDA keeps the upstream 4 stages.
+            num_stages = 1 if getattr(current_platform, "is_musa", lambda: False)() else 4
+            logger.info_once(
+                "MoE default config for tiny M: M=%d num_stages=%d", M, num_stages
+            )
         else:
             num_stages = 3
 
@@ -1561,7 +1623,8 @@ def _prepare_expert_assignment(
     # Skips moe_align_block_size and activates the `sorted_token_ids is None`
     # path of the fused_moe_kernel kernel
     naive_block_assignment = (
-        expert_map is None
+        not is_musa_triton_32()
+        and expert_map is None
         and num_tokens * top_k_num * 4 <= global_num_experts
         and not (
             (use_int8_w8a16 or use_int4_w4a16)
@@ -1737,6 +1800,41 @@ def fused_experts_impl(
     )
 
     config = get_config_func(M)
+    w1_config = config
+    if (
+        current_platform.is_musa()
+        and hidden_states.dtype == torch.bfloat16
+        and M == 25
+        and tuple(w1.shape) == (257, 1024, 2048)
+        and tuple(w2.shape) == (257, 2048, 512)
+        and top_k_num == 9
+        and global_num_experts == 257
+        and expert_map is None
+        and block_shape is None
+        and not (
+            use_fp8_w8a8
+            or use_int8_w8a8
+            or use_int8_w8a16
+            or use_int4_w4a16
+        )
+        and config.get("BLOCK_SIZE_M") == 32
+        and config.get("BLOCK_SIZE_N") == 32
+        and config.get("BLOCK_SIZE_K") == 64
+        and config.get("GROUP_SIZE_M") == 1
+        and config.get("num_warps") == 4
+        and config.get("num_stages") == 1
+    ):
+        # Qwen3.6 BF16 uses different W1 and W2 projection shapes but shares
+        # the sorted-expert workspace. Keep the common BLOCK_SIZE_M and use
+        # wider K/N tiles and eight warps for W1. Retain the default W2
+        # configuration so this specialization applies only to the first
+        # projection.
+        w1_config = dict(config)
+        w1_config.update(
+            BLOCK_SIZE_N=64,
+            BLOCK_SIZE_K=128,
+            num_warps=8,
+        )
 
     # We can reuse the memory between these because by the time we need
     # cache3, we're done with cache1
@@ -1779,7 +1877,7 @@ def fused_experts_impl(
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = _prepare_expert_assignment(
         topk_ids,
-        config,
+        w1_config,
         num_tokens,
         top_k_num,
         global_num_experts,
@@ -1803,7 +1901,7 @@ def fused_experts_impl(
         num_tokens_post_padded,
         apply_router_weight_on_input,
         top_k_num,
-        config,
+        w1_config,
         compute_type=compute_type,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
@@ -1861,9 +1959,9 @@ def fused_experts_impl(
         B_bias=w2_bias,
     )
 
-    ops.moe_sum(
-        intermediate_cache3.view(*intermediate_cache3.size()),
-        out_hidden_states,
-    )
+    _ic3 = intermediate_cache3.view(*intermediate_cache3.size())
+    from vllm_musa.jit_kernel.csrc.moe import maybe_fast_moe_sum
+    if not maybe_fast_moe_sum(_ic3, out_hidden_states):
+        ops.moe_sum(_ic3, out_hidden_states)
 
     return out_hidden_states

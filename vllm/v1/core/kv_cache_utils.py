@@ -14,8 +14,15 @@ from typing import TYPE_CHECKING, Any, NamedTuple, NewType, TypeAlias, overload
 
 from vllm import envs
 from vllm.config import VllmConfig
+from vllm.config.kda_parallel import (
+    get_kda_mamba_global_num_seqs,
+    get_kda_mamba_lease,
+    get_kda_request_windows,
+    kda_mamba_shared_pool,
+)
 from vllm.logger import init_logger
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.platforms import current_platform
 from vllm.utils.hashing import xxhash, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
@@ -43,6 +50,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     compute_layout_strides,
+    is_mamba_group,
     iter_layer_specs,
     replace_as,
 )
@@ -1207,6 +1215,27 @@ def get_max_concurrency_for_kv_cache_config(
 
     Host groups use a separate pool; the smaller concurrency limit applies.
     """
+    if kv_cache_config.pcp_layout is not None:
+        from vllm.v1.pcp.allocation import pcp_required_blocks
+
+        groups = kv_cache_config.kv_cache_groups
+        limits = [
+            (kv_cache_config.num_blocks - 1)
+            / (pcp_required_blocks(vllm_config, groups) - 1)
+        ]
+        state_blocks = (
+            kv_cache_config.musa_mamba_alloc_num_blocks
+            or kv_cache_config.musa_mamba_num_blocks
+        )
+        for group in groups:
+            if is_mamba_group(group):
+                spec = group.kv_cache_spec
+                required = cdiv(
+                    spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
+                )
+                limits.append((state_blocks - 1) / required)
+        return min(limits)
+
     num_blocks_per_request = 0
     host_blocks_per_request = 0
     for group in kv_cache_config.kv_cache_groups:
@@ -1250,6 +1279,26 @@ def _pool_bytes_per_block(
     )
 
 
+def get_num_blocks(
+    vllm_config: VllmConfig,
+    num_layers: int,
+    available_memory: int,
+    page_size: int,
+) -> int:
+    """Get the number of kv cache blocks.
+
+    Args:
+        vllm_config: The global VllmConfig
+        num_layers: The number of layers
+        available_memory: Memory available for KV cache in bytes.
+        page_size: The page size of the KV cache.
+
+    """
+    num_blocks = int(available_memory // page_size // num_layers)
+    num_blocks = max(num_blocks, 0)
+    return may_override_num_blocks(vllm_config, num_blocks)
+
+
 def get_uniform_page_size(kv_cache_specs: Iterable[KVCacheSpec]) -> int:
     """Get the page size of the KV cache."""
     page_sizes = {layer.page_size_bytes for layer in kv_cache_specs}
@@ -1291,6 +1340,7 @@ def _get_kv_cache_groups_uniform_type(
 
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
+    pad_mamba: bool = True,
 ) -> dict[str, KVCacheSpec]:
     """Unify the page size of the given KVCacheSpec. If the page size of all layers
     are the same, return the original KVCacheSpec. If not same, unify the page
@@ -1308,6 +1358,10 @@ def unify_kv_cache_spec_page_size(
 
     Args:
         kv_cache_spec: The KVCacheSpec of each attention layer in the model
+        pad_mamba: Whether to pad Mamba pages up to the common page size. Off
+            when the Mamba state owns a separate allocation, where its block
+            stride is its own page and matching the attention page only wastes
+            memory.
 
     Returns:
         The updated KVCacheSpec with the same page_size_bytes.
@@ -1324,6 +1378,11 @@ def unify_kv_cache_spec_page_size(
         if layer_spec.page_size_bytes == max_page_size:
             new_kv_cache_spec[layer_name] = layer_spec
         elif isinstance(layer_spec, MambaSpec):
+            if not pad_mamba:
+                # Kept at its own page size; the layer's block stride is that
+                # page, so nothing downstream needs it to match attention's.
+                new_kv_cache_spec[layer_name] = layer_spec
+                continue
             # MambaSpec's page size is determined by its state shapes and does
             # not scale with block_size, so pad the page instead. This is the
             # same padding mechanism the platform uses to align Mamba pages
@@ -1561,18 +1620,61 @@ def musa_mamba_separate_pool_enabled() -> bool:
     return callable(is_musa) and is_musa()
 
 
+def _has_mamba_and_attention(specs: Iterable[KVCacheSpec]) -> bool:
+    has_mamba = has_attn = False
+    for spec in specs:
+        if isinstance(spec, MambaSpec):
+            has_mamba = True
+        else:
+            has_attn = True
+        if has_mamba and has_attn:
+            return True
+    return False
+
+
 def _musa_has_mamba_and_attention(kv_cache_groups) -> bool:
-    has_mamba = any(isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_groups)
-    has_attn = any(not isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_groups)
-    return has_mamba and has_attn
+    # Worker-side groups wrap their layers in UniformTypeKVCacheSpecs, so the
+    # group spec is not itself a MambaSpec; look through the wrapper.
+    return _has_mamba_and_attention(
+        s for g in kv_cache_groups for s in iter_layer_specs(g.kv_cache_spec)
+    )
+
+
+def _musa_zero_state_connector(vllm_config) -> bool:
+    # DecodeBench owns no remote state. Mooncake is also allowed when KDA
+    # shared-pool ids are global: its regions preserve group identity and the
+    # DP fanout reuses the owner's Mamba ids on every KDA consumer rank.
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    return (
+        kv_transfer_config is None
+        or kv_transfer_config.kv_connector == "DecodeBenchConnector"
+        or (
+            kv_transfer_config.kv_connector == "MooncakeConnector"
+            and kda_mamba_shared_pool(vllm_config)
+        )
+    )
+
+
+def _musa_mamba_dedicated_pool(vllm_config) -> bool:
+    """Whether Mamba state will get its own allocation and block-id space.
+
+    Decided from the platform and the connector alone, so call sites that run
+    before the cache groups exist (page-size alignment) reach the same answer
+    as ``_musa_separate_pool_eligible``.
+    """
+    return musa_mamba_separate_pool_enabled() and _musa_zero_state_connector(
+        vllm_config
+    )
 
 
 def _musa_separate_pool_eligible(vllm_config, kv_cache_groups) -> bool:
-    # KV connectors can defer frees through the coordinator's shared-pool API;
-    # keep the upstream shared-pool layout until that API carries pool ownership.
+    # Dedicated pools have independent address spaces. Only connectors whose
+    # transfer plan preserves group identity and their block-id semantics may
+    # use them; see _musa_zero_state_connector.
+    zero_state_connector = _musa_zero_state_connector(vllm_config)
     return (
         musa_mamba_separate_pool_enabled()
-        and vllm_config.kv_transfer_config is None
+        and zero_state_connector
         and _musa_has_mamba_and_attention(kv_cache_groups)
     )
 
@@ -1583,13 +1685,16 @@ def _musa_separated_mamba_attn_tensors(vllm_config, kv_cache_groups, available_m
     Mamba groups get one dedicated tensor per layer, indexed by their own
     block-id space. The pool is sized from the MambaSpec admission bound so it
     never binds (attention admission caps running requests at <= max_num_seqs).
-    Returns (kv_cache_tensors, attn_num_blocks, mamba_num_blocks).
+    Returns (kv_cache_tensors, attn_num_blocks, mamba_num_blocks,
+    mamba_alloc_num_blocks, mamba_lease_start). The lease start is None unless
+    block ids are global across the KDA DP group.
     """
-    mamba_groups = [g for g in kv_cache_groups if isinstance(g.kv_cache_spec, MambaSpec)]
-    attn_groups = [
-        g for g in kv_cache_groups if not isinstance(g.kv_cache_spec, MambaSpec)
-    ]
-    mamba_page = get_uniform_page_size([g.kv_cache_spec for g in mamba_groups])
+    mamba_groups = [g for g in kv_cache_groups if is_mamba_group(g)]
+    attn_groups = [g for g in kv_cache_groups if not is_mamba_group(g)]
+    # A wrapped group's page size is the sum over its layers; the pool is one
+    # tensor per layer, so take the per-layer page and the per-layer bound.
+    mamba_specs = [s for g in mamba_groups for s in iter_layer_specs(g.kv_cache_spec)]
+    mamba_page = get_uniform_page_size(mamba_specs)
     max_num_seqs = vllm_config.scheduler_config.max_num_seqs
     # Each Mamba group gets its own non-binding BlockPool/address space.
     # Therefore block IDs are local to a group and do not reserve another
@@ -1598,29 +1703,50 @@ def _musa_separated_mamba_attn_tensors(vllm_config, kv_cache_groups, available_m
     # only BlockPool's null block. The previous fixed +8 slack wasted state
     # memory and reduced the attention pool without an admission invariant.
     mamba_blocks_per_request = max(
-        cdiv(
-            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
-            mamba_page,
-        )
-        for group in mamba_groups
+        cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
+        for spec in mamba_specs
     )
-    mamba_num_blocks = max_num_seqs * mamba_blocks_per_request + 1
+    # With ``kda_layer_tp`` the KDA layers shard over several ranks, so each
+    # rank's state tensor covers the requests of *every* rank in that group:
+    # one window of the local pool per rank, each window holding the head slice
+    # for all of this rank's own requests. Block ids stay rank-local, so the
+    # scheduler still hands out from one local window; the indices are shifted
+    # by the rank's window offset at forward time.
+    request_windows = get_kda_request_windows(vllm_config)
+    if kda_mamba_shared_pool(vllm_config):
+        # Block ids are global: slot i names the same request on every rank,
+        # so the KDA forward pass applies no window offset. Block 0 is the
+        # pool-wide null block. Allocation is either a static per-rank lease or
+        # per-request slots granted by the front-end at admission time.
+        mamba_num_blocks = (
+            1 + get_kda_mamba_global_num_seqs(vllm_config) * mamba_blocks_per_request
+        )
+        lease = get_kda_mamba_lease(vllm_config, mamba_blocks_per_request)
+        if lease is None:
+            lease_start = None
+            mamba_alloc_num_blocks = mamba_num_blocks
+        else:
+            lease_start, mamba_alloc_num_blocks = lease
+    else:
+        lease_start = None
+        mamba_alloc_num_blocks = max_num_seqs * mamba_blocks_per_request + 1
+        mamba_num_blocks = mamba_alloc_num_blocks * request_windows
     mamba_layers = [ln for g in mamba_groups for ln in g.layer_names]
     mamba_bytes = mamba_page * mamba_num_blocks * len(mamba_layers)
-    attn_group_size = max(len(g.layer_names) for g in attn_groups)
-    attn_page = get_uniform_page_size([g.kv_cache_spec for g in attn_groups])
-    if mamba_bytes >= available_memory:
-        raise ValueError("MUSA separate mamba pool needs more memory than available")
-    remaining = available_memory - mamba_bytes
-    attn_num_blocks = get_num_blocks(
-        vllm_config, attn_group_size, remaining, attn_page
+    if available_memory == 0:
+        # Cudagraph memory profiling builds a deliberately minimal attention
+        # cache under a temporary block override, while the Mamba pool keeps the
+        # fixed size the captured batch needs.
+        attn_budget = 0
+    else:
+        if mamba_bytes >= available_memory:
+            raise ValueError(
+                "MUSA separate mamba pool needs more memory than available"
+            )
+        attn_budget = available_memory - mamba_bytes
+    kv_cache_tensors, attn_num_blocks = _build_attention_kv_cache_tensors(
+        vllm_config, attn_groups, attn_budget
     )
-    kv_cache_tensors = []
-    for i in range(attn_group_size):
-        shared_by = [g.layer_names[i] for g in attn_groups if i < len(g.layer_names)]
-        kv_cache_tensors.append(
-            KVCacheTensor(size=attn_page * attn_num_blocks, layers=shared_by, layer_stride=attn_page * attn_num_blocks, block_stride=attn_page)
-        )
     for ln in mamba_layers:
         kv_cache_tensors.append(
             KVCacheTensor(
@@ -1631,8 +1757,13 @@ def _musa_separated_mamba_attn_tensors(vllm_config, kv_cache_groups, available_m
                 musa_mamba_pool=True,
             )
         )
-    return kv_cache_tensors, attn_num_blocks, mamba_num_blocks
-
+    return (
+        kv_cache_tensors,
+        attn_num_blocks,
+        mamba_num_blocks,
+        mamba_alloc_num_blocks,
+        lease_start,
+    )
 
 
 def validate_kv_cache_layout(
@@ -1669,6 +1800,136 @@ def validate_kv_cache_layout(
         )
 
 
+def _pcp_capacity_candidate(config, groups, num_blocks, *, use_ipc, pcp_layout=None):
+    """Describe logical IDs and price their physical allocation, without tensors."""
+    from vllm.v1.pcp.allocation import (
+        make_pcp_physical_config,
+        plan_pcp_page_workspace,
+        resolve_pcp_layout,
+    )
+
+    if pcp_layout is None:
+        pcp_layout = resolve_pcp_layout(config, groups)
+    if pcp_layout is None:
+        raise ValueError("PCP allocation requires layer-declared page placement")
+    has_state = any(is_mamba_group(group) for group in groups)
+    if has_state and not _musa_separate_pool_eligible(config, groups):
+        raise ValueError(
+            "PCP capacity planning requires independently allocated state pools"
+        )
+    attention = [group for group in groups if not is_mamba_group(group)]
+    virtual_bytes = _musa_mamba_pool_bytes(
+        config, groups
+    ) + num_blocks * _pool_bytes_per_block(config, attention)
+    if has_state:
+        tensors, actual_blocks, mamba_blocks, alloc_blocks, lease_start = (
+            _musa_separated_mamba_attn_tensors(config, groups, virtual_bytes)
+        )
+    else:
+        tensors, actual_blocks = _build_attention_kv_cache_tensors(
+            config, attention, virtual_bytes
+        )
+        mamba_blocks = alloc_blocks = lease_start = None
+    assert actual_blocks == num_blocks
+    logical = KVCacheConfig(
+        num_blocks=num_blocks,
+        pcp_layout=pcp_layout,
+        kv_cache_tensors=tensors,
+        kv_cache_groups=groups,
+        prefix_cache_retention_interval=config.cache_config.prefix_cache_retention_interval,
+        musa_mamba_num_blocks=mamba_blocks,
+        musa_mamba_lease_start=lease_start,
+        musa_mamba_shared_ids=has_state and kda_mamba_shared_pool(config),
+        musa_mamba_alloc_num_blocks=(
+            alloc_blocks if alloc_blocks != mamba_blocks else None
+        ),
+    )
+    size = pcp_layout.size
+    physical = make_pcp_physical_config(config, logical)
+    budget = plan_pcp_page_workspace(
+        config, logical, physical, size, use_ipc=use_ipc, validate=False
+    )
+    return logical, budget
+
+
+def pcp_min_memory_bytes(config, groups, *, use_ipc):
+    from vllm.v1.pcp.allocation import pcp_required_blocks
+
+    required = pcp_required_blocks(config, groups)
+    override = config.cache_config.num_gpu_blocks_override
+    if override is not None:
+        if override < required:
+            # Auto-fit searches shorter lengths against the same physical budget.
+            return float("inf")
+        required = override
+    return _pcp_capacity_candidate(config, groups, required, use_ipc=use_ipc)[
+        1
+    ].total_bytes
+
+
+def plan_pcp_cache_config(
+    config, groups, available_memory, *, use_ipc, num_blocks=None, pcp_layout=None
+):
+    """Maximize logical capacity within the measured per-worker physical budget."""
+    from vllm.v1.pcp.allocation import pcp_required_blocks, resolve_pcp_layout
+
+    if pcp_layout is None:
+        pcp_layout = resolve_pcp_layout(config, groups)
+    if pcp_layout is None:
+        raise ValueError("PCP planning requires layer-declared page placement")
+    required = pcp_required_blocks(config, groups)
+    if num_blocks is None:
+        num_blocks = config.cache_config.num_gpu_blocks_override
+    if num_blocks is not None:
+        if num_blocks < required:
+            raise ValueError("PCP block capacity cannot hold max_model_len plus null")
+        logical, budget = _pcp_capacity_candidate(
+            config, groups, num_blocks, use_ipc=use_ipc, pcp_layout=pcp_layout
+        )
+    else:
+        attention = [group for group in groups if not is_mamba_group(group)]
+        # An upper bound that ignores workspace, but never divides KDA by PCP.
+        low = required
+        high = max(
+            0,
+            (available_memory - _musa_mamba_pool_bytes(config, groups))
+            // _pool_bytes_per_block(config, attention)
+            * pcp_layout.size,
+        )
+        logical = budget = None
+        while low <= high:
+            middle = (low + high) // 2
+            candidate, candidate_budget = _pcp_capacity_candidate(
+                config, groups, middle, use_ipc=use_ipc, pcp_layout=pcp_layout
+            )
+            if candidate_budget.total_bytes <= available_memory:
+                logical, budget = candidate, candidate_budget
+                low = middle + 1
+            else:
+                high = middle - 1
+    if budget is None or budget.total_bytes > available_memory:
+        raise ValueError(
+            "PCP physical cache and bounded page workspace exceed available memory"
+        )
+    logical.pcp_memory_budget_bytes = available_memory
+    logger.info(
+        "PCP physical budget: logical_blocks=%d, local_blocks=%d, "
+        "attention=%d, KDA=%d, history=%d, CoW=%d, staging=%d, metadata=%d, "
+        "total=%d, available=%d bytes",
+        logical.num_blocks,
+        (logical.num_blocks + pcp_layout.size - 1) // pcp_layout.size,
+        budget.attention_bytes,
+        budget.kda_bytes,
+        budget.history_bytes,
+        budget.copy_bytes,
+        budget.staging_bytes,
+        budget.current_metadata_bytes,
+        budget.total_bytes,
+        available_memory,
+    )
+    return logical
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1697,6 +1958,18 @@ def get_kv_cache_config_from_groups(
             ),
         )
 
+    from vllm.v1.pcp.allocation import resolve_pcp_layout
+
+    pcp_layout = resolve_pcp_layout(vllm_config, kv_cache_groups)
+    if available_memory > 0 and pcp_layout is not None:
+        return plan_pcp_cache_config(
+            vllm_config,
+            kv_cache_groups,
+            available_memory,
+            use_ipc=current_platform.device_type == "musa",
+            pcp_layout=pcp_layout,
+        )
+
     if vllm_config.attention_config.hisparse_config is not None:
         host_budget = get_hisparse_host_pool_bytes(vllm_config)
         return get_hisparse_kv_cache_config(
@@ -1704,10 +1977,14 @@ def get_kv_cache_config_from_groups(
         )
 
     if _musa_separate_pool_eligible(vllm_config, kv_cache_groups):
-        kv_cache_tensors, num_blocks, musa_mamba_num_blocks = (
-            _musa_separated_mamba_attn_tensors(
-                vllm_config, kv_cache_groups, available_memory
-            )
+        (
+            kv_cache_tensors,
+            num_blocks,
+            musa_mamba_num_blocks,
+            musa_mamba_alloc_num_blocks,
+            musa_mamba_lease_start,
+        ) = _musa_separated_mamba_attn_tensors(
+            vllm_config, kv_cache_groups, available_memory
         )
         return KVCacheConfig(
             num_blocks=num_blocks,
@@ -1716,27 +1993,65 @@ def get_kv_cache_config_from_groups(
             prefix_cache_retention_interval=(
                 vllm_config.cache_config.prefix_cache_retention_interval
             ),
+            pcp_layout=pcp_layout,
             musa_mamba_num_blocks=musa_mamba_num_blocks,
+            musa_mamba_alloc_num_blocks=(
+                musa_mamba_alloc_num_blocks
+                if musa_mamba_alloc_num_blocks != musa_mamba_num_blocks
+                else None
+            ),
+            musa_mamba_lease_start=musa_mamba_lease_start,
+            musa_mamba_shared_ids=kda_mamba_shared_pool(vllm_config),
         )
+    kv_cache_tensors, num_blocks = _build_attention_kv_cache_tensors(
+        vllm_config, kv_cache_groups, available_memory
+    )
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        pcp_layout=pcp_layout,
+        kv_cache_tensors=kv_cache_tensors,
+        kv_cache_groups=kv_cache_groups,
+        prefix_cache_retention_interval=(
+            vllm_config.cache_config.prefix_cache_retention_interval
+        ),
+    )
+
+
+def _build_attention_kv_cache_tensors(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+    *,
+    physical_num_blocks: int | None = None,
+) -> tuple[list[KVCacheTensor], int]:
+    """Lay out attention tensors that all alias one shared pool.
+
+    Groups alias from byte 0. Spec regions are laid out differently:
+
+    block-outer (the same packing repeats for every block):
+    group 0: | blk 0 [ A | B  | pad ] | blk 1 [ A | B  | pad ] | ...
+    group 1: | blk 0 [  C |    D   ] | blk 1 [  C |    D   ] | ...
+             |<--- bytes_per_block -->|
+
+    layer-outer (only supported for uniform page sizes or single-group models):
+    group 0: | A [ blk 0 | blk 1 | ... ] | B [ blk 0 | blk 1 | ... ] |
+    group 1: | C [ blk 0 | blk 1 | ... ] | D [ blk 0 | blk 1 | ... ] |
+    """
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
     validate_kv_cache_layout(layout, kv_cache_groups)
     bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups, layout)
     interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
 
-    num_blocks = available_memory // bytes_per_block
-    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    if physical_num_blocks is None:
+        num_blocks = available_memory // bytes_per_block
+        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    else:
+        if physical_num_blocks <= 0:
+            raise ValueError(
+                "Physical cache allocation must contain at least one block"
+            )
+        num_blocks = physical_num_blocks
     size = bytes_per_block * num_blocks
-
-    # Groups alias from byte 0. Spec regions are laid out differently:
-    #
-    # block-outer (the same packing repeats for every block):
-    # group 0: | blk 0 [ A | B  | pad ] | blk 1 [ A | B  | pad ] | ...
-    # group 1: | blk 0 [  C  |    D   ] | blk 1 [  C  |    D   ] | ...
-    #          |<--- bytes_per_block -->|
-    #
-    # layer-outer (only supported for uniform page sizes or single-group models):
-    # group 0: | A [ blk 0 | blk 1 | ... ] | B [ blk 0 | blk 1 | ... ] |
-    # group 1: | C [ blk 0 | blk 1 | ... ] | D [ blk 0 | blk 1 | ... ] |
 
     kv_cache_tensors = []
     for group in kv_cache_groups:
@@ -1775,15 +2090,7 @@ def get_kv_cache_config_from_groups(
             byte_offset += len(layer_names) * (
                 spec.page_size_bytes if layout.is_block_outermost else layer_stride
             )
-
-    return KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=kv_cache_tensors,
-        kv_cache_groups=kv_cache_groups,
-        prefix_cache_retention_interval=(
-            vllm_config.cache_config.prefix_cache_retention_interval
-        ),
-    )
+    return kv_cache_tensors, num_blocks
 
 
 def _promote_local_kv_cache_specs(
@@ -2311,8 +2618,17 @@ def get_kv_cache_groups(
 
     # Prefer preserving each layer's cache semantics. If physical pages cannot
     # be unified, try a supported allocation-only fallback before failing.
+    # Mamba keeps its own page size when it owns a separate pool: there its
+    # block stride is the page itself, so matching attention's would only pad
+    # every state block.
     try:
-        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+        filtered_spec = unify_kv_cache_spec_page_size(
+            filtered_spec,
+            pad_mamba=not (
+                _musa_mamba_dedicated_pool(vllm_config)
+                and _has_mamba_and_attention(filtered_spec.values())
+            ),
+        )
     except NotImplementedError:
         fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
         if fallback_groups is None:
@@ -2433,6 +2749,51 @@ def update_kv_cache_capacity(
     )
 
 
+def _musa_mamba_pool_bytes(vllm_config: VllmConfig, kv_cache_groups) -> int:
+    """Bytes the dedicated Mamba state pool holds, independent of max_model_len.
+
+    Mirrors ``_musa_separated_mamba_attn_tensors``: the pool covers
+    ``max_num_seqs`` requests plus BlockPool's null block, once per KDA rank
+    window. Nothing here scales with the sequence length, which is exactly why
+    the shared-pool estimate understates it.
+    """
+    mamba_specs = [
+        s
+        for group in kv_cache_groups
+        if is_mamba_group(group)
+        for s in iter_layer_specs(group.kv_cache_spec)
+    ]
+    if not mamba_specs:
+        return 0
+    mamba_page = get_uniform_page_size(mamba_specs)
+    mamba_blocks_per_request = max(
+        cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
+        for spec in mamba_specs
+    )
+    num_layers = sum(
+        len(group.layer_names) for group in kv_cache_groups if is_mamba_group(group)
+    )
+    alloc_num_blocks = (
+        vllm_config.scheduler_config.max_num_seqs * mamba_blocks_per_request + 1
+    )
+    if kda_mamba_shared_pool(vllm_config):
+        # Global ids: one pool-wide null block plus the global request bound.
+        return (
+            mamba_page
+            * (
+                1
+                + get_kda_mamba_global_num_seqs(vllm_config) * mamba_blocks_per_request
+            )
+            * num_layers
+        )
+    return (
+        mamba_page
+        * alloc_num_blocks
+        * get_kda_request_windows(vllm_config)
+        * num_layers
+    )
+
+
 def _max_memory_usage_bytes_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -2450,6 +2811,37 @@ def _max_memory_usage_bytes_from_groups(
     if not kv_cache_groups:
         return 0
 
+    from vllm.v1.pcp.allocation import resolve_pcp_layout
+
+    if resolve_pcp_layout(vllm_config, kv_cache_groups) is not None:
+        return pcp_min_memory_bytes(
+            vllm_config,
+            kv_cache_groups,
+            use_ipc=current_platform.device_type == "musa",
+        )
+
+    if _musa_separate_pool_eligible(vllm_config, kv_cache_groups):
+        # The Mamba groups draw from a pool of their own, sized from the
+        # admission bound rather than from max_model_len. Counting them through
+        # the shared-pool formula (MambaSpec reports 2 pages per request in
+        # align mode) would leave attention with memory it never receives, and
+        # auto-fit would then accept a max_model_len the pools cannot hold.
+        attn_groups = [g for g in kv_cache_groups if not is_mamba_group(g)]
+        mamba_bytes = _musa_mamba_pool_bytes(vllm_config, kv_cache_groups)
+        if not attn_groups:
+            return mamba_bytes
+        return mamba_bytes + _shared_pool_max_memory_usage_bytes(
+            vllm_config, attn_groups
+        )
+
+    return _shared_pool_max_memory_usage_bytes(vllm_config, kv_cache_groups)
+
+
+def _shared_pool_max_memory_usage_bytes(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    """Maximum memory for groups that alias one pool, as upstream computes it."""
     bytes_per_block = _pool_bytes_per_block(vllm_config, kv_cache_groups)
     total_blocks = 0
     for group in kv_cache_groups:
@@ -2721,8 +3113,11 @@ def get_kv_cache_configs(
     # `num_blocks` to the override. Reflect that in `available_memory` here so
     # auto-fit, the admission check, and the per-worker config builder all
     # plan against the same effective capacity.
+    from vllm.v1.pcp.allocation import resolve_pcp_layout
+
+    pcp_sharded = resolve_pcp_layout(vllm_config, global_kv_cache_groups) is not None
     override = vllm_config.cache_config.num_gpu_blocks_override
-    if override is not None:
+    if override is not None and not pcp_sharded:
         adjusted_memory: list[int] = []
         for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
             if not groups:
@@ -2741,7 +3136,9 @@ def get_kv_cache_configs(
     # the capacity check both plan against usable blocks. Allocation below
     # still uses the full memory.
     check_memory = [
-        avail_mem - _pool_bytes_per_block(vllm_config, groups) if groups else avail_mem
+        avail_mem - _pool_bytes_per_block(vllm_config, groups)
+        if groups and not pcp_sharded
+        else avail_mem
         for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
     ]
 
@@ -2784,6 +3181,15 @@ def get_kv_cache_configs(
         # Re-plan with exactly the memory the smallest rank can afford, so
         # strides and offsets stay consistent with the shrunken allocation.
         groups = kv_cache_config.kv_cache_groups
+        if pcp_sharded:
+            kv_cache_configs[i] = plan_pcp_cache_config(
+                vllm_config,
+                groups,
+                available_memory[i],
+                use_ipc=current_platform.device_type == "musa",
+                num_blocks=min_num_blocks,
+            )
+            continue
         kv_cache_configs[i] = get_kv_cache_config_from_groups(
             vllm_config,
             groups,

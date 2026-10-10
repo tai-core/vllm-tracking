@@ -1950,7 +1950,7 @@ def init_distributed_environment(
             )
         else:
             # this backend is used for WORLD
-            torch.distributed.init_process_group(
+            init_kwargs = dict(
                 backend=backend,
                 init_method=distributed_init_method if store is None else None,
                 store=store,
@@ -1958,6 +1958,24 @@ def init_distributed_environment(
                 rank=rank,
                 timeout=timeout,
             )
+            from vllm_musa.optimization_contract import (
+                OptimizationFeature,
+                resolve_optimization_contract,
+            )
+            contract = resolve_optimization_contract(config)
+            needs_glm_pp_eager_mccl = (
+                contract.prefers(OptimizationFeature.GLM5_EAGER_MCCL_INIT)
+                and backend == "mccl"
+                and config.parallel_config.nnodes > 1
+                and config.parallel_config.pipeline_parallel_size > 1
+            )
+            if (
+                needs_glm_pp_eager_mccl
+                and getattr(torch.version, "musa", None) is not None
+                and local_rank >= 0
+            ):
+                init_kwargs["device_id"] = torch.device("musa", local_rank)
+            torch.distributed.init_process_group(**init_kwargs)
         if enable_elastic_ep:
             tp_pp_cpu_group = torch.distributed.new_group(
                 backend="gloo", timeout=timeout

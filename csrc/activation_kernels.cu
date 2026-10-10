@@ -268,7 +268,8 @@ packed_gelu_tanh_kernel(const packed_t& val, const float /*alpha*/) {
             scalar_t, typename vllm::PackedTypeConverter<scalar_t>::Type,      \
             KERNEL<scalar_t>,                                                  \
             PACKED_KERNEL<typename vllm::PackedTypeConverter<scalar_t>::Type>, \
-            ACT_FIRST, true, HAS_CLAMP, true><<<grid, block, 0, stream>>>(     \
+            ACT_FIRST, true, HAS_CLAMP, (CUDA_VERSION >= 12090)>               \
+            <<<grid, block, 0, stream>>>(                                      \
             out.mutable_data_ptr<scalar_t>(),                                  \
             input.const_data_ptr<scalar_t>(), d, LIMIT, ALPHA, BETA);          \
       });                                                                      \
@@ -340,6 +341,7 @@ void gelu_tanh_and_mul(torch::stable::Tensor& out,    // [..., d]
 
 namespace vllm {
 
+#ifndef USE_MUSA  // fatrelu/swigluoai kernels crash mcc
 template <typename T>
 __device__ __forceinline__ T fatrelu_kernel(const T& x, const float threshold) {
   const float f = (float)x;
@@ -473,6 +475,7 @@ __global__ void swigluoai_and_mul_kernel(
     }
   }
 }
+#endif  // !USE_MUSA
 
 // SITU (Kimi SituGLU) gated activation. Non-interleaved layout:
 // input = [gate(d), up(d)] per token.
@@ -806,6 +809,7 @@ __device__ __forceinline__ int get_masked_feature_index() {
   return blockIdx.x * blockDim.x + threadIdx.x;
 }
 
+#ifndef USE_MUSA  // upstream masked activation kernels use CUDA-only activation helpers
 template <typename scalar_t, bool BATCHED_EXPERTS>
 __global__ void masked_situ_and_mul_kernel(
     scalar_t* __restrict__ out, const scalar_t* __restrict__ input,
@@ -946,8 +950,11 @@ __global__ void masked_activation_kernel(
   }
 }
 
+#endif  // !USE_MUSA
 }  // namespace vllm
 
+
+#ifndef USE_MUSA  // fatrelu/swigluoai kernels crash mcc
 #define LAUNCH_ACTIVATION_GATE_KERNEL_WITH_PARAM(KERNEL, PACKED_KERNEL, PARAM) \
   auto dtype = input.scalar_type();                                            \
   int d = input.size(-1) / 2;                                                  \
@@ -1035,6 +1042,7 @@ void swigluoai_and_mul(torch::stable::Tensor& out,    // [..., d]
                        double alpha, double limit) {
   LAUNCH_SIGLUOAI_AND_MUL(vllm::swigluoai_and_mul, alpha, limit);
 }
+#endif  // !USE_MUSA
 
 // Kimi SITU gated activation. `linear_beta <= 0` means "unset" (up passed
 // through), matching SituAndMul(linear_beta=None) on the Python side.
@@ -1059,6 +1067,7 @@ void situ_and_mul(torch::stable::Tensor& out,    // [..., d]
       });
 }
 
+#ifndef USE_MUSA  // masked activation ops are CUDA-only on the MUSA path
 void masked_situ_and_mul(torch::stable::Tensor& out,    // [E, T, d]
                          torch::stable::Tensor& input,  // [E, T, 2 * d]
                          const torch::stable::Tensor& expert_num_tokens,
@@ -1194,6 +1203,8 @@ void masked_moe_activation(
 // Fused SITU activation and block-FP8 quantization for Humming w2.
 // `num_valid_tokens` is the int32 DeepEP token count (psum[-1]); rows = it *
 // `topk`, so padding is excluded on-device and skipped rows receive scale 1.
+#endif  // !USE_MUSA
+
 void situ_and_mul_quant(torch::stable::Tensor& out,    // [..., d]  (fp8)
                         torch::stable::Tensor& scale,  // [..., 1 or d/128]
                         torch::stable::Tensor& input,  // [..., 2 * d]
@@ -1373,7 +1384,8 @@ __global__ void activation_kernel(
     dim3 block(std::min(d / vec_size, 1024));                                  \
     if (CUDA_VERSION >= 12090 && cc_major >= 10 && num_tokens > 128) {         \
       VLLM_STABLE_DISPATCH_FLOATING_TYPES(dtype, "activation_kernel", [&] {    \
-        vllm::activation_kernel<scalar_t, KERNEL<scalar_t>, true, true>        \
+        vllm::activation_kernel<scalar_t, KERNEL<scalar_t>, true,              \
+                                (CUDA_VERSION >= 12090)>                       \
             <<<grid, block, 0, stream>>>(out.mutable_data_ptr<scalar_t>(),     \
                                          input.const_data_ptr<scalar_t>(), d); \
       });                                                                      \

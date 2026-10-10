@@ -86,13 +86,33 @@ def deep_gemm_fp8_o_proj(
             if hasattr(wo_a, "weight_scale")
             else wo_a.weight_scale_inv
         )
-        fp8_einsum(
-            "bhr,hdr->bhd",
-            (o_proj_input, o_scale),
-            (wo_a.weight, weight_scale),
-            z,
-            recipe=einsum_recipe,
-        )
+        if current_platform.is_musa():
+            # MUSA: mate's fp8_einsum rejects the 2D o_proj weight that
+            # upstream passes; the MUSA provider normalizes it to grouped 3D.
+            from vllm_musa.deepseek_v4_jit.fp8_einsum import (
+                try_musa_deepseek_v4_fp8_einsum,
+            )
+
+            handled, reason = try_musa_deepseek_v4_fp8_einsum(
+                o_proj_input,
+                o_scale,
+                wo_a.weight,
+                weight_scale,
+                z,
+                "bhr,hdr->bhd",
+            )
+            if not handled:
+                raise RuntimeError(
+                    f"MUSA DeepSeek-V4 o_proj fp8_einsum unsupported: {reason}"
+                )
+        else:
+            fp8_einsum(
+                "bhr,hdr->bhd",
+                (o_proj_input, o_scale),
+                (wo_a.weight, weight_scale),
+                z,
+                recipe=einsum_recipe,
+            )
     else:
         grouped_weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
         torch.bmm(

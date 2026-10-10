@@ -107,7 +107,7 @@ class FusedMTPInputRMSNormKernel(
             # hnorm path: load prev_hidden[token, slot, :].
             slot = pid_task - 1
             row_offset = (token_idx * HC_MULT + slot) * HIDDEN
-            x = tl.load(prev_hidden_ptr + row_offset + block, mask=mask, other=0.0)
+            x = tl.load(prev_hidden_ptr + row_offset + block, mask=mask, other=0.0).to(tl.float32)
             _rmsnorm_row(
                 x,
                 hnorm_weight_ptr,

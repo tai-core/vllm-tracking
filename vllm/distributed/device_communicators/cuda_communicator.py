@@ -156,14 +156,38 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
-            self.ca_comm = CustomAllreduce(
-                group=self.cpu_group,
-                device=self.device,
-                symm_mem_enabled=(
-                    self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
-                ),
-                register_graph_buffers=register,
-            )
+            if current_platform.is_musa():
+                try:
+                    from vllm_musa.distributed.device_communicators.musa_jit_custom_all_reduce import (
+                        MusaJitCustomAllreduce,
+                    )
+
+                    self.ca_comm = MusaJitCustomAllreduce(
+                        group=self.cpu_group,
+                        device=self.device,
+                        symm_mem_enabled=(
+                            self.symm_mem_comm is not None
+                            and not self.symm_mem_comm.disabled
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "MUSA JIT custom all-reduce init failed; falling back "
+                        "to vLLM CustomAllreduce."
+                    )
+
+            # MUSA JIT init may fail or return a disabled communicator. In both
+            # cases, use the upstream csrc-backed CustomAllreduce fallback.
+            if self.ca_comm is None or self.ca_comm.disabled:
+                self.ca_comm = CustomAllreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                    symm_mem_enabled=(
+                        self.symm_mem_comm is not None
+                        and not self.symm_mem_comm.disabled
+                    ),
+                    register_graph_buffers=register,
+                )
 
         # AITER custom all-gather/reduce-scatter DP-attention dispatch/combine
         if (

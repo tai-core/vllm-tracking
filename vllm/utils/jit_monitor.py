@@ -97,7 +97,11 @@ def _setup_triton_autotuning_print() -> None:
     """Enable ``TRITON_PRINT_AUTOTUNING`` unless the user opted out."""
     if not HAS_TRITON:
         return
-    from triton import knobs  # type: ignore[import-untyped]
+    try:
+        from triton import knobs  # type: ignore[import-untyped]
+    except ImportError:
+        logger.debug("Triton knobs API is unavailable; skipping JIT monitor setup.")
+        return
 
     user_val = os.environ.get("TRITON_PRINT_AUTOTUNING")
     if user_val == "0":
@@ -239,7 +243,11 @@ def _setup_triton_jit_hook() -> None:
     """Register a jit_post_compile_hook that warns on compilation."""
     if not HAS_TRITON:
         return
-    from triton import knobs
+    try:
+        from triton import knobs
+    except ImportError:
+        logger.debug("Triton knobs API is unavailable; skipping JIT monitor setup.")
+        return
     from triton.runtime import jit as _triton_jit
 
     # kernels pass non-JSON-serializable constexprs

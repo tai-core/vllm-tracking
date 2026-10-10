@@ -284,14 +284,23 @@ class BlockPool:
                 block_hash, kv_cache_group_id
             )
             if blk.block_hash is not None:
-                # The only valid case where a "new full block" already has a
-                # hash is partial->full promotion of the same cache block.
-                assert (
+                # Usually a newly cached block only carries a shorter partial
+                # hash (partial->full promotion).  Mamba's dedicated pools
+                # can also reuse a block carrying a longer partial alias
+                # from a previous request.  The block has just been allocated
+                # for this request, so discard stale aliases before inserting
+                # the hash for the new contents instead of asserting.
+                if (
                     blk.block_hash_num_tokens is not None
-                    and blk.block_hash_num_tokens < num_hash_tokens
-                )
-                removed_hashes = self._remove_cached_block_hashes(blk)
-                self._emit_block_removed_events(removed_hashes)
+                    and blk.block_hash_num_tokens >= num_hash_tokens
+                ):
+                    removed_hashes = self._remove_cached_block_hashes(blk)
+                    self._emit_block_removed_events(removed_hashes)
+                else:
+                    assert blk.block_hash_num_tokens is not None
+                    assert blk.block_hash_num_tokens < num_hash_tokens
+                    removed_hashes = self._remove_cached_block_hashes(blk)
+                    self._emit_block_removed_events(removed_hashes)
             self._insert_block_hash(
                 block_hash_with_group_id,
                 blk,

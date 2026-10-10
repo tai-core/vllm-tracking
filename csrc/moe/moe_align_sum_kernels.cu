@@ -2,15 +2,15 @@
 #include <cub/cub.cuh>
 
 #include <cuda_runtime.h>
-#include <torch/csrc/stable/macros.h>
-#include <torch/csrc/stable/accelerator.h>
-#include <torch/csrc/stable/ops.h>
-#include <torch/csrc/stable/tensor.h>
-#include <torch/headeronly/core/ScalarType.h>
+#include <torch/all.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/Atomic.cuh>
 
 #include "core/cuda_compat.h"
 #include "core/utils.hpp"
-#include "dispatch_utils.h"
+#include "musa_dispatch_utils.h"
 #include "quantization/vectorization.cuh"
 #include "torch_utils.h"
 
@@ -670,28 +670,25 @@ __global__ void moe_lora_align_block_size_small_batch_expert_kernel(
 
 // taken from
 // https://github.com/sgl-project/sglang/blob/8b5f83ed3b7d2a49ad5c5cd5aa61c5d502f47dbc
-void moe_align_block_size(torch::stable::Tensor topk_ids, int64_t num_experts,
-                          int64_t block_size,
-                          torch::stable::Tensor sorted_token_ids,
-                          torch::stable::Tensor experts_ids,
-                          torch::stable::Tensor num_tokens_post_pad,
-                          std::optional<torch::stable::Tensor> maybe_expert_map,
-                          std::optional<torch::stable::Tensor> scatter_idx) {
-  const torch::stable::accelerator::DeviceGuard device_guard(
-      topk_ids.get_device_index());
+void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
+                          int64_t block_size, torch::Tensor sorted_token_ids,
+                          torch::Tensor experts_ids,
+                          torch::Tensor num_tokens_post_pad,
+                          std::optional<torch::Tensor> maybe_expert_map,
+                          std::optional<torch::Tensor> scatter_idx) {
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(topk_ids));
   const cudaStream_t stream =
-      get_current_cuda_stream(topk_ids.get_device_index());
+      at::cuda::getCurrentCUDAStream();
 
   int32_t* scatter_ptr = nullptr;
   if (scatter_idx.has_value()) {
-    STD_TORCH_CHECK(
-        scatter_idx->scalar_type() == torch::headeronly::ScalarType::Int,
-        "scatter_idx must be int32");
-    STD_TORCH_CHECK(scatter_idx->device() == topk_ids.device() &&
-                        scatter_idx->is_contiguous() &&
-                        scatter_idx->numel() == topk_ids.numel(),
-                    "scatter_idx must be contiguous, on the same device, and "
-                    "match topk_ids.numel()");
+    TORCH_CHECK(scatter_idx->scalar_type() == at::ScalarType::Int,
+                "scatter_idx must be int32");
+    TORCH_CHECK(scatter_idx->device() == topk_ids.device() &&
+                    scatter_idx->is_contiguous() &&
+                    scatter_idx->numel() == topk_ids.numel(),
+                "scatter_idx must be contiguous, on the same device, and "
+                "match topk_ids.numel()");
     scatter_ptr = reinterpret_cast<int32_t*>(scatter_idx->mutable_data_ptr());
   }
 
@@ -702,18 +699,17 @@ void moe_align_block_size(torch::stable::Tensor topk_ids, int64_t num_experts,
   threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
   // BlockScan uses 1024 threads and assigns one thread per expert.
-  STD_TORCH_CHECK(padded_num_experts < 1024,
+  TORCH_CHECK(padded_num_experts < 1024,
                   "padded_num_experts must be less than 1024");
   bool has_expert_map = maybe_expert_map.has_value();
-  torch::stable::Tensor expert_map;
+  torch::Tensor expert_map;
   if (has_expert_map) {
     expert_map = maybe_expert_map.value();
   } else {
-    expert_map = torch::stable::new_empty(topk_ids, {0},
-                                          torch::headeronly::ScalarType::Int);
+    expert_map = torch::empty({0}, topk_ids.options().dtype(torch::kInt));
   }
 
-  VLLM_STABLE_DISPATCH_INTEGRAL_AND_UNSIGNED_TYPES(
+  VLLM_DISPATCH_INTEGRAL_AND_UNSIGNED_TYPES(
       topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
         // calc needed amount of shared mem for `cumsum` tensors
         bool small_batch_expert_mode =
@@ -743,8 +739,7 @@ void moe_align_block_size(torch::stable::Tensor topk_ids, int64_t num_experts,
               sorted_token_ids.size(0), topk_ids.size(1), has_expert_map,
               scatter_ptr);
         } else {
-          torch::stable::Tensor cumsum_buffer = torch::stable::new_empty(
-              topk_ids, {num_experts + 1}, torch::headeronly::ScalarType::Int);
+          torch::Tensor cumsum_buffer = torch::empty({num_experts + 1}, topk_ids.options().dtype(torch::kInt));
           auto align_kernel = vllm::moe::moe_align_block_size_kernel<scalar_t>;
 
           size_t num_warps = CEILDIV(padded_num_experts, experts_per_warp);
@@ -788,26 +783,25 @@ void moe_align_block_size(torch::stable::Tensor topk_ids, int64_t num_experts,
 
 void batched_moe_align_block_size(int64_t max_tokens_per_batch,
                                   int64_t block_size,
-                                  const torch::stable::Tensor& batch_num_tokens,
-                                  torch::stable::Tensor sorted_ids,
-                                  torch::stable::Tensor batch_ids,
-                                  torch::stable::Tensor num_tokens_post_pad) {
+                                  const torch::Tensor& batch_num_tokens,
+                                  torch::Tensor sorted_ids,
+                                  torch::Tensor batch_ids,
+                                  torch::Tensor num_tokens_post_pad) {
   namespace batched_kernel = vllm::moe::batched_moe_align_block_size;
 
-  const torch::stable::accelerator::DeviceGuard device_guard(
-      batch_num_tokens.get_device_index());
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(batch_num_tokens));
   const cudaStream_t stream =
-      get_current_cuda_stream(batch_num_tokens.get_device_index());
+      at::cuda::getCurrentCUDAStream();
   int32_t const B = batch_num_tokens.size(0);
   int32_t const num_blocks_per_batch =
       round_to_next_multiple_of(max_tokens_per_batch, block_size) / block_size;
   int32_t const num_blocks = num_blocks_per_batch * B;
   int64_t const sorted_ids_size = num_blocks * block_size;
 
-  STD_TORCH_CHECK(sorted_ids.size(0) == sorted_ids_size);
-  STD_TORCH_CHECK(batch_ids.size(0) == sorted_ids_size / block_size);
-  STD_TORCH_CHECK(num_tokens_post_pad.size(0) == 1);
-  STD_TORCH_CHECK(B <= batched_kernel::num_threads);
+  TORCH_CHECK(sorted_ids.size(0) == sorted_ids_size);
+  TORCH_CHECK(batch_ids.size(0) == sorted_ids_size / block_size);
+  TORCH_CHECK(num_tokens_post_pad.size(0) == 1);
+  TORCH_CHECK(B <= batched_kernel::num_threads);
 
   // Avoid coordination overhead for small capacities or many batches.
   int64_t const cooperative_threshold = std::max<int64_t>(256, 8 * B);
@@ -826,14 +820,14 @@ void batched_moe_align_block_size(int64_t max_tokens_per_batch,
       reinterpret_cast<int32_t*>(num_tokens_post_pad.mutable_data_ptr()));
 }
 
-void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
-             torch::stable::Tensor& output,  // [num_tokens, hidden_size]
-             std::optional<torch::stable::Tensor> topk_ids,
-             std::optional<torch::stable::Tensor> expert_map) {
+void moe_sum(torch::Tensor& input,   // [num_tokens, topk, hidden_size]
+             torch::Tensor& output,  // [num_tokens, hidden_size]
+             std::optional<torch::Tensor> topk_ids,
+             std::optional<torch::Tensor> expert_map) {
   // Output is dense and written in place, so it must be contiguous. The input
   // is read by its strides (no copy); only the hidden dim needs to be
   // contiguous to take the vectorized path.
-  STD_TORCH_CHECK(output.is_contiguous(),
+  TORCH_CHECK(output.is_contiguous(),
                   "moe_sum expects a contiguous output");
 
   const int hidden_size = input.size(-1);
@@ -843,23 +837,22 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
   const int64_t stride_topk = input.stride(1);
   const int64_t stride_hidden = input.stride(2);
 
-  const torch::stable::accelerator::DeviceGuard device_guard(
-      output.get_device_index());
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
   const cudaStream_t stream =
-      get_current_cuda_stream(output.get_device_index());
+      at::cuda::getCurrentCUDAStream();
 
   if (topk_ids.has_value()) {
     // Pad-aware reduce path
-    const torch::stable::Tensor& tk = topk_ids.value();
-    STD_TORCH_CHECK(tk.size(0) == num_tokens && tk.size(1) == topk,
+    const torch::Tensor& tk = topk_ids.value();
+    TORCH_CHECK(tk.size(0) == num_tokens && tk.size(1) == topk,
                     "moe_sum: topk_ids must have shape [num_tokens, topk]");
     const int64_t stride_tk_token = tk.stride(0);
     const int64_t stride_tk_k = tk.stride(1);
 
     const int32_t* expert_map_ptr = nullptr;
     if (expert_map.has_value()) {
-      STD_TORCH_CHECK(
-          expert_map->scalar_type() == torch::headeronly::ScalarType::Int,
+      TORCH_CHECK(
+          expert_map->scalar_type() == at::ScalarType::Int,
           "moe_sum: expert_map must be int32");
       expert_map_ptr =
           reinterpret_cast<const int32_t*>(expert_map->const_data_ptr());
@@ -871,7 +864,7 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
           out_ptr, in_ptr, num_tokens, hidden_size, stride_token, stride_topk, \
           topk_ids_ptr, expert_map_ptr, stride_tk_token, stride_tk_k)
 
-    VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+    VLLM_DISPATCH_FLOATING_TYPES(
         input.scalar_type(), "moe_sum_pad_aware", [&] {
           constexpr int VEC = vllm::moe::MOE_SUM_VEC<scalar_t>;
           constexpr int WIDTH = VEC * sizeof(scalar_t);
@@ -886,7 +879,7 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
               (reinterpret_cast<uintptr_t>(in_ptr) % WIDTH == 0) &&
               (reinterpret_cast<uintptr_t>(out_ptr) % WIDTH == 0);
 
-          VLLM_STABLE_DISPATCH_IDX_TYPES(
+          VLLM_DISPATCH_IDX_TYPES(
               tk.scalar_type(), "moe_sum_pad_aware_idx", [&] {
                 auto* topk_ids_ptr =
                     reinterpret_cast<const idx_t*>(tk.const_data_ptr());
@@ -945,7 +938,7 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
                                          hidden_size, stride_token,   \
                                          stride_topk, nullptr, nullptr, 0, 0)
 
-  VLLM_STABLE_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum", [&] {
+  VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum", [&] {
     constexpr int VEC = vllm::moe::MOE_SUM_VEC<scalar_t>;
     constexpr int WIDTH = VEC * sizeof(scalar_t);  // 16 bytes
     auto* out_ptr = reinterpret_cast<scalar_t*>(output.mutable_data_ptr());
@@ -1002,44 +995,43 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
 }
 
 void moe_lora_align_block_size(
-    torch::stable::Tensor topk_ids, torch::stable::Tensor token_lora_mapping,
+    torch::Tensor topk_ids, torch::Tensor token_lora_mapping,
     int64_t num_experts, int64_t block_size, int64_t max_loras,
     int64_t max_num_tokens_padded, int64_t max_num_m_blocks,
-    torch::stable::Tensor sorted_token_ids, torch::stable::Tensor expert_ids,
-    torch::stable::Tensor num_tokens_post_pad,
-    torch::stable::Tensor adapter_enabled, torch::stable::Tensor lora_ids,
-    std::optional<torch::stable::Tensor> maybe_expert_map) {
+    torch::Tensor sorted_token_ids, torch::Tensor expert_ids,
+    torch::Tensor num_tokens_post_pad,
+    torch::Tensor adapter_enabled, torch::Tensor lora_ids,
+    std::optional<torch::Tensor> maybe_expert_map) {
   const int topk_num = topk_ids.size(1);
 
-  STD_TORCH_CHECK(block_size > 0, "block_size should be greater than 0. ");
+  TORCH_CHECK(block_size > 0, "block_size should be greater than 0. ");
 
   int device_max_shared_mem;
-  int dev = topk_ids.get_device_index();
-  const torch::stable::accelerator::DeviceGuard device_guard(dev);
+  const auto dev = topk_ids.get_device();
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(topk_ids));
   cudaDeviceGetAttribute(&device_max_shared_mem,
                          cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-  const cudaStream_t stream = get_current_cuda_stream(dev);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   int64_t padded_num_experts =
       ((num_experts + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
   // BlockScan uses 1024 threads and assigns one thread per expert.
-  STD_TORCH_CHECK(padded_num_experts < 1024,
+  TORCH_CHECK(padded_num_experts < 1024,
                   "padded_num_experts must be less than 1024");
 
-  torch::stable::Tensor token_mask =
-      torch::stable::new_empty(topk_ids, {max_loras * topk_ids.size(0)},
-                               torch::headeronly::ScalarType::Int);
+  torch::Tensor token_mask =
+      torch::empty({max_loras * topk_ids.size(0)},
+                    topk_ids.options().dtype(torch::kInt));
   bool has_expert_map = maybe_expert_map.has_value();
-  torch::stable::Tensor expert_map;
+  torch::Tensor expert_map;
   if (has_expert_map) {
     expert_map = maybe_expert_map.value();
   } else {
-    expert_map = torch::stable::new_empty(topk_ids, {0},
-                                          torch::headeronly::ScalarType::Int);
+    expert_map = torch::empty({0}, topk_ids.options().dtype(torch::kInt));
   }
 
-  VLLM_STABLE_DISPATCH_INTEGRAL_TYPES(
+  VLLM_DISPATCH_INTEGRAL_TYPES(
       topk_ids.scalar_type(), "moe_lora_align_sum_kernel", [&] {
         bool small_batch_expert_mode =
             (topk_ids.numel() < 1024) && (num_experts <= 64);
@@ -1050,7 +1042,7 @@ void moe_lora_align_block_size(
               (num_thread + 1) * num_experts * sizeof(int32_t) +
               (num_experts + 1) * sizeof(int32_t);
           if (shared_mem > device_max_shared_mem) {
-            STD_TORCH_CHECK(false, "Shared memory usage exceeds device limit.");
+            TORCH_CHECK(false, "Shared memory usage exceeds device limit.");
           }
 
           // threadIdx.x >= fill_threads: counting experts and aligning
@@ -1061,7 +1053,7 @@ void moe_lora_align_block_size(
           auto kernel =
               vllm::moe::moe_lora_align_block_size_small_batch_expert_kernel<
                   scalar_t, fill_threads>;
-          STD_CUDA_CHECK(VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize(
+          AT_CUDA_CHECK(VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize(
               (void*)kernel, shared_mem));
           // Grid size is (max_loras + 1) because active_lora_ids has length
           // max_loras + 1: sorted-unique values of token_lora_mapping, which
@@ -1095,9 +1087,8 @@ void moe_lora_align_block_size(
           size_t shared_mem_size = num_warps * WARP_SIZE * sizeof(int32_t);
 
           // cumsum buffer
-          torch::stable::Tensor cumsum = torch::stable::new_zeros(
-              topk_ids, {max_loras * (num_experts + 1)},
-              torch::headeronly::ScalarType::Int);
+          torch::Tensor cumsum = torch::zeros({max_loras * (num_experts + 1)},
+                    topk_ids.options().dtype(torch::kInt));
 
           auto align_kernel =
               vllm::moe::moe_lora_align_block_size_kernel<scalar_t>;

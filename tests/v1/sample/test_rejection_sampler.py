@@ -14,6 +14,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RejectionSampler,
+    apply_sampling_constraints,
     sample_recovered_tokens,
 )
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
@@ -743,6 +744,60 @@ def test_top_p(rejection_sampler, top_p):
         unmasked_indices=top_p_indices,
         sampling_metadata=sampling_metadata,
     )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_musa(),
+    reason="MUSA rejection sampling uses a platform-specific top-p fallback",
+)
+def test_musa_rejection_top_p_mask_matches_pytorch_reference():
+    """Keep MUSA rejection sampling off the divergent Triton top-p mask."""
+    vocab_size = 100
+    batch_size = 100
+    num_draft_tokens = 3
+    num_tokens = batch_size * num_draft_tokens
+    top_p = 0.5
+
+    generator = torch.Generator(device=DEVICE_TYPE).manual_seed(0)
+    target_logits = torch.randn(
+        (num_tokens, vocab_size),
+        generator=generator,
+        device=DEVICE_TYPE,
+    )
+    temperature = torch.ones(batch_size, dtype=torch.float32, device=DEVICE_TYPE)
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False,
+        temperature=temperature,
+        top_p=torch.full(
+            (batch_size,), top_p, dtype=torch.float32, device=DEVICE_TYPE
+        ),
+    )
+    cu_num_draft_tokens = torch.arange(
+        num_draft_tokens,
+        num_tokens + 1,
+        num_draft_tokens,
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+
+    actual = apply_sampling_constraints(
+        target_logits.clone(),
+        cu_num_draft_tokens,
+        sampling_metadata,
+    )
+
+    logits_sort, logits_idx = target_logits.sort(dim=-1, descending=False)
+    probs_sum = logits_sort.softmax(dim=-1).cumsum(dim=-1)
+    top_p_mask = probs_sum <= 1 - top_p
+    top_p_mask[:, -1] = False
+    logits_sort.masked_fill_(top_p_mask, -float("inf"))
+    expected = target_logits.clone().scatter_(
+        dim=-1,
+        index=logits_idx,
+        src=logits_sort,
+    )
+
+    assert torch.equal(torch.isfinite(actual), torch.isfinite(expected))
 
 
 ########################### Tests for Logit Processors ###################

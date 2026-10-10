@@ -217,6 +217,7 @@ TorchProfilerActivityMap = {
     "CPU": torch.profiler.ProfilerActivity.CPU,
     "CUDA": torch.profiler.ProfilerActivity.CUDA,
     "PrivateUse1": torch.profiler.ProfilerActivity.PrivateUse1,
+    "MUSA": torch.profiler.ProfilerActivity.MUSA,
     "XPU": torch.profiler.ProfilerActivity.XPU,
 }
 
@@ -683,6 +684,7 @@ class CudaProfilerWrapper(WorkerProfiler):
 _DEFAULT_TORCH_PROFILER_ACTIVITIES: dict[str, tuple[TorchProfilerActivity, ...]] = {
     "cpu": ("CPU",),
     "cuda": ("CPU", "CUDA"),
+    "musa": ("CPU", "MUSA"),
     "xpu": ("CPU", "XPU"),
 }
 _SUPPORTED_TORCH_PROFILER_ACTIVITIES = {
@@ -692,6 +694,7 @@ _SUPPORTED_TORCH_PROFILER_ACTIVITIES = {
 _SUPPORTED_PROFILER_KINDS: dict[str, frozenset[ProfilerKind]] = {
     "cpu": frozenset(("torch",)),
     "cuda": frozenset(("torch", "cuda", "proton")),
+    "musa": frozenset(("torch", "cuda", "proton")),
     "xpu": frozenset(("torch",)),
 }
 

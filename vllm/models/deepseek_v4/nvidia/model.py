@@ -174,6 +174,12 @@ class DeepseekV4MLP(nn.Module):
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
         )
+        if current_platform.is_musa():
+            from vllm.config import get_current_vllm_config_or_none
+
+            from vllm_musa.optimization_contract import bind_optimization_contract
+
+            bind_optimization_contract(self.down_proj, get_current_vllm_config_or_none())
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
@@ -185,6 +191,13 @@ class DeepseekV4MLP(nn.Module):
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
+        if isinstance(self.act_fn, SiluAndMulWithClamp):
+            fused_forward = getattr(self.down_proj, "forward_swiglu_clamp", None)
+            if fused_forward is not None:
+                fused_output = fused_forward(gate_up, self.act_fn.swiglu_limit)
+                if fused_output is not None:
+                    return fused_output
+
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -1345,8 +1358,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # DeepseekV4Attention._run_parallel_input_projections
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
         # kv_score). fused_wqa_wkv stays on the default stream.
-        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
-
+        # Disable them on ROCm/XPU because of backend hang issues/no overlap.
+        aux_stream_list = (
+            None
+            if current_platform.is_rocm() or current_platform.is_xpu()
+            else [torch.cuda.Stream() for _ in range(3)]
+        )
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
@@ -1847,7 +1864,16 @@ class DeepseekV4ForCausalLM(
 
         config = vllm_config.model_config.hf_config
         self.config = config
-        expert_dtype = getattr(config, "expert_dtype", "fp4")
+        # Some converted FP8 checkpoints omit expert_dtype from hf_config.
+        # The DeepSeek quant config resolves it from hf_overrides, so reuse that
+        # authoritative value instead of silently selecting the FP4 mapper.
+        expert_dtype = getattr(config, "expert_dtype", None)
+        resolved_quant_dtype = getattr(vllm_config.quant_config, "expert_dtype", None)
+        if resolved_quant_dtype in ("fp4", "fp8") and (
+            expert_dtype is None
+            or (expert_dtype == "fp4" and resolved_quant_dtype == "fp8")
+        ):
+            expert_dtype = resolved_quant_dtype
         if expert_dtype != "fp4":
             self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
 

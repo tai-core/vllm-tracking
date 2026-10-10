@@ -314,7 +314,14 @@ class CUDAGraphWrapper:
                 with torch.cuda.graph(
                     cudagraph,
                     pool=graph_pool,
-                    stream=current_stream(),
+                    # torch_musa selects a dedicated non-default capture
+                    # stream when stream is None. Capturing on the current
+                    # default stream raises in MUSA graph capture.
+                    stream=(
+                        None
+                        if current_platform.device_type == "musa"
+                        else current_stream()
+                    ),
                 ):
                     # `output` is managed by pytorch's cudagraph pool
                     output = self.runnable(*args, **kwargs)

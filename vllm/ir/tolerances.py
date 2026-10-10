@@ -29,7 +29,7 @@ DEFAULT_TOLERANCES: ToleranceSpec = {
     torch.float8_e5m2: {"atol": 2e-1, "rtol": 2e-1},
     # 1-bit mantissa; machine epsilon ~2.5e-1. Packed pair format (x2).
     # Derived from vLLM fp4 tests (test_silu_mul_nvfp4_quant: atol=3e-1).
-    torch.float4_e2m1fn_x2: {"atol": 3e-1, "rtol": 3e-1},
+#    torch.float4_e2m1fn_x2: {"atol": 3e-1, "rtol": 3e-1},
     # Integer quantized; off-by-one from rounding is expected.
     # rtol=0 because relative error is meaningless for small integers.
     torch.int8: {"atol": 1, "rtol": 0},

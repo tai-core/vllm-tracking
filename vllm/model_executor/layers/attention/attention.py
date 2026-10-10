@@ -495,6 +495,7 @@ class Attention(nn.Module, AttentionLayerBase):
         # definition specify the output tensor shape.
         output_shape: torch.Size | None = None,
         output_dtype: torch.dtype | None = None,
+        kv_cache_dummy_dep: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The KV cache is stored inside this class and is accessed via
         `self.kv_cache`.
@@ -524,7 +525,7 @@ class Attention(nn.Module, AttentionLayerBase):
             # Handle both 2D [num_tokens, hidden] and
             # 3D [num_tokens, heads, head_dim] query
             num_tokens = query.shape[0]
-            output_shape = torch.Size((num_tokens, self.num_heads * self.head_size_v))
+            output_shape = (num_tokens, self.num_heads * self.head_size_v)
         output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
         hidden_size = output_shape[-1]
         # Reshape the query, key, and value tensors.
@@ -536,7 +537,6 @@ class Attention(nn.Module, AttentionLayerBase):
             key = key.view(-1, self.num_kv_heads, self.head_size)
         if value is not None:
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
-        kv_cache_dummy_dep = None
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
             if (
@@ -544,6 +544,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 and self.kv_sharing_target_layer_name is None
                 and key is not None
                 and value is not None
+                and kv_cache_dummy_dep is None
             ):
                 kv_cache_dummy_dep = unified_kv_cache_update(
                     key, value, self.layer_name
@@ -564,6 +565,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 and self.kv_sharing_target_layer_name is None
                 and key is not None
                 and value is not None
+                and kv_cache_dummy_dep is None
             ):
                 kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
                     key, value, encoded

@@ -408,11 +408,17 @@ class CudaGraphManager:
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
 
-    def _capture_stream(self, desc: BatchExecutionDescriptor) -> torch.cuda.Stream:
+    def _capture_stream(
+        self, desc: BatchExecutionDescriptor
+    ) -> torch.cuda.Stream | None:
         """Capture on the stream used by the microbatch threads."""
         if desc.num_ubatches > 1:
             assert self.ubatch_runner is not None
             return self.ubatch_runner.capture_stream
+        # torch_musa.graph uses its own non-default stream when none is
+        # supplied; capturing on the current default stream is unsupported.
+        if current_platform.device_type == "musa":
+            return None
         return current_stream()
 
     @torch.inference_mode()

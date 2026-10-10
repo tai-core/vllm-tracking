@@ -75,6 +75,13 @@ class DeepGemmQuantScaleFMT(Enum):
             and is_deep_gemm_supported()
             and (_fp8_gemm_nt_impl is not None)
         )
+        if use_e8m0 and current_platform.is_musa():
+            logger.info_once(
+                "DeepGEMM E8M0 disabled on MUSA: grouped FP8 UE8M0 cast is "
+                "not supported by the MUSA DeepGEMM backend."
+            )
+            use_e8m0 = False
+
         if not use_e8m0:
             cls._oracle_cache = cls.FLOAT32  # type: ignore
             return
@@ -134,6 +141,12 @@ def is_deep_gemm_e8m0_used() -> bool:
         return False
 
     if envs.VLLM_USE_DEEP_GEMM_E8M0:
+        if current_platform.is_musa():
+            logger.info_once(
+                "DeepGEMM E8M0 disabled on MUSA: grouped FP8 UE8M0 cast is "
+                "not supported by the MUSA DeepGEMM backend."
+            )
+            return False
         logger.info_once("DeepGEMM E8M0 enabled on current platform.")
         return True
 
@@ -320,6 +333,17 @@ def _lazy_init() -> None:
     _tf32_hc_prenorm_gemm_impl = getattr(_dg, "tf32_hc_prenorm_gemm", None)
     _mega_mhc_impl = getattr(_dg, "mega_mhc", None)
     _bf16_mega_gate_impl = getattr(_dg, "bf16_mega_gate", None)
+    if _tf32_hc_prenorm_gemm_impl is None:
+        # MUSA provides the TF32 HyperConnection prenorm kernel through MATE,
+        # while the standalone deep_gemm package does not expose it.
+        try:
+            import mate.deep_gemm as _mate_dg
+        except Exception:
+            _mate_dg = None
+        if _mate_dg is not None:
+            _tf32_hc_prenorm_gemm_impl = getattr(
+                _mate_dg, "tf32_hc_prenorm_gemm", None
+            )
     _get_mn_major_tma_aligned_tensor_impl = getattr(
         _dg, "get_mn_major_tma_aligned_tensor", None
     )
@@ -362,7 +386,7 @@ def get_mk_alignment_for_contiguous_layout() -> list[int]:
     _lazy_init()
     if _get_mk_alignment_for_contiguous_layout_impl is None:
         return _missing()
-    mk_align_size = _get_mk_alignment_for_contiguous_layout_impl()
+    mk_align_size = 128
     return [mk_align_size, mk_align_size]
 
 
@@ -411,7 +435,12 @@ def set_mk_alignment_for_contiguous_layout(value: int) -> None:
     dg = _import_deep_gemm()
     if dg is None:
         raise RuntimeError("DeepGEMM is not available")
-    dg.set_mk_alignment_for_contiguous_layout(value)
+    setter = getattr(dg, "set_mk_alignment_for_contiguous_layout", None)
+    if setter is None:
+        # MUSA: the MUSA DeepGEMM backend has no BLOCK_M alignment setter; the
+        # alignment is fixed, so skip rather than fail.
+        return
+    setter(value)
 
 
 @contextlib.contextmanager
@@ -559,6 +588,8 @@ def m_grouped_fp8_gemm_nt_contiguous(*args, **kwargs):
     _lazy_init()
     if _grouped_impl is None:
         return _missing(*args, **kwargs)
+    if current_platform.is_musa():
+        return _grouped_impl(*args, **kwargs)
     return _grouped_impl(
         *args, disable_ue8m0_cast=not is_deep_gemm_e8m0_used(), **kwargs
     )
@@ -568,6 +599,8 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous(*args, **kwargs):
     _lazy_init()
     if _grouped_fp4_impl is None:
         return _missing(*args, **kwargs)
+    if current_platform.is_musa():
+        return _grouped_fp4_impl(*args, **kwargs)
     return _grouped_fp4_impl(
         *args, disable_ue8m0_cast=not is_deep_gemm_e8m0_used(), **kwargs
     )
@@ -577,6 +610,8 @@ def fp8_m_grouped_gemm_nt_masked(*args, **kwargs):
     _lazy_init()
     if _grouped_masked_impl is None:
         return _missing(*args, **kwargs)
+    if current_platform.is_musa():
+        return _grouped_masked_impl(*args, **kwargs)
     return _grouped_masked_impl(
         *args, disable_ue8m0_cast=not is_deep_gemm_e8m0_used(), **kwargs
     )

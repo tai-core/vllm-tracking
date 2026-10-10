@@ -469,8 +469,9 @@ def postprocess_mamba_fused_kernel(
     # Update accepted-token count before early exits (per-request, so only
     # state_idx == 0 writes). Also guard on tile_idx == 0 so tiles > 0
     # (when TEMPORAL_TILES > 1) do not duplicate the store.
-    if src_block_idx == dest_block_idx and state_idx == 0 and tile_idx == 0:
-        tl.store(num_accepted_tokens_out_ptr + req_idx, 1)
+    if src_block_idx == dest_block_idx and state_idx == 0:
+        if tile_idx == 0:
+            tl.store(num_accepted_tokens_out_ptr + req_idx, 1)
 
     # Skip no-op self-copy.
     if src_block_idx == dest_block_idx and accept_token_bias == 0:

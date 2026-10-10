@@ -117,15 +117,18 @@ __device__ __forceinline__ float2 silu2(float2 x) {
 }
 
 __device__ __forceinline__ __nv_bfloat162 silu2_v2(float2 x) {
-#ifndef USE_ROCM
+// ==================== MUSA ADAPTATION ====================
+#ifndef USE_MUSA
+// ========================== END ==========================
   return make_bfloat162(__float2bfloat16_rn(silu(x.x)),
                         __float2bfloat16_rn(silu(x.y)));
 #else
   return __float22bfloat162_rn(make_float2(silu(x.x), silu(x.y)));
 #endif
 }
-
-#ifndef USE_ROCM
+// ==================== MUSA ADAPTATION ====================
+#ifndef USE_MUSA
+// ========================== END ==========================
 __device__ __forceinline__ float warp_max(float v) {
   static constexpr unsigned FULL_MASK = 0xffffffffu;
   for (int offset = 1; offset < WARP_SIZE; offset *= 2) {
@@ -184,7 +187,10 @@ __device__ __forceinline__ void cp_async_wait<0>() {
 }
 
 __device__ __forceinline__ float clip(float v, float mmin, float mmax) {
+#if __CUDACC_VER_MAJOR__ >= 11 && __CUDA_ARCH__ >= 800
   return fminf(mmax, fmaxf(v, mmin));
+#else
+#endif
 }
 
 __device__ __forceinline__ __nv_bfloat16 clip(__nv_bfloat16 v,
@@ -282,7 +288,9 @@ __global__ void silu_mul_fp8_quant_deep_gemm_kernel(
     Idx_t stride_i_e, Idx_t stride_i_t, Idx_t stride_i_h, Idx_t stride_yq_e,
     Idx_t stride_yq_t, Idx_t stride_yq_h, Idx_t stride_ys_e, Idx_t stride_ys_t,
     Idx_t stride_ys_g, Idx_t stride_ys_p, Idx_t stride_counts_e) {
-#ifndef USE_ROCM
+// ==================== MUSA ADAPTATION ====================
+#ifndef USE_MUSA
+// ========================== END ==========================
   static constexpr int NUM_WARPS = THREADS / WARP_SIZE;
 
   static constexpr int LOAD_STAGE_SIZE = 2 * GROUP_SIZE / 8;
@@ -296,10 +304,10 @@ __global__ void silu_mul_fp8_quant_deep_gemm_kernel(
   int* s_expert_offsets =
       reinterpret_cast<int*>(smem_128 + (SMEM_SIZE_BYTES_Y / 16));
 
-  static constexpr __nv_bfloat16 fp8_min = get_fp8_min<fp8_type>();
-  static constexpr __nv_bfloat16 fp8_max = get_fp8_max<fp8_type>();
-  // We assign EPS with it's 16-bit unsigned counterpart to allow constexpr.
-  static constexpr __nv_bfloat16 EPS = (__nv_bfloat16_raw{.x = 11996});
+  const __nv_bfloat16 fp8_min = get_fp8_min<fp8_type>();
+  const __nv_bfloat16 fp8_max = get_fp8_max<fp8_type>();
+  // Use the raw 16-bit representation to preserve the exact BF16 value.
+  const __nv_bfloat16 EPS = (__nv_bfloat16_raw{.x = 11996});
   int tid = threadIdx.x;
   int warp_id = tid >> 5;
   int lane_id = tid & 0x1f;
@@ -534,7 +542,7 @@ __global__ void silu_mul_fp8_quant_deep_gemm_kernel(
       if (!lane_id) {
         // Store scales.
         if constexpr (std::is_same<scale_t, uint8_t>::value) {
-          // Packed UE8M0 format. Remove Mantissa.
+          // Packed UE8MO format. Remove Mantissa.
           *y_s_ptr = reinterpret_cast<int16_t&>(y_s) >> 7;
 
           bool const jump_pack = (current_group_id + 1) % 4 == 0;
@@ -601,8 +609,9 @@ void persistent_masked_m_silu_mul_quant(
     torch::stable::Tensor& y_q,                      // (E, T, H) [OUT]
     torch::stable::Tensor& y_s,  // (E, T, H//group_size) [OUT]
     bool cast_scale_ue8m0) {
-#ifndef USE_ROCM
-
+// ==================== MUSA ADAPTATION ====================
+#ifndef USE_MUSA
+// ========================== END ==========================
   // This kernel currently only supports H % 128 == 0 and assumes a
   // fixed GROUP_SIZE of 128.
   static constexpr int GROUP_SIZE = 128;

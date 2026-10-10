@@ -352,6 +352,12 @@ def apply_moe_activation(
             silu_and_mul_with_clamp(
                 output, input, config.clamp_limit, topk_ids, expert_map
             )
+        elif input.device.type == "musa":
+            from vllm_musa.jit_kernel.csrc.moe import maybe_fast_silu_and_mul
+
+            if not maybe_fast_silu_and_mul(output, input):
+                d = input.shape[-1] // 2
+                output.copy_(F.silu(input[..., :d]) * input[..., d:])
         else:
             torch.ops._C.silu_and_mul(output, input)
     elif activation == MoEActivation.GELU:

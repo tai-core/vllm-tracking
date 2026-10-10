@@ -12,6 +12,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import replace
 from functools import reduce
+from math import prod
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
@@ -116,6 +117,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
 from vllm.utils.torch_utils import (
+    get_dtype_size,
     PIN_MEMORY,
     async_tensor_h2d,
     kv_cache_dtype_str_to_dtype,
@@ -573,6 +575,9 @@ class GPUModelRunner(
         self.kv_caches: list[torch.Tensor] = []
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
+        # Cache groups whose forward path consumes token-level slot mappings.
+        # Populated together with ``attn_groups`` after backends are resolved.
+        self._slot_mapping_kv_cache_gids: tuple[int, ...] = ()
         # self.kv_cache_config: KVCacheConfig
 
         # mm_hash ->  encoder_output
@@ -583,6 +588,9 @@ class GPUModelRunner(
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
         self.use_aux_hidden_state_outputs = False
+        # / PR #34880: tracks whether the draft model supports
+        # FULL-mode CUDA-graph capture (Eagle + padded drafter batch).
+        self.supports_sd_full_graph = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -638,6 +646,9 @@ class GPUModelRunner(
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
+                import os as _dflash_os
+                if _dflash_os.environ.get("VLLM_MUSA_DFLASH_FULL_WRAP", "1") != "0":
+                    self.supports_sd_full_graph = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.use_eagle():
@@ -646,6 +657,11 @@ class GPUModelRunner(
                     self.use_aux_hidden_state_outputs = (
                         self.drafter.eagle3_use_aux_hidden_state
                     )
+                # / PR #34880: enable FULL-mode draft capture when
+                # padded drafter batch is enabled.
+                self.supports_sd_full_graph = (
+                    not self.speculative_config.disable_padded_drafter_batch
+                )
             elif self.speculative_config.method == "medusa":
                 self.drafter = MedusaProposer(
                     vllm_config=self.vllm_config, device=self.device
@@ -738,6 +754,32 @@ class GPUModelRunner(
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             reasoning_config=self.vllm_config.reasoning_config,
             use_replayssm=self.cache_config.use_replayssm,
+        )
+
+        from vllm_musa.optimization_contract import (
+            OptimizationFeature,
+            resolve_optimization_contract,
+        )
+
+        optimization_contract = resolve_optimization_contract(
+            self.vllm_config,
+            is_pooling_model=self.is_pooling_model,
+        )
+        is_musa_qwen_text_generation = (
+            current_platform.is_musa()
+            and optimization_contract.prefers(
+                OptimizationFeature.QWEN_LEGACY_SAMPLING
+            )
+        )
+        self.sampler._musa_qwen_legacy_sampling = is_musa_qwen_text_generation
+        self.sampler._musa_optimization_contract = optimization_contract
+        self.sampler.topk_topp_sampler._musa_optimization_contract = (
+            optimization_contract
+        )
+        self._musa_qwen_uniform_decode_logits_indices = (
+            torch.arange(self.max_num_reqs, dtype=torch.int32, device=self.device)
+            if is_musa_qwen_text_generation
+            else None
         )
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -854,6 +896,25 @@ class GPUModelRunner(
         self.query_pos = self._make_buffer(arange_size, dtype=torch.int64)
         self._arange_scratch = np.empty(arange_size, dtype=np.int64)
 
+        # MUSA-3406: reusable CPU/GPU buffers for speculative metadata indices.
+        # Avoid per-step torch.from_numpy(...).to(device) pageable uploads in
+        # _calc_spec_decode_metadata on the TP8 DeepSeek-V4 decode path.
+        self._spec_cu_num_draft_tokens = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
+        self._spec_cu_num_sampled_tokens = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
+        self._spec_logits_indices = self._make_buffer(
+            self.max_num_tokens, dtype=torch.int64
+        )
+        self._spec_target_logits_indices = self._make_buffer(
+            self.max_num_tokens, dtype=torch.int64
+        )
+        self._spec_bonus_logits_indices = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
+
         # Layer pairings for cross-layer KV sharing.
         # If an Attention layer `layer_name` is in the keys of this dict, it
         # means this layer will perform attention using the keys and values
@@ -926,7 +987,9 @@ class GPUModelRunner(
         self.num_accepted_tokens_event: torch.Event | None = None
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
-            self.num_accepted_tokens_event = torch.Event()
+            self.num_accepted_tokens_event = (
+                torch.musa.Event() if current_platform.is_musa() else torch.Event()
+            )
             self.draft_token_ids_copy_stream = torch.cuda.Stream()
             self.draft_token_ids_cpu = torch.empty(
                 (self.max_num_reqs, self.num_spec_tokens),
@@ -1921,6 +1984,8 @@ class GPUModelRunner(
         self,
         scheduler_output: "SchedulerOutput",
         num_scheduled_tokens: np.ndarray,
+        *,
+        use_cached_decode_logits_indices: bool = False,
     ) -> tuple[
         torch.Tensor,
         SpecDecodeMetadata | None,
@@ -2141,11 +2206,28 @@ class GPUModelRunner(
         )
         self.seq_lens[num_reqs:].fill_(0)
 
-        self.input_batch.block_table.compute_slot_mapping(
-            num_reqs,
-            self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
-        )
+        if (
+            total_num_scheduled_tokens == num_reqs
+            and self.speculative_config is None
+            and self.cache_config.mamba_cache_mode == "none"
+            and self._slot_mapping_kv_cache_gids
+        ):
+            # SSM metadata consumes the per-group block table directly as state
+            # indices; it does not consume token-level slot mappings. Avoid one
+            # launch per SSM cache group in uniform non-spec decode while still
+            # updating every attention group that writes token KV entries.
+            for kv_cache_gid in self._slot_mapping_kv_cache_gids:
+                self.input_batch.block_table[kv_cache_gid].compute_slot_mapping(
+                    num_reqs,
+                    self.query_start_loc.gpu[: num_reqs + 1],
+                    self.positions[:total_num_scheduled_tokens],
+                )
+        else:
+            self.input_batch.block_table.compute_slot_mapping(
+                num_reqs,
+                self.query_start_loc.gpu[: num_reqs + 1],
+                self.positions[:total_num_scheduled_tokens],
+            )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2188,7 +2270,13 @@ class GPUModelRunner(
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
-            logits_indices = query_start_loc[1:] - 1
+            if use_cached_decode_logits_indices:
+                assert self._musa_qwen_uniform_decode_logits_indices is not None
+                logits_indices = self._musa_qwen_uniform_decode_logits_indices[
+                    :num_reqs
+                ]
+            else:
+                logits_indices = query_start_loc[1:] - 1
             spec_decode_metadata = None
             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
         else:
@@ -2478,8 +2566,11 @@ class GPUModelRunner(
                 )
 
             if for_cudagraph_capture:
+                capture_kwargs = {}
+                if getattr(builder, "supports_dynamic_cudagraph_metadata", False):
+                    capture_kwargs = extra_attn_metadata_args
                 attn_metadata_i = attn_group.build_metadata_for_cudagraph_capture(
-                    common_attn_metadata, ubid or 0
+                    common_attn_metadata, ubid or 0, **capture_kwargs
                 )
             elif (
                 cache_key in cached_attn_metadata
@@ -2670,17 +2761,48 @@ class GPUModelRunner(
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += self._arange_scratch[: cu_num_draft_tokens[-1]]
 
-        cu_num_draft_tokens = async_tensor_h2d(cu_num_draft_tokens, device=self.device)
-        cu_num_sampled_tokens = async_tensor_h2d(
-            cu_num_sampled_tokens, device=self.device
-        )
-        logits_indices = async_tensor_h2d(logits_indices, device=self.device)
-        target_logits_indices = async_tensor_h2d(
-            target_logits_indices, device=self.device
-        )
-        bonus_logits_indices = async_tensor_h2d(
-            bonus_logits_indices, device=self.device
-        )
+        if current_platform.is_musa():
+            # MUSA-3406: copy through persistent pinned CPU buffers so the
+            # per-step metadata uploads do not allocate pageable CPU tensors.
+            num_reqs = num_draft_tokens.shape[0]
+            num_sampled_total = int(cu_num_sampled_tokens[-1])
+            num_draft_total = int(cu_num_draft_tokens[-1])
+
+            self._spec_cu_num_draft_tokens.np[:num_reqs] = cu_num_draft_tokens
+            self._spec_cu_num_sampled_tokens.np[:num_reqs] = cu_num_sampled_tokens
+            self._spec_logits_indices.np[:num_sampled_total] = logits_indices
+            self._spec_target_logits_indices.np[:num_draft_total] = (
+                target_logits_indices
+            )
+            self._spec_bonus_logits_indices.np[:num_reqs] = bonus_logits_indices
+
+            self._spec_cu_num_draft_tokens.copy_to_gpu(num_reqs)
+            self._spec_cu_num_sampled_tokens.copy_to_gpu(num_reqs)
+            self._spec_logits_indices.copy_to_gpu(num_sampled_total)
+            self._spec_target_logits_indices.copy_to_gpu(num_draft_total)
+            self._spec_bonus_logits_indices.copy_to_gpu(num_reqs)
+
+            cu_num_draft_tokens = self._spec_cu_num_draft_tokens.gpu[:num_reqs]
+            cu_num_sampled_tokens = self._spec_cu_num_sampled_tokens.gpu[:num_reqs]
+            logits_indices = self._spec_logits_indices.gpu[:num_sampled_total]
+            target_logits_indices = self._spec_target_logits_indices.gpu[
+                :num_draft_total
+            ]
+            bonus_logits_indices = self._spec_bonus_logits_indices.gpu[:num_reqs]
+        else:
+            cu_num_draft_tokens = async_tensor_h2d(
+                cu_num_draft_tokens, device=self.device
+            )
+            cu_num_sampled_tokens = async_tensor_h2d(
+                cu_num_sampled_tokens, device=self.device
+            )
+            logits_indices = async_tensor_h2d(logits_indices, device=self.device)
+            target_logits_indices = async_tensor_h2d(
+                target_logits_indices, device=self.device
+            )
+            bonus_logits_indices = async_tensor_h2d(
+                bonus_logits_indices, device=self.device
+            )
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
@@ -3657,6 +3779,7 @@ class GPUModelRunner(
         num_tokens: int,
         num_reqs: int,
         force_uniform_decode: bool | None = None,
+        has_prefill: bool = False,
     ) -> bool:
         """Checks if it's a decode batch with same amount scheduled tokens
         across all requests.
@@ -3665,6 +3788,7 @@ class GPUModelRunner(
             (
                 (max_num_scheduled_tokens == uniform_decode_query_len)
                 and (num_tokens == max_num_scheduled_tokens * num_reqs)
+                and not has_prefill
             )
             if force_uniform_decode is None
             else force_uniform_decode
@@ -3738,12 +3862,19 @@ class GPUModelRunner(
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
+        has_prefill = self.model_config.is_hybrid and bool(
+            (
+                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+                < self.input_batch.num_prompt_tokens_cpu_tensor[:num_reqs]
+            ).any()
+        )
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             uniform_decode_query_len=self.uniform_decode_query_len,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
+            has_prefill=has_prefill,
         )
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
@@ -4018,8 +4149,20 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            use_cached_decode_logits_indices = (
+                self._musa_qwen_uniform_decode_logits_indices is not None
+                and max_num_scheduled_tokens == 1
+                and num_tokens_unpadded == num_reqs
+            )
+
             logits_indices, spec_decode_metadata, max_num_sampled_tokens = (
-                self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
+                self._prepare_inputs(
+                    scheduler_output,
+                    num_scheduled_tokens_np,
+                    use_cached_decode_logits_indices=(
+                        use_cached_decode_logits_indices
+                    ),
+                )
             )
 
             (
@@ -4238,21 +4381,58 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                if use_cached_decode_logits_indices:
+                    sample_hidden_states = hidden_states[:num_reqs]
+                else:
+                    sample_hidden_states = hidden_states[logits_indices]
+                if current_platform.is_musa() and getattr(
+                    self.sampler, "_musa_qwen_legacy_sampling", False
+                ):
+                    from vllm_musa.v1.sample.topk_topp_sampler import (
+                        musa_compute_logits_if_eligible,
+                    )
+
+                    logits, _ = musa_compute_logits_if_eligible(
+                        self.model,
+                        sample_hidden_states,
+                        self.input_batch.sampling_metadata,
+                        self.sampler,
+                    )
+                else:
+                    self.sampler._musa_qwen_sharded_logits = False
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
 
-                sample_hidden_states = hidden_states[logits_indices]
+                if use_cached_decode_logits_indices:
+                    sample_hidden_states = hidden_states[:num_reqs]
+                else:
+                    sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
+                    self.sampler._musa_qwen_sharded_logits = False
                     get_pp_group().send_tensor_dict(
                         hidden_states.tensors,
                         all_gather_group=get_tp_group(),
                     )
                     logits = None
                 else:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                    if current_platform.is_musa() and getattr(
+                        self.sampler, "_musa_qwen_legacy_sampling", False
+                    ):
+                        from vllm_musa.v1.sample.topk_topp_sampler import (
+                            musa_compute_logits_if_eligible,
+                        )
+
+                        logits, _ = musa_compute_logits_if_eligible(
+                            self.model,
+                            sample_hidden_states,
+                            self.input_batch.sampling_metadata,
+                            self.sampler,
+                        )
+                    else:
+                        self.sampler._musa_qwen_sharded_logits = False
+                        logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -4278,11 +4458,37 @@ class GPUModelRunner(
         )
         self.kv_connector_output = kv_connector_output
 
+        # A DSV4 MTP prefill step can enqueue work on several MUSA task queues.
+        # Fence those queues before async scheduling reuses the next step's
+        # graph inputs and metadata.
         # Now the batch has been launched we can wait for corrections from the
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
+        queue_fence = getattr(
+            self, "_musa_dsv4_mtp_prefill_queue_fence", None
+        )
+        if queue_fence is None:
+            from vllm_musa.optimization_contract.policy import (
+                deepseek_v4_mtp_async_prefill_queue_fence_enabled,
+                deepseek_v4_mtp_prefill_step_requires_sync,
+            )
+
+            queue_fence = (
+                deepseek_v4_mtp_prefill_step_requires_sync
+                if deepseek_v4_mtp_async_prefill_queue_fence_enabled(
+                    self.vllm_config
+                )
+                else False
+            )
+            self._musa_dsv4_mtp_prefill_queue_fence = queue_fence
+        if (
+            queue_fence
+            and queue_fence(scheduler_output)
+            and not torch.musa.is_current_stream_capturing()
+        ):
+            torch.musa.synchronize()
         return None
 
     def _input_fits_in_drafter(
@@ -4382,6 +4588,7 @@ class GPUModelRunner(
             input_fits_in_drafter = self._input_fits_in_drafter(
                 spec_decode_common_attn_metadata
             )
+
             # Whether the drafter runs a GPU model forward (and thus carries
             # TP/EP/DP collectives), independent of padded-batch timing.
             drafter_runs_model_forward = (
@@ -5674,6 +5881,7 @@ class GPUModelRunner(
         )
 
         attn_metadata: PerLayerAttnMetadata | None = None
+        spec_decode_cm: 'CommonAttentionMetadata | None' = None
 
         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
             num_tokens_padded=num_tokens_padded,
@@ -5748,7 +5956,7 @@ class GPUModelRunner(
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
-                attn_metadata, _ = self._build_attention_metadata(
+                attn_metadata, spec_decode_cm = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded if pad_attn else None,
                     num_reqs=num_reqs_padded,
@@ -5867,13 +6075,16 @@ class GPUModelRunner(
                     | Gemma4Proposer,
                 )
                 assert self.speculative_config is not None
-                # Eagle currently only supports PIECEWISE cudagraphs.
-                # Therefore only use cudagraphs if the main model uses PIECEWISE
-                # NOTE(lucas): this is a hack, need to clean up.
+                # / PR #34880: Eagle now supports FULL cudagraphs via
+                # CUDAGraphWrapper around the draft model (gated on
+                # supports_sd_full_graph in __init__).
                 use_cudagraphs = (
                     (
                         is_graph_capturing
-                        and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+                        and (
+                            cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+                            or self.supports_sd_full_graph
+                        )
                     )
                     or (
                         not is_graph_capturing
@@ -5893,6 +6104,7 @@ class GPUModelRunner(
 
                 self.drafter.dummy_run(
                     num_tokens,
+                    common_attn_metadata=spec_decode_cm,
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
                     slot_mappings=slot_mappings,
@@ -6789,6 +7001,12 @@ class GPUModelRunner(
 
         for i, attn_backend_map in enumerate(attention_backend_maps):
             self.attn_groups.append(create_attn_groups(attn_backend_map, i))
+
+        self._slot_mapping_kv_cache_gids = tuple(
+            kv_cache_gid
+            for kv_cache_gid, attn_groups in enumerate(self.attn_groups)
+            if any(not attn_group.backend.is_ssm() for attn_group in attn_groups)
+        )
 
     def initialize_metadata_builders(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]

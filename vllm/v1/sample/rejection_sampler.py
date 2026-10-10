@@ -18,6 +18,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
     triton_kernel_dispatcher_with_warmup,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
@@ -26,6 +27,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
@@ -451,7 +453,21 @@ def rejection_sample(
     if sampling_metadata.all_greedy:
         is_greedy = None
     else:
-        is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
+        # int32, not torch.bool -- MUSA Triton 3.1.0 chokes on
+        # `not` / truthiness of a bool-typed tl.load'd value.
+        is_greedy = (
+            sampling_metadata.temperature == GREEDY_TEMPERATURE
+        ).to(torch.int32)
+
+    # MUSA Triton rejects the None-pointer handling for the
+    # `synthetic_conditional_rates_ptr` kernel arg. Pass a 1-element
+    # dummy tensor when synthetic mode is off; both rejection-sampler
+    # kernels gate every read of it behind `SYNTHETIC_MODE: tl.constexpr`
+    # so the dummy is never read.
+    if synthetic_conditional_rates is None:
+        synthetic_conditional_rates = torch.empty(
+            1, dtype=torch.float32, device=device
+        )
 
     # Generate uniform probabilities before either kernel because synthetic
     # mode needs them in the greedy kernel too.  Skip only when all requests
@@ -575,6 +591,10 @@ def apply_sampling_constraints(
 
     # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
     # which is slow for large vocab sizes. This may cause performance issues.
+    # MUSA Triton's top-p mask can retain tokens outside the requested support.
+    # Use the PyTorch implementation for rejection-sampling correctness.
+    if current_platform.is_musa():
+        return apply_top_k_top_p_pytorch(logits, top_k, top_p)
     return apply_top_k_top_p(logits, top_k, top_p)
 
 
@@ -738,8 +758,10 @@ def rejection_greedy_sample_kernel(
     req_idx = tl.program_id(0)
     # FIXME(woosuk): Because is_greedy_ptr is not None at profiling run,
     # re-compilation may happen during runtime when is_greedy_ptr is None.
-    is_greedy = True if is_greedy_ptr is None else tl.load(is_greedy_ptr + req_idx)
-    if not is_greedy:
+    # `1`/`== 0` instead of `True`/`not` -- MUSA Triton
+    # 3.1.0 cannot bitcast the bool-typed loaded value.
+    is_greedy = 1 if is_greedy_ptr is None else tl.load(is_greedy_ptr + req_idx)
+    if is_greedy == 0:
         # Early exit for non-greedy sampling requests.
         return
 
@@ -843,8 +865,10 @@ def rejection_random_sample_kernel(
     SYNTHETIC_MODE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
+    # explicit `!= 0` instead of truthiness on the loaded
+    # value -- MUSA Triton 3.1.0 cannot bitcast the bool-typed value.
     is_greedy = tl.load(is_greedy_ptr + req_idx)
-    if is_greedy:
+    if is_greedy != 0:
         # Early exit for greedy sampling requests.
         return
 

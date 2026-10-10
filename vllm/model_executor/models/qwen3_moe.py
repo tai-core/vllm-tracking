@@ -56,6 +56,14 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+
+# MUSA: the FP8 act-quant fusion matcher resolves
+# torch.ops._C.rotary_embedding.default at import; on MUSA the classic _C op
+# stubs only register as a side effect of importing vllm._custom_ops. Force that
+# import here so the stub exists before the compile backend's matcher reads it,
+# letting the MoE/VL decoder boot non-eager without the inductor-heuristics flag.
+import vllm._custom_ops  # noqa: F401,E402
+
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,

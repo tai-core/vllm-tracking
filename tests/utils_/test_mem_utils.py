@@ -5,9 +5,31 @@ from unittest.mock import MagicMock, patch
 import torch
 from vllm_test_utils.monitor import monitor
 
-from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
+from vllm.utils.mem_utils import (
+    MemoryProfilingResult,
+    MemorySnapshot,
+    _calculate_non_kv_cache_memory,
+    memory_profiling,
+)
 
 from ..utils import create_new_process_for_each_test
+
+
+def test_memory_profiling_uses_component_accounting_on_musa():
+    result = MemoryProfilingResult(
+        weights_memory=10,
+        torch_peak_increase=20,
+        non_torch_increase=30,
+        total_consumed=100,
+        transient_peak_headroom=50,
+    )
+
+    with patch("vllm.utils.mem_utils.current_platform") as mock_platform:
+        mock_platform.is_musa.return_value = True
+        assert _calculate_non_kv_cache_memory(result) == 60
+
+        mock_platform.is_musa.return_value = False
+        assert _calculate_non_kv_cache_memory(result) == 150
 
 
 @create_new_process_for_each_test()

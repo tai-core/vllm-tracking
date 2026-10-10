@@ -259,6 +259,17 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     if runner.is_pooling_model or not _has_deepseek_v4_sparse_mla_backend(runner):
         return
 
+    speculative_config = getattr(worker.vllm_config, "speculative_config", None)
+    if (
+        current_platform.is_musa()
+        and speculative_config is not None
+        and getattr(speculative_config, "method", None) == "mtp"
+    ):
+        logger.info(
+            "Skipping DeepSeek V4 sparse MLA mixed warmup for MUSA MTP."
+        )
+        return
+
     max_tokens = worker.scheduler_config.max_num_batched_tokens
     mixed_tokens = _clamp_warmup_tokens(_SPARSE_MLA_MIXED_WARMUP_TOKENS, max_tokens)
     if mixed_tokens <= 0:

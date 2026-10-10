@@ -234,6 +234,22 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if residual.device.type == "musa":
+            from vllm_musa.deepseek_v4_mhc import mhc_pre_musa_with_norm
+
+            return mhc_pre_musa_with_norm(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                norm_weight,
+                norm_eps,
+            )
         return mhc_kernels.mhc_pre_torch(
             residual,
             fn,
@@ -613,6 +629,10 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
+        if x.device.type == "musa":
+            from vllm_musa.deepseek_v4_mhc import mhc_post_musa
+
+            return mhc_post_musa(x, residual, post_layer_mix, comb_res_mix)
         return mhc_kernels.mhc_post_torch(
             x,
             residual,
@@ -726,6 +746,11 @@ class HCHeadOp(CustomOp):
         return out.view(*outer_shape, hidden_size)
 
     def forward_native(self, *args, **kwargs):
+        hidden_states = args[0] if args else kwargs.get("hidden_states")
+        if hidden_states is not None and hidden_states.device.type == "musa":
+            from vllm_musa.deepseek_v4_mhc import hc_head_musa
+
+            return hc_head_musa(*args, **kwargs)
         raise NotImplementedError("Native implementation of hc_head is not available")
 
     def forward_xpu(
@@ -922,6 +947,27 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if x.device.type == "musa":
+            from vllm_musa.deepseek_v4_mhc import mhc_fused_post_pre_musa
+
+            return mhc_fused_post_pre_musa(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+                norm_weight,
+                norm_eps,
+            )
         # Decompose into post + pre (no fused kernel available).
         residual_cur = mhc_kernels.mhc_post_torch(
             x, residual, post_layer_mix, comb_res_mix

@@ -215,6 +215,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
     def dummy_run(
         self,
         num_tokens: int,
+        common_attn_metadata: CommonAttentionMetadata | None = None,
         use_cudagraphs: bool = True,
         is_graph_capturing: bool = False,
         slot_mappings: dict[str, torch.Tensor] | None = None,
@@ -226,11 +227,28 @@ class DFlashProposer(SpecDecodeBaseProposer):
         - max_query_tokens is quite small, DFlash only sees spec tokens as queries
         - Multimodal inputs are not currently supported
         """
+        import dataclasses as _dc
         num_query_tokens = min(num_tokens, self.max_query_tokens)
-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
-            self._determine_batch_execution_and_padding(
-                num_query_tokens, use_cudagraphs=use_cudagraphs
-            )
+        # dflash parallel-drafting query_len (= 1 + num_speculative
+        # tokens per request); dispatch FULL keys at this width, not Eagle's 1.
+        uniform_decode_query_len = 1 + self.num_speculative_tokens
+        # the patched inference propose() computes
+        # uniform_decode = common_attn_metadata.max_query_len == 1; for dflash
+        # common_attn_metadata is the non-causal new_cad with max_query_len =
+        # num_query_per_req (>1), so inference uniform_decode is always False.
+        # Match it here (boot captured uniform=True before -> key mismatch ->
+        # capture-at-inference).
+        uniform_decode = False
+        (
+            cudagraph_runtime_mode,
+            batch_desc,
+            num_input_tokens,
+            num_tokens_across_dp,
+        ) = self._determine_batch_execution_and_padding(
+            num_query_tokens,
+            uniform_decode,
+            use_cudagraphs=use_cudagraphs,
+            uniform_decode_query_len=uniform_decode_query_len,
         )
 
         # Slot mapping sized to num_input_tokens (query only), matching
@@ -245,21 +263,28 @@ class DFlashProposer(SpecDecodeBaseProposer):
         else:
             slot_mapping_dict = slot_mappings or {}
 
+        # build dflash's non-causal per-layer attn metadata for the
+        # captured forward so the FA kernel captures at the right shape and the
+        # FULL graph registers under the inference batch_descriptor.
+        if common_attn_metadata is not None:
+            _, dummy_attn_metadata = self.build_per_group_and_layer_attn_metadata(
+                _dc.replace(common_attn_metadata, causal=False)
+            )
+        else:
+            dummy_attn_metadata = None
+
         # Context and query positions use separate buffers; no copy needed.
         context_positions = self._context_positions_buffer[:num_tokens]
-        # Context states will be passed directly to the precomputation without
-        # going through the buffer, since no CUDA graph is used for the precomputation.
-        # For the dummy run, we use the dummy buffer.
         context_states = self.hidden_states[:num_tokens]
 
-        # Run the KV projection (GEMM + norms + RoPE) for memory profiling,
         self.model.precompute_and_store_context_kv(context_states, context_positions)
         with set_forward_context(
-            None,
+            dummy_attn_metadata,
             self.vllm_config,
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_desc,
             slot_mapping=slot_mapping_dict,
         ):
             self.model(

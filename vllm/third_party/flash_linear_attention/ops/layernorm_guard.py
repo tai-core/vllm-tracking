@@ -26,6 +26,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
     triton_scalar_specialization_rep,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.utils.platform_utils import num_compute_units
@@ -332,6 +333,10 @@ class LayerNormFwdKernel(VllmJitKernel["LayerNormFwdKernel.CompileKey"]):
 
     def compile(self, compile_key: CompileKey) -> None:
         warmup = getattr(self.kernel, "warmup", None)
+        # MUSA Triton kernels compile on their first invocation, but the
+        # wrapper does not expose Triton's precompile-only warmup method.
+        if warmup is None and current_platform.device_type == "musa":
+            return
         assert warmup is not None
         variant = compile_key.input_variant
 

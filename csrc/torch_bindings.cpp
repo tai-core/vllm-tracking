@@ -181,10 +181,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "bool");
 
   // CUTLASS nvfp4 block scaled GEMM
+#ifndef USE_MUSA
   ops.def(
       "cutlass_scaled_fp4_mm(Tensor! out, Tensor a, Tensor b,"
       "                      Tensor block_scale_a, Tensor block_scale_b,"
       "                      Tensor alpha) -> ()");
+#endif
 
   // cutlass nvfp4 block scaled group GEMM
   ops.def(
@@ -199,10 +201,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       " Tensor problem_sizes, Tensor expert_offsets, Tensor sf_offsets) -> ()");
 
   // Compute NVFP4 block quantized tensor.
+#ifndef USE_MUSA
   ops.def(
       "scaled_fp4_quant(Tensor input,"
       "                 Tensor input_scale, bool "
       "is_sf_swizzled_layout) -> (Tensor, Tensor)");
+#endif
 
   // Out variant
   // TODO: Add out_variant tag once PyTorch supports it (added in 2.11)
@@ -212,24 +216,30 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // via torch.library.Library.define(..., tags=(torch.Tag.out_variant,))
   // with the .impl remaining in C++.
   // See pytorch/pytorch#176117.
+#ifndef USE_MUSA
   ops.def(
       "scaled_fp4_quant.out(Tensor input,"
       "                     Tensor input_scale, bool "
       "is_sf_swizzled_layout, *, Tensor(a!) output, Tensor(b!) output_scale) "
       "-> ()");
+#endif
 
   // Compute NVFP4 experts quantization.
+#ifndef USE_MUSA
   ops.def(
       "scaled_fp4_experts_quant(Tensor! output, Tensor! output_scale,"
       "Tensor input, Tensor input_global_scale, Tensor input_offset_by_experts,"
       "Tensor output_scale_offset_by_experts) -> ()");
+#endif
 
   // Fused SiLU+Mul+NVFP4 experts quantization.
+#ifndef USE_MUSA
   ops.def(
       "silu_and_mul_scaled_fp4_experts_quant(Tensor! output, Tensor! "
       "output_scale,"
       "Tensor input, Tensor input_global_scale, Tensor input_offset_by_experts,"
       "Tensor output_scale_offset_by_experts) -> ()");
+#endif
 
   // Compute MXFP4 experts quantization (32-element blocks, E8M0 SFs).
   ops.def(
@@ -245,9 +255,11 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor output_scale_offset_by_experts, int n_experts) -> ()");
 
   // Fused SiLU+Mul+NVFP4 quantization.
+#ifndef USE_MUSA
   ops.def(
       "silu_and_mul_nvfp4_quant(Tensor! result, Tensor! result_block_scale, "
       "Tensor input, Tensor input_global_scale) -> ()");
+#endif
 
   // Check if cutlass_scaled_mm_fp4 is supported for CUDA devices
   // of the given capability
@@ -502,6 +514,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 #endif
 
   // Horizontally-fused MiniMax-M3 QK-norm + partial NeoX RoPE + KV-insert.
+#ifndef USE_MUSA
   ops.def(
       "fused_minimax_m3_qknorm_rope_kv_insert("
       "Tensor! qkv, Tensor q_norm_weight, Tensor k_norm_weight, "
@@ -515,6 +528,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "str kv_cache_dtype, bool skip_index_branch=False, "
       "Tensor!? q_fp8_out=None, float q_fp8_scale=1.0, "
       "Tensor? kv_k_scale=None, Tensor? kv_v_scale=None) -> ()");
+#endif
 
 #ifdef VLLM_ENABLE_FUSED_KDA_DECODE
   ops.def(
@@ -621,12 +635,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
 
   // FATReLU implementation.
+#ifndef USE_MUSA
   ops.def("fatrelu_and_mul(Tensor! out, Tensor input, float threshold) -> ()");
 
   ops.def(
       "swigluoai_and_mul(Tensor! out, Tensor input, float alpha=1.702, float "
       "limit=7.0) "
       "-> ()");
+#endif
 
   // SituGLU implementation used in Kimi models.
   ops.def(
@@ -740,6 +756,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor(h!) n_gram_ids) -> ()");
 }
 
+#if !defined(USE_MUSA)
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   // LongCat n-gram embedding index kernel.
   ops.impl("ngram_compute_n_gram_ids", TORCH_BOX(&ngram_compute_n_gram_ids));
@@ -875,8 +892,10 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("swigluoai_and_mul", TORCH_BOX(&swigluoai_and_mul));
   ops.impl("situ_and_mul", TORCH_BOX(&situ_and_mul));
   ops.impl("situ_and_mul_quant", TORCH_BOX(&situ_and_mul_quant));
+#ifndef USE_MUSA
   ops.impl("masked_situ_and_mul", TORCH_BOX(&masked_situ_and_mul));
   ops.impl("masked_moe_activation", TORCH_BOX(&masked_moe_activation));
+#endif
   ops.impl("gelu_new", TORCH_BOX(&gelu_new));
   ops.impl("gelu_fast", TORCH_BOX(&gelu_fast));
   ops.impl("gelu_quick", TORCH_BOX(&gelu_quick));
@@ -905,6 +924,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CPU, ops) {
   ops.impl("get_cuda_view_from_cpu_tensor",
            TORCH_BOX(&get_cuda_view_from_cpu_tensor));
 }
+#endif
 
 STABLE_TORCH_LIBRARY_FRAGMENT(_C_cuda_utils, cuda_utils) {
   cuda_utils.def("get_device_attribute(int attribute, int device_id) -> int");
@@ -923,6 +943,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cuda_utils, CompositeExplicitAutograd,
 // there is no device to dispatch on. CompositeExplicitAutograd makes them
 // available for all backends. This is the stable ABI equivalent of calling
 // ops.impl("op_name", &func) without a dispatch key in the non-stable API.
+#if !defined(USE_MUSA)
 STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd, ops) {
 #ifndef USE_ROCM
   ops.impl("cutlass_scaled_mm_supports_fp8",
@@ -1167,5 +1188,60 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
   ops.impl("cp_gather_indexer_k_quant_cache",
            TORCH_BOX(&cp_gather_indexer_k_quant_cache));
 }
+#endif
 
+#if defined(USE_MUSA)
+// MUSA: the CUDA / CompositeExplicitAutograd impl blocks above are excluded
+// because they reference stable kernels not yet ported to MUSA. The
+// elementwise/norm families (activation/layernorm/pos_encoding) ARE built (see
+// setup.py VLLM_STABLE_CSRC_SOURCES); register them under PrivateUse1 -- MUSA's
+// dispatch key -- via torchada's TORCH_BOX shim (the stable ABI does not
+// translate the CUDA dispatch-key token like torch.library's Python path does).
+STABLE_TORCH_LIBRARY_IMPL(_C, PrivateUse1, ops) {
+  ops.impl("weak_ref_tensor", TORCH_BOX(&weak_ref_tensor));
+  ops.impl("silu_and_mul_quant", TORCH_BOX(&silu_and_mul_quant));
+  ops.impl("silu_and_mul", TORCH_BOX(&silu_and_mul));
+  ops.impl("mul_and_silu", TORCH_BOX(&mul_and_silu));
+  ops.impl("gelu_and_mul", TORCH_BOX(&gelu_and_mul));
+  ops.impl("gelu_tanh_and_mul", TORCH_BOX(&gelu_tanh_and_mul));
+  ops.impl("situ_and_mul", TORCH_BOX(&situ_and_mul));
+#ifndef USE_MUSA
+  ops.impl("masked_situ_and_mul", TORCH_BOX(&masked_situ_and_mul));
+#endif
+  ops.impl("gelu_new", TORCH_BOX(&gelu_new));
+  ops.impl("gelu_fast", TORCH_BOX(&gelu_fast));
+  ops.impl("gelu_quick", TORCH_BOX(&gelu_quick));
+  ops.impl("relu_squared", TORCH_BOX(&relu_squared));
+  ops.impl("silu_and_mul_with_clamp", TORCH_BOX(&silu_and_mul_clamp));
+  ops.impl("rms_norm", TORCH_BOX(&rms_norm));
+  ops.impl("fused_add_rms_norm", TORCH_BOX(&fused_add_rms_norm));
+  // Layernorm+quant fusion kernels (rms_quant_fusion compile-pass targets).
+  ops.impl("rms_norm_static_fp8_quant", TORCH_BOX(&rms_norm_static_fp8_quant));
+  ops.impl("fused_add_rms_norm_static_fp8_quant",
+           TORCH_BOX(&fused_add_rms_norm_static_fp8_quant));
+  ops.impl("rms_norm_dynamic_per_token_quant",
+           TORCH_BOX(&rms_norm_dynamic_per_token_quant));
+  ops.impl("rms_norm_per_block_quant", TORCH_BOX(&rms_norm_per_block_quant));
+  ops.impl("silu_and_mul_per_block_quant",
+           TORCH_BOX(&silu_and_mul_per_block_quant));
+  // static_scaled_fp8_quant is intentionally omitted: its int[]? group_shape
+  // argument is not boxable by torch_musa's stable ABI. The remaining dynamic
+  // FP8 and INT8 paths take only Tensor arguments.
+  ops.impl("dynamic_scaled_fp8_quant", TORCH_BOX(&dynamic_scaled_fp8_quant));
+  ops.impl("dynamic_per_token_scaled_fp8_quant",
+           TORCH_BOX(&dynamic_per_token_scaled_fp8_quant));
+  ops.impl("static_scaled_int8_quant", TORCH_BOX(&static_scaled_int8_quant));
+  ops.impl("dynamic_scaled_int8_quant", TORCH_BOX(&dynamic_scaled_int8_quant));
+  ops.impl("rotary_embedding", TORCH_BOX(&rotary_embedding));
+  // w8a8 per-token-group quant (MUSA-0/Option-3 consolidation): the upstream
+  // stable kernels replace the native csrc/musa non-fused re-impl. The MUSA-only
+  // *fused* silu_and_mul_per_token_group_fp8_quant stays native (no upstream peer).
+  ops.impl("per_token_group_fp8_quant", TORCH_BOX(&per_token_group_quant_fp8));
+  ops.impl("per_token_group_fp8_quant_packed",
+           TORCH_BOX(&per_token_group_quant_8bit_packed));
+  ops.impl("per_token_group_quant_int8", TORCH_BOX(&per_token_group_quant_int8));
+  // sampler penalty (sampler.cu); its upstream CUDA impl block is USE_MUSA-excluded.
+  ops.impl("apply_repetition_penalties_", TORCH_BOX(&apply_repetition_penalties_));
+}
+#endif
 REGISTER_EXTENSION(_C_stable_libtorch)

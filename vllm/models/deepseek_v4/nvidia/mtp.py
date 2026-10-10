@@ -412,10 +412,15 @@ class DeepSeekV4MTP(nn.Module):
         # FP8 experts register ``..._weight_scale_inv`` (block_quant) while
         # FP4/MXFP4 experts register ``..._weight_scale``. Choose the suffix
         # for the rename below based on the model's expert dtype.
+        expert_dtype = getattr(self.config, "expert_dtype", None)
+        resolved_quant_dtype = getattr(self.quant_config, "expert_dtype", None)
+        if resolved_quant_dtype in ("fp4", "fp8") and (
+            expert_dtype is None
+            or (expert_dtype == "fp4" and resolved_quant_dtype == "fp8")
+        ):
+            expert_dtype = resolved_quant_dtype
         expert_scale_suffix = (
-            ".weight_scale"
-            if getattr(self.config, "expert_dtype", "fp4") == "fp4"
-            else ".weight_scale_inv"
+            ".weight_scale" if expert_dtype == "fp4" else ".weight_scale_inv"
         )
 
         for name, loaded_weight in weights:

@@ -1,8 +1,17 @@
 // clang-format off
 // adapted from https://github.com/state-spaces/mamba/blob/main/csrc/selective_scan/selective_scan_fwd_kernel.cuh
-#include "../torch_utils.h"
-#include <torch/csrc/stable/macros.h>
+#include <torch/all.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include "selective_scan.h"
+
+#include <c10/util/BFloat16.h>
+#include <c10/util/Half.h>
+#ifdef USE_ROCM
+    #include <c10/hip/HIPException.h>  // For C10_HIP_CHECK and C10_HIP_KERNEL_LAUNCH_CHECK
+#else
+    #include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
+#endif
 
 #ifndef USE_ROCM
     #include <cub/block/block_load.cuh>
@@ -143,7 +152,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             cache_index * params.ssm_states_batch_stride +
             dim_id * kNRows * params.ssm_states_dim_stride;
     }
-    
+
     float D_val[kNRows] = {0};
     if (params.D_ptr != nullptr) {
         #pragma unroll
@@ -158,6 +167,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             delta_bias[r] = reinterpret_cast<float *>(params.delta_bias_ptr)[dim_id * kNRows + r];
         }
     }
+
 
     // Use block_size for chunking when APC is enabled, otherwise use 2048 for backwards compatibility
     const int block_size = params.cache_enabled ? params.block_size : 2048;
@@ -222,7 +232,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
         }
         u += chunk_tokens;
         delta += chunk_tokens;
-    
+
         float delta_vals[kNRows][kNItems], delta_u_vals[kNRows][kNItems], out_vals[kNRows][kNItems];
         #pragma unroll
         for (int r = 0; r < kNRows; ++r) {
@@ -324,12 +334,12 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
 
                     // Store state at the end of each aligned chunk when cache is enabled
                     if (params.cache_enabled && batch_cache_indices != nullptr) {
+
                         size_t cache_slot;
                         if (chunk == n_chunks - 1) {
                             cache_slot = batch_cache_indices[block_idx_last_scheduled[batch_id]];
                         } else {
-                            const int block_idx_completed = (current_position + chunk_tokens - 1) / block_size;
-                            cache_slot = batch_cache_indices[block_idx_completed];
+                            cache_slot = batch_cache_indices[block_idx_first_scheduled[batch_id] + chunk];
                         }
 
                         size_t state_offset = cache_slot * params.ssm_states_batch_stride +
@@ -407,15 +417,15 @@ void selective_scan_fwd_launch(SSMParamsBase &params, cudaStream_t stream) {
                 auto kernel = &selective_scan_fwd_kernel<Ktraits>;
                 if (kSmemSize >= 48 * 1024) {
 #ifdef USE_ROCM
-                    STD_CUDA_CHECK(hipFuncSetAttribute(
+                    C10_HIP_CHECK(hipFuncSetAttribute(
                         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
 #else
-                    STD_CUDA_CHECK(cudaFuncSetAttribute(
+                    C10_CUDA_CHECK(cudaFuncSetAttribute(
                         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
 #endif
                 }
                 kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
-                STD_CUDA_KERNEL_LAUNCH_CHECK();
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
             });
         });
     });
@@ -453,48 +463,31 @@ void selective_scan_fwd_cuda(SSMParamsBase &params, cudaStream_t stream) {
     #endif
 }
 
-template void selective_scan_fwd_cuda<torch::headeronly::BFloat16, float, torch::headeronly::BFloat16>(SSMParamsBase &params, cudaStream_t stream);
-template void selective_scan_fwd_cuda<torch::headeronly::BFloat16, float, float>(SSMParamsBase &params, cudaStream_t stream);
-template void selective_scan_fwd_cuda<torch::headeronly::Half, float, torch::headeronly::Half>(SSMParamsBase &params, cudaStream_t stream);
-template void selective_scan_fwd_cuda<torch::headeronly::Half, float, float>(SSMParamsBase &params, cudaStream_t stream);
+template void selective_scan_fwd_cuda<at::Half, float, at::Half>(SSMParamsBase &params, cudaStream_t stream);
+template void selective_scan_fwd_cuda<at::Half, float, float>(SSMParamsBase &params, cudaStream_t stream);
 template void selective_scan_fwd_cuda<float, float, float>(SSMParamsBase &params, cudaStream_t stream);
 
-#define CHECK_SHAPE(x, ...) STD_TORCH_CHECK(x.sizes().equals(torch::headeronly::IntHeaderOnlyArrayRef({__VA_ARGS__})), #x " must have shape (" #__VA_ARGS__ ")")
+#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 
 #define DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(ITYPE, STYPE, NAME, ...)       \
-    if (ITYPE == torch::headeronly::ScalarType::Half) {                             \
-        using input_t = torch::headeronly::Half;                                                  \
+    if (ITYPE == at::ScalarType::Half) {                                            \
+        using input_t = at::Half;                                                   \
         using weight_t = float;                                                     \
-        if (STYPE == torch::headeronly::ScalarType::Half) {                         \
-            using state_t = torch::headeronly::Half;                                              \
+        if (STYPE == at::ScalarType::Half) {                                        \
+            using state_t = at::Half;                                               \
             __VA_ARGS__();                                                          \
-        } else if (STYPE == torch::headeronly::ScalarType::Float) {                 \
+        } else if (STYPE == at::ScalarType::Float) {                                \
             using state_t = float;                                                  \
             __VA_ARGS__();                                                          \
-        } else {                                                                    \
-            STD_TORCH_CHECK(false, #NAME " not implemented for state type '", STYPE, "'"); \
         }                                                                           \
-    } else if (ITYPE == torch::headeronly::ScalarType::BFloat16) {                  \
-        using input_t = torch::headeronly::BFloat16;                                              \
-        using weight_t = float;                                                     \
-        if (STYPE == torch::headeronly::ScalarType::BFloat16) {                     \
-            using state_t = torch::headeronly::BFloat16;                                          \
-            __VA_ARGS__();                                                          \
-        } else if (STYPE == torch::headeronly::ScalarType::Float) {                 \
-            using state_t = float;                                                  \
-            __VA_ARGS__();                                                          \
-        } else {                                                                    \
-            STD_TORCH_CHECK(false, #NAME " not implemented for state type '", STYPE, "'"); \
-        }                                                                           \
-    } else if (ITYPE == torch::headeronly::ScalarType::Float)  {                    \
+    } else if (ITYPE == at::ScalarType::Float)  {                                   \
         using input_t = float;                                                      \
         using weight_t = float;                                                     \
         using state_t = float;                                                      \
         __VA_ARGS__();                                                              \
     } else {                                                                        \
-        STD_TORCH_CHECK(false, #NAME " not implemented for input type '", ITYPE, "'"); \
+        AT_ERROR(#NAME, " not implemented for input type '", toString(ITYPE), "'"); \
     }
-
 
 template<typename input_t, typename weight_t, typename state_t>
 void selective_scan_fwd_cuda(SSMParamsBase &params, cudaStream_t stream);
@@ -509,30 +502,30 @@ void set_ssm_params_fwd(SSMParamsBase &params,
                         const bool is_variable_B,
                         const bool is_variable_C,
                         // device pointers
-                        const torch::stable::Tensor u,
-                        const torch::stable::Tensor delta,
-                        const torch::stable::Tensor A,
-                        const torch::stable::Tensor B,
-                        const torch::stable::Tensor C,
-                        const torch::stable::Tensor out,
-                        const torch::stable::Tensor z,
-                        const torch::stable::Tensor out_z,
-                        const std::optional<torch::stable::Tensor>& D,
-                        const std::optional<torch::stable::Tensor>& delta_bias,
-                        const torch::stable::Tensor ssm_states,
+                        const torch::Tensor u,
+                        const torch::Tensor delta,
+                        const torch::Tensor A,
+                        const torch::Tensor B,
+                        const torch::Tensor C,
+                        const torch::Tensor out,
+                        const torch::Tensor z,
+                        const torch::Tensor out_z,
+                        const std::optional<at::Tensor>& D,
+                        const std::optional<at::Tensor>& delta_bias,
+                        const torch::Tensor ssm_states,
                         bool has_z,
                         bool delta_softplus,
-                        const std::optional<torch::stable::Tensor>& query_start_loc,
-                        const std::optional<torch::stable::Tensor>& cache_indices,
-                        const std::optional<torch::stable::Tensor>& has_initial_state,
+                        const std::optional<at::Tensor>& query_start_loc,
+                        const std::optional<at::Tensor>& cache_indices,
+                        const std::optional<at::Tensor>& has_initial_state,
                         bool varlen,
                         int64_t null_block_id,
                         int64_t block_size,
-                        const std::optional<torch::stable::Tensor> &block_idx_first_scheduled_token,
-                        const std::optional<torch::stable::Tensor> &block_idx_last_scheduled_token,
-                        const std::optional<torch::stable::Tensor> &initial_state_idx,
-                        const std::optional<torch::stable::Tensor> &cu_chunk_seqlen,
-                        const std::optional<torch::stable::Tensor> &last_chunk_indices) {
+                        const std::optional<torch::Tensor> &block_idx_first_scheduled_token,
+                        const std::optional<torch::Tensor> &block_idx_last_scheduled_token,
+                        const std::optional<torch::Tensor> &initial_state_idx,
+                        const std::optional<torch::Tensor> &cu_chunk_seqlen,
+                        const std::optional<torch::Tensor> &last_chunk_indices) {
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -636,7 +629,7 @@ void set_ssm_params_fwd(SSMParamsBase &params,
         }
         params.out_batch_stride = out.stride(0);
         params.out_d_stride = out.stride(1);
-        
+
         params.ssm_states_batch_stride = ssm_states.stride(0);
         params.ssm_states_dim_stride = ssm_states.stride(1);
         params.ssm_states_dstate_stride = ssm_states.stride(2);
@@ -645,45 +638,67 @@ void set_ssm_params_fwd(SSMParamsBase &params,
     }
 }
 
-void selective_scan_fwd(const torch::stable::Tensor &u, const torch::stable::Tensor &delta,
-                  const torch::stable::Tensor &A, const torch::stable::Tensor &B, const torch::stable::Tensor &C,
-                  const std::optional<torch::stable::Tensor> &D_,
-                  const std::optional<torch::stable::Tensor> &z_,
-                  const std::optional<torch::stable::Tensor> &delta_bias_,
+void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
+                  const torch::Tensor &A, const torch::Tensor &B, const torch::Tensor &C,
+                  const std::optional<torch::Tensor> &D_,
+                  const std::optional<torch::Tensor> &z_,
+                  const std::optional<torch::Tensor> &delta_bias_,
                   bool delta_softplus,
-                  const std::optional<torch::stable::Tensor> &query_start_loc,
-                  const std::optional<torch::stable::Tensor> &cache_indices,
-                  const std::optional<torch::stable::Tensor> &has_initial_state,
-                  const torch::stable::Tensor &ssm_states,
-                  // used to identify padding entries if cache_indices provided
-                  // in case of padding, the kernel will return early
+                  const std::optional<torch::Tensor> &query_start_loc,
+                  const std::optional<torch::Tensor> &cache_indices,
+                  const std::optional<torch::Tensor> &has_initial_state,
+                  const torch::Tensor &ssm_states,
+                  // used to identify null-block entries if cache_indices provided
+                  // in case of null-block, the kernel will return early
                   int64_t null_block_id,
                   int64_t block_size,
-                  const std::optional<torch::stable::Tensor> &block_idx_first_scheduled_token,
-                  const std::optional<torch::stable::Tensor> &block_idx_last_scheduled_token,
-                  const std::optional<torch::stable::Tensor> &initial_state_idx,
-                  const std::optional<torch::stable::Tensor> &cu_chunk_seqlen,
-                  const std::optional<torch::stable::Tensor> &last_chunk_indices) {
+                  const std::optional<torch::Tensor> &block_idx_first_scheduled_token,
+                  const std::optional<torch::Tensor> &block_idx_last_scheduled_token,
+                  const std::optional<torch::Tensor> &initial_state_idx,
+                  const std::optional<torch::Tensor> &cu_chunk_seqlen,
+                  const std::optional<torch::Tensor> &last_chunk_indices) {
     auto input_type = u.scalar_type();
     auto weight_type = A.scalar_type();
-    STD_TORCH_CHECK(input_type == torch::headeronly::ScalarType::Float || input_type == torch::headeronly::ScalarType::Half || input_type == torch::headeronly::ScalarType::BFloat16);
-    STD_TORCH_CHECK(weight_type == torch::headeronly::ScalarType::Float);
+    TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
+    TORCH_CHECK(weight_type == at::ScalarType::Float);
+
+    // mcc cannot codegen the bf16 kernel (no isel for v2bf16 insert in cub I/O);
+    // route bf16 through the float kernel: upcast, recurse, copy outputs back.
+    if (input_type == at::ScalarType::BFloat16) {
+        auto u_f = u.to(at::ScalarType::Float);
+        auto delta_f = delta.to(at::ScalarType::Float);
+        auto B_f = (B.scalar_type() == at::ScalarType::BFloat16) ? B.to(at::ScalarType::Float) : B;
+        auto C_f = (C.scalar_type() == at::ScalarType::BFloat16) ? C.to(at::ScalarType::Float) : C;
+        std::optional<torch::Tensor> z_f = z_.has_value()
+            ? std::optional<torch::Tensor>(z_.value().to(at::ScalarType::Float)) : std::nullopt;
+        const bool ssm_bf16 = (ssm_states.scalar_type() == at::ScalarType::BFloat16);
+        auto ssm_f = ssm_bf16 ? ssm_states.to(at::ScalarType::Float) : ssm_states;
+        selective_scan_fwd(u_f, delta_f, A, B_f, C_f, D_, z_f, delta_bias_, delta_softplus,
+                           query_start_loc, cache_indices, has_initial_state, ssm_f,
+                           null_block_id, block_size, block_idx_first_scheduled_token,
+                           block_idx_last_scheduled_token, initial_state_idx,
+                           cu_chunk_seqlen, last_chunk_indices);
+        delta.copy_(delta_f);
+        if (z_.has_value()) z_.value().copy_(z_f.value());
+        if (ssm_bf16) ssm_states.copy_(ssm_f);
+        return;
+    }
 
     const bool is_variable_B = B.dim() >= 3;
     const bool is_variable_C = C.dim() >= 3;
 
-    STD_TORCH_CHECK(delta.scalar_type() == input_type);
-    STD_TORCH_CHECK(B.scalar_type() == (!is_variable_B ? weight_type : input_type));
-    STD_TORCH_CHECK(C.scalar_type() == (!is_variable_C ? weight_type : input_type));
+    TORCH_CHECK(delta.scalar_type() == input_type);
+    TORCH_CHECK(B.scalar_type() == (!is_variable_B ? weight_type : input_type));
+    TORCH_CHECK(C.scalar_type() == (!is_variable_C ? weight_type : input_type));
 
-    STD_TORCH_CHECK(u.is_cuda());
-    STD_TORCH_CHECK(delta.is_cuda());
-    STD_TORCH_CHECK(A.is_cuda());
-    STD_TORCH_CHECK(B.is_cuda());
-    STD_TORCH_CHECK(C.is_cuda());
+    TORCH_CHECK(u.is_cuda());
+    TORCH_CHECK(delta.is_cuda());
+    TORCH_CHECK(A.is_cuda());
+    TORCH_CHECK(B.is_cuda());
+    TORCH_CHECK(C.is_cuda());
 
-    STD_TORCH_CHECK(u.stride(-1) == 1 || u.size(-1) == 1);
-    STD_TORCH_CHECK(delta.stride(-1) == 1 || delta.size(-1) == 1);
+    TORCH_CHECK(u.stride(-1) == 1 || u.size(-1) == 1);
+    TORCH_CHECK(delta.stride(-1) == 1 || delta.size(-1) == 1);
 
     const auto sizes = u.sizes();
     const bool varlen = query_start_loc.has_value();
@@ -693,7 +708,7 @@ void selective_scan_fwd(const torch::stable::Tensor &u, const torch::stable::Ten
     const int dstate = A.size(1);
     const int n_groups = varlen ? B.size(0) : B.size(1);
 
-    STD_TORCH_CHECK(dstate <= 256, "selective_scan only supports state dimension <= 256");
+    TORCH_CHECK(dstate <= 256, "selective_scan only supports state dimension <= 256");
 
     if (varlen) {
         CHECK_SHAPE(u, dim, seqlen);
@@ -703,78 +718,78 @@ void selective_scan_fwd(const torch::stable::Tensor &u, const torch::stable::Ten
         CHECK_SHAPE(delta, batch_size, dim, seqlen);
     }
     CHECK_SHAPE(A, dim, dstate);
-    STD_TORCH_CHECK(is_variable_B, "is_variable_B = False is disabled in favor of reduced binary size");
+    TORCH_CHECK(is_variable_B, "is_variable_B = False is disabled in favor of reduced binary size")
     if (varlen) {
         CHECK_SHAPE(B, n_groups, dstate, seqlen);
     } else {
         CHECK_SHAPE(B, batch_size, n_groups, dstate, seqlen);
     }
-    STD_TORCH_CHECK(B.stride(-1) == 1 || B.size(-1) == 1);
+    TORCH_CHECK(B.stride(-1) == 1 || B.size(-1) == 1);
 
-    STD_TORCH_CHECK(is_variable_C, "is_variable_C = False is disabled in favor of reduced binary size");
+    TORCH_CHECK(is_variable_C, "is_variable_C = False is disabled in favor of reduced binary size")
     if (varlen) {
         CHECK_SHAPE(C, n_groups, dstate, seqlen);
     } else {
         CHECK_SHAPE(C, batch_size, n_groups, dstate, seqlen);
     }
-    STD_TORCH_CHECK(C.stride(-1) == 1 || C.size(-1) == 1);
+    TORCH_CHECK(C.stride(-1) == 1 || C.size(-1) == 1);
 
     if (D_.has_value()) {
         auto D = D_.value();
-        STD_TORCH_CHECK(D.scalar_type() == torch::headeronly::ScalarType::Float);
-        STD_TORCH_CHECK(D.is_cuda());
-        STD_TORCH_CHECK(D.stride(-1) == 1 || D.size(-1) == 1);
+        TORCH_CHECK(D.scalar_type() == at::ScalarType::Float);
+        TORCH_CHECK(D.is_cuda());
+        TORCH_CHECK(D.stride(-1) == 1 || D.size(-1) == 1);
         CHECK_SHAPE(D, dim);
     }
 
     if (delta_bias_.has_value()) {
         auto delta_bias = delta_bias_.value();
-        STD_TORCH_CHECK(delta_bias.scalar_type() == torch::headeronly::ScalarType::Float);
-        STD_TORCH_CHECK(delta_bias.is_cuda());
-        STD_TORCH_CHECK(delta_bias.stride(-1) == 1 || delta_bias.size(-1) == 1);
+        TORCH_CHECK(delta_bias.scalar_type() == at::ScalarType::Float);
+        TORCH_CHECK(delta_bias.is_cuda());
+        TORCH_CHECK(delta_bias.stride(-1) == 1 || delta_bias.size(-1) == 1);
         CHECK_SHAPE(delta_bias, dim);
     }
 
 
     if (has_initial_state.has_value()) {
         auto has_initial_state_ = has_initial_state.value();
-        STD_TORCH_CHECK(has_initial_state_.scalar_type() == torch::headeronly::ScalarType::Bool);
-        STD_TORCH_CHECK(has_initial_state_.is_cuda());
+        TORCH_CHECK(has_initial_state_.scalar_type() == at::ScalarType::Bool);
+        TORCH_CHECK(has_initial_state_.is_cuda());
         CHECK_SHAPE(has_initial_state_, batch_size);
     }
 
 
     if (query_start_loc.has_value()) {
         auto query_start_loc_ = query_start_loc.value();
-        STD_TORCH_CHECK(query_start_loc_.scalar_type() == torch::headeronly::ScalarType::Int);
-        STD_TORCH_CHECK(query_start_loc_.is_cuda());
+        TORCH_CHECK(query_start_loc_.scalar_type() == at::ScalarType::Int);
+        TORCH_CHECK(query_start_loc_.is_cuda());
     }
 
 
     if (cache_indices.has_value()) {
         auto cache_indices_ = cache_indices.value();
-        STD_TORCH_CHECK(cache_indices_.scalar_type() == torch::headeronly::ScalarType::Int);
-        STD_TORCH_CHECK(cache_indices_.is_cuda());
+        TORCH_CHECK(cache_indices_.scalar_type() == at::ScalarType::Int);
+        TORCH_CHECK(cache_indices_.is_cuda());
 
         // cache_indices can be either 1D (batch_size,) for non-APC mode
         // or 2D (batch_size, max_positions) for APC mode
         const bool is_apc_mode = block_idx_first_scheduled_token.has_value();
         if (is_apc_mode) {
-            STD_TORCH_CHECK(cache_indices_.dim() == 2, "cache_indices must be 2D for APC mode");
-            STD_TORCH_CHECK(cache_indices_.size(0) == batch_size, "cache_indices first dimension must match batch_size");
+            TORCH_CHECK(cache_indices_.dim() == 2, "cache_indices must be 2D for APC mode");
+            TORCH_CHECK(cache_indices_.size(0) == batch_size, "cache_indices first dimension must match batch_size");
         } else {
             CHECK_SHAPE(cache_indices_, batch_size);
         }
     }
 
 
-    torch::stable::Tensor z, out_z;
+    at::Tensor z, out_z;
     const bool has_z = z_.has_value();
     if (has_z) {
         z = z_.value();
-        STD_TORCH_CHECK(z.scalar_type() == input_type);
-        STD_TORCH_CHECK(z.is_cuda());
-        STD_TORCH_CHECK(z.stride(-1) == 1 || z.size(-1) == 1);
+        TORCH_CHECK(z.scalar_type() == input_type);
+        TORCH_CHECK(z.is_cuda());
+        TORCH_CHECK(z.stride(-1) == 1 || z.size(-1) == 1);
         if (varlen){
             CHECK_SHAPE(z, dim, seqlen);
         } else {
@@ -785,12 +800,12 @@ void selective_scan_fwd(const torch::stable::Tensor &u, const torch::stable::Ten
     }
 
     // Right now u has BHL layout and delta has HBL layout, and we want out to have HBL layout
-    torch::stable::Tensor out = delta;
+    at::Tensor out = delta;
     // ssm_states can now be either the same as input_type or float32
     auto state_type = ssm_states.scalar_type();
-    STD_TORCH_CHECK(state_type == input_type || state_type == torch::headeronly::ScalarType::Float);
-    STD_TORCH_CHECK(ssm_states.is_cuda());
-    STD_TORCH_CHECK(ssm_states.stride(-1) == 1);
+    TORCH_CHECK(state_type == input_type || state_type == at::ScalarType::Float);
+    TORCH_CHECK(ssm_states.is_cuda());
+    TORCH_CHECK(ssm_states.stride(-1) == 1);
 
     SSMParamsBase params;
     set_ssm_params_fwd(params, batch_size, dim, seqlen, dstate, n_groups, is_variable_B, is_variable_C,
@@ -813,9 +828,9 @@ void selective_scan_fwd(const torch::stable::Tensor &u, const torch::stable::Ten
                        last_chunk_indices
                        );
 
-    
-    const torch::stable::accelerator::DeviceGuard device_guard(u.get_device_index());
-    auto stream = get_current_cuda_stream();
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(u));
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
     DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(u.scalar_type(), ssm_states.scalar_type(), "selective_scan_fwd", [&] {
         selective_scan_fwd_cuda<input_t, weight_t, state_t>(params, stream);
     });

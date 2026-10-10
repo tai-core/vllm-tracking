@@ -352,10 +352,13 @@ class AttentionGroup:
         )
 
     def build_metadata_for_cudagraph_capture(
-        self, common_attn_metadata: CommonAttentionMetadata, ubatch_idx: int = 0
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        ubatch_idx: int = 0,
+        **kwargs: Any,
     ) -> Any:
         return self.get_metadata_builder(ubatch_idx).build_for_cudagraph_capture(
-            self._with_kernel_block_table(common_attn_metadata, ubatch_idx)
+            self._with_kernel_block_table(common_attn_metadata, ubatch_idx), **kwargs
         )
 
     def build_metadata_for_drafting(
@@ -576,9 +579,13 @@ def allocate_kv_cache(
     if not kv_cache_config.kv_cache_tensors:
         return {}
 
+    # MUSA may use separate attention and Mamba pools. Each pool has its own
+    # backing allocation; the default v0.30 layout continues to share one.
+    separate_musa_pools = kv_cache_config.musa_mamba_num_blocks is not None
     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
-    assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
-    raw_size = sizes.pop()
+    if not separate_musa_pools:
+        assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
+    raw_size = max(sizes)
     # wvSplitKrc's process-lifetime static workspaces (csrc/rocm/skinny_gemms.cu)
     # are created lazily on the first qualifying GEMM. Force that now, before
     # the giant backing allocation below: if one landed in this segment's
@@ -593,10 +600,20 @@ def allocate_kv_cache(
         buf_size = ((raw_size + page_size - 1) // page_size) * page_size
     else:
         buf_size = raw_size
-    buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
+    shared_buf = (
+        None
+        if separate_musa_pools
+        else torch.zeros(buf_size, dtype=torch.int8, device=device)
+    )
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
+        buf = (
+            torch.zeros(tensor.size, dtype=torch.int8, device=device)
+            if separate_musa_pools
+            else shared_buf
+        )
+        assert buf is not None
         layer_name = tensor.layers[0]
         group_id, group = next(
             (group_id, group)

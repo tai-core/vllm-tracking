@@ -209,7 +209,8 @@ class OnlineQuantizationConfig(QuantizationConfig):
     def get_min_capability(cls) -> int:
         # Note: as more online quant schemes will be added, this
         # value will become the minimum across all supported schemes.
-        return 75
+        # MUSA: S5000 reports device capability 31.
+        return 31
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:

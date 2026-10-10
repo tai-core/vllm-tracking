@@ -12,7 +12,16 @@ from unittest.mock import patch
 
 import torch
 from torch._subclasses import FakeTensorMode
-from torch.fx._graph_pickler import GraphPickler, Options
+import torch.fx._graph_pickler as _vllm_graph_pickler
+GraphPickler = _vllm_graph_pickler.GraphPickler
+Options = getattr(_vllm_graph_pickler, "Options", None)
+
+
+def _musa_graph_pickler_dumps(graph_module):
+    if Options is None:
+        return GraphPickler.dumps(graph_module)
+    return GraphPickler.dumps(graph_module, Options(ops_filter=None))
+
 from torch.utils import _pytree as pytree
 
 import vllm.envs as envs
@@ -246,7 +255,7 @@ class VllmSerializableFunction(SerializableCallable):  # type: ignore[misc]
             patch.object(GraphPickler, "reducer_override", _graph_reducer_override),
             patch_pytree_map_over_slice(),
         ):
-            return GraphPickler.dumps(graph_module, Options(ops_filter=None))
+            return _musa_graph_pickler_dumps(graph_module)
 
     @classmethod
     def deserialize_graph_module(

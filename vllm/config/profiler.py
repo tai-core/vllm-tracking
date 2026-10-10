@@ -13,7 +13,7 @@ from vllm.utils.hashing import safe_hash
 logger = init_logger(__name__)
 
 ProfilerKind = Literal["torch", "cuda", "proton"]
-TorchProfilerActivity = Literal["CPU", "CUDA", "PrivateUse1", "XPU"]
+TorchProfilerActivity = Literal["CPU", "CUDA", "PrivateUse1", "MUSA", "XPU"]
 ProtonBackend = Literal["cupti"]
 ProtonContext = Literal["shadow", "python"]
 ProtonData = Literal["tree", "trace"]

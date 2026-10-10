@@ -34,6 +34,21 @@ logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
+# Resolve the in-kernel tensor-descriptor builtin once at import. The TD load
+# helpers reference this module-level name (not ``tl.make_tensor_descriptor``
+# directly) so the Triton JIT cache-key AST walk resolves a real symbol even on
+# Triton builds that lack the builtin; on those builds USE_TD is never enabled,
+# so the no-op fallback is only ever hashed, never executed.
+if hasattr(tl, "make_tensor_descriptor"):
+    make_tensor_descriptor = tl.make_tensor_descriptor
+elif hasattr(tl, "_experimental_make_tensor_descriptor"):
+    make_tensor_descriptor = tl._experimental_make_tensor_descriptor
+else:
+
+    @triton.jit
+    def make_tensor_descriptor(base, shape, strides, block_shape, _builder=None):
+        return None
+
 
 @triton.jit
 def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
@@ -98,7 +113,7 @@ def _load_q_td(
         + (cur_batch_in_all_start_index + q_block_local_idx * BLOCK_Q) * query_stride_0
         + (kv_head_idx * num_queries_per_kv) * query_stride_1
     )
-    q_desc = tl.make_tensor_descriptor(
+    q_desc = make_tensor_descriptor(
         base=q_base,
         shape=(q_block_local_len, num_queries_per_kv * HEAD_SIZE),
         strides=(query_stride_0, 1),
@@ -133,7 +148,7 @@ def _load_kv_tile_td(
         + physical_block_idx_scalar * stride_cache_0
         + kv_head_idx * stride_cache_2
     )
-    desc = tl.make_tensor_descriptor(
+    desc = make_tensor_descriptor(
         base=base,
         shape=(BLOCK_SIZE, HEAD_SIZE),
         strides=(stride_cache_1, stride_cache_3),
@@ -163,7 +178,7 @@ def _store_output_td(
     are the same in both modes, so share one helper.
     """
     acc = acc.to(base_ptr.dtype.element_ty)
-    output_desc = tl.make_tensor_descriptor(
+    output_desc = make_tensor_descriptor(
         base=base_ptr,
         shape=(q_block_local_len, num_queries_per_kv, HEAD_SIZE),
         strides=(stride_token, stride_head, 1),
@@ -261,12 +276,12 @@ def kernel_unified_attention(
     # ``int | None`` is the only annotation that lets the wrapper pass
     # ``None`` here so Triton can skip materialising the strides when the
     # ``USE_PER_TOKEN_HEAD_SCALES`` branch is dead.
-    stride_ks_blk: int | None = None,
-    stride_ks_slot: int | None = None,
-    stride_ks_head: int | None = None,
-    stride_vs_blk: int | None = None,
-    stride_vs_slot: int | None = None,
-    stride_vs_head: int | None = None,
+    stride_ks_blk: tl.int64 = 0,
+    stride_ks_slot: tl.int64 = 0,
+    stride_ks_head: tl.int64 = 0,
+    stride_vs_blk: tl.int64 = 0,
+    stride_vs_slot: tl.int64 = 0,
+    stride_vs_head: tl.int64 = 0,
     # KV cache quantization mode handled inside this kernel via constexpr
     # branches: NONE (0), FP8_PER_TENSOR (1), INT8_PER_TOKEN_HEAD (2),
     # FP8_PER_TOKEN_HEAD (3). Sub-byte INT4 (4) uses its own
@@ -1156,12 +1171,12 @@ def unified_attention(
         stride_v_cache_1=v.stride(1),
         stride_v_cache_2=v.stride(2),
         stride_v_cache_3=v.stride(3),
-        stride_ks_blk=ks_blk,
-        stride_ks_slot=ks_slot,
-        stride_ks_head=ks_head,
-        stride_vs_blk=vs_blk,
-        stride_vs_slot=vs_slot,
-        stride_vs_head=vs_head,
+        stride_ks_blk=(ks_blk or 0),
+        stride_ks_slot=(ks_slot or 0),
+        stride_ks_head=(ks_head or 0),
+        stride_vs_blk=(vs_blk or 0),
+        stride_vs_slot=(vs_slot or 0),
+        stride_vs_head=(vs_head or 0),
         query_start_len_ptr=cu_seqlens_q,
         BLOCK_Q=BLOCK_Q,
         num_seqs=num_seqs,

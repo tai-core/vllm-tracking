@@ -385,3 +385,10 @@ def unpack_seq_triton(
 
 _PACK_SEQ_TRITON_KERNEL = PackSeqTritonKernel()
 _UNPACK_SEQ_TRITON_KERNEL = UnpackSeqTritonKernel()
+
+# v0.28 MUSA backends imported the DCP combine helper from this module.
+# v0.30 moved it to dcp.py; retain the compatibility export.
+try:
+    from vllm.v1.attention.ops.dcp import cp_lse_ag_out_rs  # noqa: F401
+except ImportError:
+    cp_lse_ag_out_rs = None

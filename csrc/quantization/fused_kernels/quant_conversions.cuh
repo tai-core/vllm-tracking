@@ -13,7 +13,9 @@ namespace vllm {
 // TODO(luka/varun): combine into common utilities for int8
 //  (with int8_quant_kernels.cu)
 static __device__ __forceinline__ int8_t float_to_int8_rn(float const x) {
-#ifdef USE_ROCM
+// MUSA: mcc cannot assemble the NVIDIA-only `cvt.rni.sat.s8.f32` PTX below
+// (it emits wrong int8s), so take the portable nearbyint+saturate path ROCm uses.
+#if defined(USE_ROCM) || defined(USE_MUSA)
   static const float i8_min =
       static_cast<float>(std::numeric_limits<int8_t>::min());
   static const float i8_max =

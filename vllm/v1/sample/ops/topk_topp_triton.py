@@ -210,10 +210,7 @@ def _topk_topp_kernel(
                     max_range = max_logit
                     min_range = outlier_pivot
                     search_range = tl.cast(num_outliers, tl.int32)
-                    search_iters = tl.cast(
-                        (num_outliers + BLOCK_SIZE_TRUNC - 1) // BLOCK_SIZE_TRUNC,
-                        tl.int32,
-                    )
+                    search_iters = (search_range + BLOCK_SIZE_TRUNC - 1) // BLOCK_SIZE_TRUNC
                     found_pivot = 0
                     while found_pivot == 0:
                         k_pivot_0 = (max_range - min_range) * 1.0 / 3.0 + min_range
@@ -386,9 +383,13 @@ def _topk_topp_kernel(
 
                 # Top-k only path.  If there are fewer finite values
                 # than k (e.g. grammar mask), keep everything.
-                final_pivot = k_pivot if num_finite_total > k else -float("inf")
+                final_pivot = -float("inf")
+                if num_finite_total > k:
+                    final_pivot = k_pivot
 
-                if TOPP_ENABLED and num_finite_total > k:
+                if num_finite_total <= k:
+                    pass
+                elif TOPP_ENABLED:
                     #### TOP-P SAMPLING AFTER TOP-K ####
                     p = tl.load(P + row_id)
                     if p < 1.0:
@@ -396,10 +397,7 @@ def _topk_topp_kernel(
                         sum_exp_logits = 0.0
                         num_outliers_2 = tl.zeros((), dtype=tl.uint32)
                         search_range = tl.cast(num_outliers, tl.int32)
-                        search_iters = tl.cast(
-                            (num_outliers + BLOCK_SIZE_TRUNC - 1) // BLOCK_SIZE_TRUNC,
-                            tl.int32,
-                        )
+                        search_iters = (search_range + BLOCK_SIZE_TRUNC - 1) // BLOCK_SIZE_TRUNC
 
                         # Third pass: Calculate exp logits and sum, gather outliers
                         if num_outliers > k:
@@ -507,11 +505,9 @@ def _topk_topp_kernel(
                                 )
 
                             search_range = tl.cast(num_outliers_2, tl.int32)
-                            search_iters = tl.cast(
-                                (num_outliers_2 + BLOCK_SIZE_TRUNC - 1)
-                                // BLOCK_SIZE_TRUNC,
-                                tl.int32,
-                            )
+                            search_iters = (
+                                search_range + BLOCK_SIZE_TRUNC - 1
+                            ) // BLOCK_SIZE_TRUNC
 
                             # Fourth pass: Calculate BUFFER and get outliers
                             for i in range(0, search_iters):
@@ -605,7 +601,9 @@ def _topk_topp_kernel(
                         # Top-k + Top-p path
                         final_pivot = tl.log(p_pivot * sum_exp_logits) + max_logit
 
-        if TOPP_ENABLED and final_pivot == -float("inf"):
+        if final_pivot != -float("inf"):
+            pass
+        elif TOPP_ENABLED:
             #### STANDALONE TOP-P SAMPLING ####
             # When the split top-p pipeline co-runs (mixed top-k + top-p
             # batches), it covers p-only rows (k >= VOCAB_SIZE); skip those
@@ -708,10 +706,7 @@ def _topk_topp_kernel(
                 if sum_outlier_probs > p:
                     min_range = outlier_prob
                     search_range = tl.cast(num_outliers, tl.int32)
-                    search_iters = tl.cast(
-                        (num_outliers + BLOCK_SIZE_TRUNC - 1) // BLOCK_SIZE_TRUNC,
-                        tl.int32,
-                    )
+                    search_iters = (search_range + BLOCK_SIZE_TRUNC - 1) // BLOCK_SIZE_TRUNC
 
                     found_pivot = 0
                     while found_pivot == 0:

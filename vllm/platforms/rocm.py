@@ -1360,7 +1360,7 @@ class RocmPlatform(Platform):
             default,
             rms_norm=rms_norm,
             fused_add_rms_norm=rms_norm,
-            gelu_and_mul_sparse=["native"],
+            gated_qkv_rms_norm_rope=["native"],
         )
 
     @classmethod

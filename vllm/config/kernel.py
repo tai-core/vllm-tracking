@@ -32,6 +32,7 @@ class IrOpPriorityConfig:
     """Priority list for vllm.ir.ops.rms_norm"""
 
     fused_add_rms_norm: list[str] = Field(default_factory=list)
+    gated_qkv_rms_norm_rope: list[str] = Field(default_factory=list)
     """Priority list for vllm.ir.ops.fused_add_rms_norm"""
 
     gelu_and_mul_sparse: list[str] = Field(default_factory=list)

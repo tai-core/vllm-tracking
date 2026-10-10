@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
@@ -21,12 +22,13 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
 )
 from vllm.utils.math_utils import round_up
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWABackend,
     DeepseekSparseSWAMetadataBuilder,
 )
-from vllm.v1.attention.ops.flashmla import (
+from vllm_musa.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
 )
@@ -54,9 +56,17 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
     backend_cls = DeepseekV4FlashMLABackend
     swa_backend_cls = DeepseekSparseSWAFlashMLABackend
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:
+        super().__init__(vllm_config, *args, **kwargs)
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
+        parallel_config = vllm_config.parallel_config
+        spec_config = vllm_config.speculative_config
+        self._allow_dsv4_tp8_mtp_direct_out = (
+            current_platform.is_musa()
+            and spec_config is not None
+            and spec_config.num_speculative_tokens > 0
+            and parallel_config.tensor_parallel_size == 8
+        )
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return deep_gemm_fp8_o_proj(
@@ -206,8 +216,18 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 topk_indices = attn_metadata.c128a_global_decode_topk_indices
                 topk_lens = attn_metadata.c128a_decode_topk_lens
 
+        active_decode_tokens = q.shape[0]
+        if topk_indices is not None:
+            topk_indices = topk_indices[:active_decode_tokens]
+        if topk_lens is not None:
+            topk_lens = topk_lens[:active_decode_tokens]
+
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
+        if swa_indices is not None:
+            swa_indices = swa_indices[:active_decode_tokens]
+        if swa_lens is not None:
+            swa_lens = swa_lens[:active_decode_tokens]
 
         # We treat queries in the same seq as different queries
         # and later we only attend by generated indices.
@@ -395,4 +415,8 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 attn_sink=self.attn_sink,
                 topk_length=combined_lens,
                 out=output[query_start:query_end],
+                allow_dsv4_tp8_mtp_direct_out=(
+                    self._allow_dsv4_tp8_mtp_direct_out
+                    and get_current_vllm_config_or_none() is not None
+                ),
             )

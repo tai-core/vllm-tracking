@@ -14,7 +14,15 @@ import torch
 try:
     from cuda.bindings import runtime as cudart
 except ImportError:
-    from cuda import cudart
+    try:
+        from cuda import cudart
+    except ImportError:
+        # cuda-python is unavailable (e.g. on MUSA, where there is no CUDA IPC
+        # runtime binding). The Lamport fused all-reduce path needs these
+        # bindings; without them the workspace cannot be built. Leave cudart
+        # None so allocation raises and callers fall back to the standard
+        # all-reduce + RMSNorm path.
+        cudart = None
 
 _ALIGN = 1 << 21  # 2 MiB — CUDA IPC allocation alignment
 _IPC_HANDLE_SIZE = 64  # sizeof(cudaIpcMemHandle_t)
@@ -188,6 +196,11 @@ class LamportWorkspace:
     """
 
     def __init__(self, rank: int, world_size: int, comm_size: int, process_group=None):
+        if cudart is None:
+            raise RuntimeError(
+                "Lamport workspace requires the cuda-python runtime bindings, "
+                "which are unavailable on this platform."
+            )
         assert world_size >= 2, "Lamport workspace requires at least 2 ranks"
         assert comm_size > 0, "comm_size must be positive"
 

@@ -228,6 +228,28 @@ class GateLinear(ReplicatedLinear):
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        # Tier 0 (MUSA): parallel FP32 router gate.
+        #
+        # With force_fp32_compute the FP32 weight would reach Tier 6 and land on the
+        # vendor FP32 SGEMM, which launches with grid=(1,1,1) and costs ~292 us at
+        # every M on S5000 - 19% of the decode step device time for Nemotron-3.5
+        # (29 MoE layers x 1 call per step).  The MUSA kernel is bitwise identical to
+        # that GEMM (same FP32 accumulation order) and ~1.9x faster at decode M, so
+        # the router's top-k and the model output do not change.  All shape/backend
+        # policy lives in the MUSA module; it returns None for anything it does not
+        # own, leaving every other model's tier chain untouched.  The call is
+        # unconditional on purpose: a `x.device.type == "musa"` test here reads False
+        # while Dynamo traces (FakeTensors report "meta"), which folds the branch into
+        # the compiled graph as "not applicable" and silently disables the kernel in
+        # exactly the runs that matter.  The module owns that decision instead.
+        from vllm_musa.model_executor.layers.fused_moe.router.musa_router_gemm import (
+            router_gate_fp32,
+        )
+
+        output = router_gate_fp32(x, self.weight)
+        if output is not None:
+            return output, None
+
         # Tier 1: cuteDSL ll_bf16_gemm (SM90+, any dims)
         if (
             self.allow_ll_bf16_gemm

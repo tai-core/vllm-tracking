@@ -624,6 +624,26 @@ def mhc_pre_tilelang(
         layer_input: shape (..., hidden_size), dtype torch.bfloat16
 
     """
+    # MUSA: the upstream prenorm GEMM lowers to deep_gemm's tf32_hc_prenorm_gemm,
+    # which the MUSA deep_gemm backend does not provide. Route the whole pre
+    # block through the MUSA MHC provider, which selects a native or TileLang
+    # path without that symbol.
+    if residual.device.type == "musa":
+        from vllm_musa.deepseek_v4_mhc import mhc_pre_musa_with_norm
+
+        return mhc_pre_musa_with_norm(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+        )
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         _MHC_PRE_BIG_FUSE_TILELANG_KERNEL,
     )
@@ -757,6 +777,34 @@ def mhc_pre_broadcast_tilelang(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """First-layer mHC pre for a residual broadcast from ``(T, H)``."""
     # n_splits is retained for the shared API; split selection is internal.
+    if residual.device.type == "musa":
+        assert norm_weight is not None, (
+            "broadcast mHC pre currently requires fused RMSNorm"
+        )
+        hidden_size = residual.shape[-1]
+        hc_mult = fn.shape[1] // hidden_size
+        residual_out = (
+            residual.unsqueeze(-2)
+            .expand(*residual.shape[:-1], hc_mult, hidden_size)
+            .contiguous()
+        )
+        from vllm_musa.deepseek_v4_mhc import mhc_pre_musa_with_norm
+
+        post_mix, comb_mix, layer_input = mhc_pre_musa_with_norm(
+            residual_out,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+        )
+        return residual_out, post_mix, comb_mix, layer_input
+
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         _MHC_PRE_BIG_FUSE_TILELANG_KERNEL,
     )
@@ -839,6 +887,12 @@ def mhc_post_tilelang(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    # MUSA: route the post block through the MUSA MHC provider so it does not
+    # depend on the CUDA TileLang post kernels.
+    if residual.device.type == "musa":
+        from vllm_musa.deepseek_v4_mhc import mhc_post_musa
+
+        return mhc_post_musa(x, residual, post_layer_mix, comb_res_mix)
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         _MHC_POST_TILELANG_KERNEL,
     )
@@ -890,6 +944,29 @@ def mhc_fused_post_pre_tilelang(
         layer_input_cur: shape (..., hidden_size)
 
     """
+    # MUSA: same deep_gemm tf32_hc_prenorm_gemm gap as mhc_pre_tilelang. Run the
+    # post+pre pair through the MUSA MHC provider.
+    if residual.device.type == "musa":
+        from vllm_musa.deepseek_v4_mhc import mhc_fused_post_pre_musa
+
+        return mhc_fused_post_pre_musa(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            tile_n,
+            norm_weight,
+            norm_eps,
+        )
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         _MHC_FUSED_TILELANG_KERNEL,
         _MHC_POST_TILELANG_KERNEL,

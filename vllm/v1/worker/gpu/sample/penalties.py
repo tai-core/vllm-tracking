@@ -127,7 +127,7 @@ def _penalties_kernel(
     use_rep_penalty = rep_penalty != 1.0
     use_freq_penalty = freq_penalty != 0.0
     use_pres_penalty = pres_penalty != 0.0
-    use_penalty = use_rep_penalty or use_freq_penalty or use_pres_penalty
+    use_penalty = (use_rep_penalty or use_freq_penalty) or use_pres_penalty
     if not use_penalty:
         # Early return to avoid loading logits.
         return

@@ -138,7 +138,7 @@ class CustomAllreduce:
         self,
         group: ProcessGroup,
         device: int | str | torch.device,
-        max_size=8192 * 1024,
+        max_size=16 * 8192 * 1024,
         max_all_gather_size=_DEFAULT_ALL_GATHER_MAX_SIZE,
         max_mnnvl_all_gather_size=None,
         max_reduce_scatter_size=_DEFAULT_REDUCE_SCATTER_MAX_SIZE,
@@ -281,6 +281,7 @@ class CustomAllreduce:
         if (
             same_node
             and not current_platform.is_rocm()
+            and not current_platform.is_musa()
             and not _can_p2p(rank, world_size)
         ):
             logger.warning(

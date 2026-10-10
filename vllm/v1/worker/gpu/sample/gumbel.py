@@ -209,6 +209,7 @@ def gumbel_noised_argmax(
 def gumbel_block_argmax(
     logits,
     block,
+    rng_block,
     mask,
     token_idx,
     expanded_idx_mapping_ptr,
@@ -259,7 +260,7 @@ def gumbel_block_argmax(
     pos = tl.load(pos_ptr + token_idx)
     return gumbel_noised_argmax(
         logits,
-        block,
+        rng_block,
         mask,
         seed,
         pos,
@@ -290,6 +291,7 @@ def _gumbel_sample_kernel(
     pos_ptr,
     temp_ptr,
     vocab_size,
+    vocab_start_index,
     BLOCK_SIZE: tl.constexpr,
     IS_DRAFTING: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr,
@@ -299,6 +301,7 @@ def _gumbel_sample_kernel(
     token_idx = tl.program_id(0).to(tl.int64)
     block_idx = tl.program_id(1)
     block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    global_block = block + vocab_start_index
     mask = block < vocab_size
     logits = tl.load(
         logits_ptr + token_idx * logits_stride + block,
@@ -310,6 +313,7 @@ def _gumbel_sample_kernel(
     value, idx = gumbel_block_argmax(
         logits,
         block,
+        global_block,
         mask,
         token_idx,
         expanded_idx_mapping_ptr,
@@ -328,7 +332,7 @@ def _gumbel_sample_kernel(
         USE_FP64=USE_FP64,
         PER_TOKEN_COL=PER_TOKEN_COL,
     )
-    token_id = block_idx * BLOCK_SIZE + idx
+    token_id = vocab_start_index + block_idx * BLOCK_SIZE + idx
     tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
 
@@ -345,7 +349,9 @@ def gumbel_sample(
     logits_cache_col: torch.Tensor | None = None,  # scalar or [num_tokens]
     use_fp64: bool = False,
     logits_cache_source: torch.Tensor | None = None,
-) -> torch.Tensor:
+    vocab_start_index: int = 0,
+    return_values: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     # Enforce contiguity on non-strided input tensors
     expanded_idx_mapping = expanded_idx_mapping.contiguous()
     pos = pos.contiguous()
@@ -397,6 +403,7 @@ def gumbel_sample(
         pos,
         temperature,
         vocab_size,
+        vocab_start_index,
         BLOCK_SIZE=BLOCK_SIZE,
         IS_DRAFTING=is_drafting,
         APPLY_TEMPERATURE=apply_temperature,
@@ -406,4 +413,7 @@ def gumbel_sample(
     # NOTE(woosuk): Use int64 for later indexing.
     max_block_idx = local_max.argmax(dim=-1, keepdim=True)
     sampled = local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
-    return sampled
+    if not return_values:
+        return sampled
+    sampled_values = local_max.gather(dim=-1, index=max_block_idx).view(-1)
+    return sampled, sampled_values

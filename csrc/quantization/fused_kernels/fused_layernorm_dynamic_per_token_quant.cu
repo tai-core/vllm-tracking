@@ -142,8 +142,10 @@ void rms_norm_dynamic_per_token_quant_dispatch(
     std::optional<torch::stable::Tensor> const& scale_ub,
     std::optional<torch::stable::Tensor>& residual) {
   int32_t hidden_size = input.size(-1);
-  int32_t input_stride =
-      torch::stable::view(input, {-1, hidden_size}).stride(0);
+  // MUSA: the row stride of input viewed as [-1, hidden_size]; use stride(-2)
+  // directly (as the static-quant kernel does) since torch::stable has no
+  // int[]-arg view on torch_musa's stable ABI.
+  int32_t input_stride = input.stride(-2);
   auto num_tokens = input.numel() / hidden_size;
 
   dim3 grid(num_tokens);
@@ -219,8 +221,10 @@ void rms_norm_per_block_quant_dispatch(
     std::optional<torch::stable::Tensor> const& scale_ub,
     std::optional<torch::stable::Tensor>& residual, bool is_scale_transposed) {
   int32_t hidden_size = input.size(-1);
-  int32_t input_stride =
-      torch::stable::view(input, {-1, hidden_size}).stride(0);
+  // MUSA: the row stride of input viewed as [-1, hidden_size]; use stride(-2)
+  // directly (as the static-quant kernel does) since torch::stable has no
+  // int[]-arg view on torch_musa's stable ABI.
+  int32_t input_stride = input.stride(-2);
 
   STD_TORCH_CHECK(hidden_size % 4 == 0,
                   "Hidden size must be divisible by 4 for vectorized access");

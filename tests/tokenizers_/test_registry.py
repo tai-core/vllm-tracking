@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from transformers import AutoConfig, Qwen3_5MoeConfig
@@ -164,3 +164,31 @@ def test_cached_tokenizer_from_config_registers_local_config(tmp_path: Path):
         CONFIG_MAPPING._extra_content.pop("qwen3_5_moe", None)
         if registered_config is not None:
             CONFIG_MAPPING._extra_content["qwen3_5_moe"] = registered_config
+
+
+def test_deepseek_ocr_uses_generic_fast_tokenizer():
+    """DeepSeek-OCR must not fall back to slow LlamaTokenizer.
+
+    Its cached slow-tokenizer wrapper concatenates byte-level markers (``Ġ``
+    and ``Ċ``) instead of applying the tokenizer.json decoder.  The vLLM
+    config adapter exposes the model as ``deepseek_ocr`` even though the raw
+    checkpoint advertises ``deepseek_vl_v2``.
+    """
+    fake_tokenizer = MagicMock(is_fast=True)
+    with patch(
+        "vllm.tokenizers.registry.get_config",
+        return_value=SimpleNamespace(model_type="deepseek_ocr"),
+    ), patch.object(
+        TokenizerRegistry,
+        "load_tokenizer_cls",
+        return_value=SimpleNamespace,
+    ), patch(
+        "transformers.tokenization_utils_tokenizers.TokenizersBackend.from_pretrained",
+        return_value=fake_tokenizer,
+    ) as load_fast, patch(
+        "vllm.tokenizers.hf.get_cached_tokenizer", side_effect=lambda x: x
+    ):
+        tokenizer = get_tokenizer("dummy", tokenizer_mode="hf")
+
+    assert tokenizer is fake_tokenizer
+    load_fast.assert_called_once()

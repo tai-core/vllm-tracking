@@ -520,6 +520,39 @@ class RoutedExperts(PluggableLayer):
                     expert_data = expert_data.narrow(dim, 0, loaded_weight.shape[dim])
         return expert_data
 
+    def _tp_shard_indices(
+        self,
+        shard_size: int,
+        shard_dim: int,
+        loaded_weight: torch.Tensor,
+        tp_rank: int,
+    ) -> tuple[int, int]:
+        """Per-rank slice size and checkpoint offset for a TP-sharded load.
+
+        The param dimension may be padded above the natural per-rank size
+        (``intermediate_size_per_partition`` rounded up to a quant-block
+        multiple). Two regimes:
+
+        * Padded so that ``shard_size * tp_size`` exceeds the checkpoint
+          dimension (MUSA block-FP8 MoE, where a sub-block per-partition such
+          as 192 is padded to 256). Striding by the unpadded per-rank size
+          would land each rank on checkpoint rows that do not align with the
+          128-row quant-block grid the scales are defined on, so weight and
+          scale would dequantize against mismatched blocks. Stride by the
+          padded ``shard_size`` instead: each rank then covers a whole number
+          of quant blocks, weight and scale stay aligned, and the surplus
+          ranks (whose offset runs past the checkpoint) load nothing and keep
+          their zero-filled padding.
+        * Otherwise (no padding, or padding that still tiles the checkpoint
+          evenly, e.g. MXFP4) stride by the unpadded per-rank size so every
+          rank lands on its natural slice.
+        """
+        ckpt = loaded_weight.shape[shard_dim]
+        tp_size = self.moe_config.moe_parallel_config.tp_size
+        if shard_size * tp_size > ckpt:
+            return shard_size, shard_size * tp_rank
+        return ckpt // tp_size, (ckpt // tp_size) * tp_rank
+
     def _load_w13(
         self,
         expert_data: torch.Tensor,
@@ -538,22 +571,17 @@ class RoutedExperts(PluggableLayer):
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
         # and we're not loading the full weight
         if not load_full and loaded_weight.ndim > 0:
-            # When the parameter has been padded (e.g. MXFP4 rounding up
-            # intermediate_size_per_partition), shard_size is the padded
-            # size.  Compute the offset into the checkpoint weight using
-            # the *unpadded* per-rank size so that every TP rank lands at
-            # the correct slice.
-            tp_size = self.moe_config.moe_parallel_config.tp_size
-            loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
-            start_offset = loaded_per_rank * tp_rank
-            available = loaded_weight.shape[shard_dim] - start_offset
+            per_rank, offset = self._tp_shard_indices(
+                shard_size, shard_dim, loaded_weight, tp_rank
+            )
+            available = loaded_weight.shape[shard_dim] - offset
             if available <= 0:
                 # If there is no available weight to load for this TP rank
                 # (can happen on last TP rank with padding), we can skip
                 # loading and return early
                 return
-            narrow_size = min(loaded_per_rank, available)
-            loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
+            narrow_size = min(per_rank, available)
+            loaded_weight = loaded_weight.narrow(shard_dim, offset, narrow_size)
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
@@ -581,20 +609,21 @@ class RoutedExperts(PluggableLayer):
     ):
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
-        # Padded TP weights have already been sliced by the grouped loader.
+        shard_size = expert_data.shape[shard_dim]
+        # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
+        # and we're not loading the full weight
         if not load_full and loaded_weight.ndim > 0:
-            # Same padding fix as _load_w13: use unpadded per-rank size.
-            tp_size = self.moe_config.moe_parallel_config.tp_size
-            loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
-            start_offset = loaded_per_rank * tp_rank
-            available = loaded_weight.shape[shard_dim] - start_offset
+            per_rank, offset = self._tp_shard_indices(
+                shard_size, shard_dim, loaded_weight, tp_rank
+            )
+            available = loaded_weight.shape[shard_dim] - offset
             if available <= 0:
                 # If there is no available weight to load for this TP rank
                 # (can happen on last TP rank with padding), we can skip
                 # loading and return early
                 return
-            narrow_size = min(loaded_per_rank, available)
-            loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
+            narrow_size = min(per_rank, available)
+            loaded_weight = loaded_weight.narrow(shard_dim, offset, narrow_size)
         # w2, down_proj: Load into only logical weight of w2.
         hidden_dim = self._get_hidden_dim(shard_dim, expert_data.ndim)
         expert_data = self._narrow_expert_data_for_padding(

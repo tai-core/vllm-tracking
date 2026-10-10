@@ -446,21 +446,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             + self.model_state.num_new_sampled_tokens_per_step
         )
 
-        if self.parallel_config.enable_batch_sharded_sampling:
-            if hasattr(self.model, "compute_logits_local"):
-                self.batch_sharder = BatchSharder(
-                    max_num_reqs=self.max_num_reqs,
-                    max_num_logits_per_req=self.decode_query_len,
-                    device=self.device,
-                )
-                logger.info("Batch-sharded sampling enabled.")
-            else:
-                logger.warning_once(
-                    "Disabling batch-sharded sampling: %s does not implement "
-                    "compute_logits_local",
-                    type(self.model).__name__,
-                )
-
         # Initialize samplers. Model states may override via custom_sampler().
         config_processors = self.model_config.logits_processors or ()
         custom_logits_processors = build_custom_logits_processors(
@@ -515,10 +500,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler,
                     self.speculative_config,
                     self.device,
-                    watermark_key=speculative_target_watermark_key(
-                        self.vllm_config.watermark_config
-                    ),
                 )
+            from vllm_musa.optimization_contract import resolve_optimization_contract
+
+            optimization_contract = resolve_optimization_contract(
+                model_config=self.model_config
+            )
+            self.sampler._musa_optimization_contract = optimization_contract
+            topk_topp_sampler = getattr(self.sampler, "topk_topp_sampler", None)
+            if topk_topp_sampler is not None:
+                topk_topp_sampler._musa_optimization_contract = optimization_contract
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 self.device,
@@ -1479,20 +1470,50 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
+        dcp_local_seq_lens = None
+        if self.use_dcp:
+            # Prepare dcp local seq_lens.
+            prepare_dcp_local_seq_lens(
+                self.input_buffers.dcp_local_seq_lens,
+                self.input_buffers.seq_lens,
+                num_reqs,
+                self.dcp_size,
+                self.dcp_rank,
+                self.cp_interleave,
+            )
+            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[:num_reqs_padded]
+
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
-        logits_indices = combine_sampled_and_draft_tokens(
-            self.input_buffers.input_ids,
-            idx_mapping,
-            self.req_states.last_sampled_tokens,
-            query_start_loc,
-            seq_lens,
-            self.req_states.prefill_len.gpu,
-            self.req_states.draft_tokens,
-            cu_num_logits,
-            total_num_logits,
-            self.model_state.num_new_sampled_tokens_per_step,
-        )
+        selector = getattr(self, "_musa_select_uniform_decode_model_inputs", None)
+        model_inputs = None
+        if selector is not None:
+            model_inputs = selector(
+                req_ids,
+                num_scheduled_tokens_np,
+                batch_req_state.is_prefilling_np,
+                total_num_draft_tokens,
+                total_num_logits,
+                num_tokens,
+                num_tokens_after_padding,
+                num_reqs_padded,
+            )
+        if model_inputs is None:
+            logits_indices = combine_sampled_and_draft_tokens(
+                self.input_buffers.input_ids,
+                idx_mapping,
+                self.req_states.last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                self.req_states.prefill_len.gpu,
+                self.req_states.draft_tokens,
+                cu_num_logits,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+            )
+            input_ids = self.input_buffers.input_ids[:num_tokens_after_padding]
+        else:
+            input_ids, logits_indices = model_inputs
 
         fast_prefill = None
         if self.fast_prefill is not None:
@@ -1514,6 +1535,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             out=seq_lens_cpu_upper_bound_np[:num_reqs],
         )
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
+
+        max_seq_len_np = None
+        if self.use_pp:
+            # Used only by pipeline-parallel sampled-mask handling.
+            max_seq_len_np = self.req_states.max_seq_len[idx_mapping_np]
 
         prompt_lens = None
         if self.model_config.rswa_window is not None:
@@ -1537,7 +1563,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            dcp_local_seq_lens=None,
+            dcp_local_seq_lens=dcp_local_seq_lens,
             num_computed_tokens_np=num_computed_tokens_np,
             prefill_len_np=batch_req_state.prefill_len_np,
             num_computed_prefill_tokens_np=batch_req_state.num_computed_prefill_tokens_np,
@@ -1546,7 +1572,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prefill_runs_as_decode_np=batch_req_state.prefill_runs_as_decode_np,
             decode_graph_eligible=batch_req_state.decode_graph_eligible,
             max_seq_len_np=batch_req_state.max_seq_len_np,
-            input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
+            input_ids=input_ids,
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             is_padding=is_padding,
             logits_indices=logits_indices,
@@ -1623,7 +1649,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = all_to_all_logits(local_logits, shard_metadata)
             logits = logits[:, : self.vocab_size]
         else:
-            sample_hidden_states = hidden_states[input_batch.logits_indices]
+            selector = getattr(self, "_musa_select_sample_hidden_states", None)
+            sample_hidden_states = (
+                None if selector is None else selector(hidden_states, input_batch)
+            )
+            if sample_hidden_states is None:
+                sample_hidden_states = hidden_states[input_batch.logits_indices]
             logits = self.model.compute_logits(sample_hidden_states)
 
         invalid_drafts = None
@@ -1701,6 +1732,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.is_last_pp_rank:
             assert self.sampler is not None
             output_bin_counts = self.sampler.penalties_state.output_bin_counts
+        selector = getattr(self, "_musa_select_next_input_ids_buffer", None)
+        next_input_ids = None if selector is None else selector()
         post_update(
             idx_mapping,
             self.req_states.num_computed_tokens.gpu,
@@ -1712,6 +1745,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc,
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
+            next_input_ids=next_input_ids,
         )
 
         self.model_state.postprocess_state(

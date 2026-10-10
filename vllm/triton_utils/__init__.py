@@ -12,9 +12,19 @@ if TYPE_CHECKING or HAS_TRITON:
     import triton
     import triton.language as tl
     import triton.language.extra.libdevice as tldevice
-    from triton.experimental import gluon
-    from triton.experimental.gluon import language as gl
-    from triton.language.core import _aggregate as aggregate  # noqa: E501
+
+    try:
+        from triton.experimental import gluon
+        from triton.experimental.gluon import language as gl
+        from triton.language.core import _aggregate as aggregate  # noqa: E501
+    except ImportError:
+        # The MUSA Torch 2.11 stack uses Triton 3.2, which predates Gluon.
+        # Gluon is only consumed by platform-specific AMD kernels, so keep
+        # regular Triton available while making unsupported Gluon use fail
+        # through the same explicit placeholder as a Triton-less install.
+        gluon = TritonLanguagePlaceholder()
+        gl = TritonLanguagePlaceholder()
+        aggregate = TritonLanguagePlaceholder()
 else:
     triton = TritonPlaceholder()
     tl = TritonLanguagePlaceholder()

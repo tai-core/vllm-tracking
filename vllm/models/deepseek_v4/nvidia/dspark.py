@@ -24,6 +24,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_post_tilelang,
@@ -304,6 +305,23 @@ def _insert_context_kv(
         dtype=kv.dtype,
         device=kv.device,
     )
+    if current_platform.is_musa():
+        # Reuse the regular DSV4 MUSA cache-insertion wrapper. DSpark has no
+        # query result here; the dummy query is consumed only by the in-place
+        # fused operator while context KV is written to the sliding-window cache.
+        from vllm_musa import _custom_ops as _musa_custom_ops
+
+        _musa_custom_ops.deepseek_v4_qnorm_rope_kv_insert(
+            dummy_q,
+            kv,
+            swa_cache,
+            slot_mapping.contiguous(),
+            positions.contiguous(),
+            cos_sin_cache,
+            attn.eps,
+            block_size,
+        )
+        return
     if cache_dtype == torch.uint8:
         # fp8_ds_mla UE8M0 paged layout
         swa_2d = swa_cache.view(swa_cache.shape[0], -1)
@@ -466,10 +484,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
                 num_experts=self.config.n_routed_experts,
                 num_redundant_experts=first_layer.ffn.n_redundant_experts,
             )
+        expert_dtype = getattr(self.config, "expert_dtype", None)
+        resolved_quant_dtype = getattr(self.quant_config, "expert_dtype", None)
+        if resolved_quant_dtype in ("fp4", "fp8") and (
+            expert_dtype is None
+            or (expert_dtype == "fp4" and resolved_quant_dtype == "fp8")
+        ):
+            expert_dtype = resolved_quant_dtype
         expert_scale_suffix = (
-            ".weight_scale"
-            if getattr(self.config, "expert_dtype", "fp4") == "fp4"
-            else ".weight_scale_inv"
+            ".weight_scale" if expert_dtype == "fp4" else ".weight_scale_inv"
         )
 
         # (param_name, ckpt_shard_name, shard_id) for non-expert stacked params.
