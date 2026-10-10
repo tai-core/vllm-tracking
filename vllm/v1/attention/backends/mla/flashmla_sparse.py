@@ -1370,7 +1370,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 f"{padded_num_heads} for BF16 sparse prefill kernel"
             )
             if out is None:
-                q_padded = q.new_empty((q.shape[0], padded_num_heads, q.shape[2]))
+                q_padded = q.new_zeros((q.shape[0], padded_num_heads, q.shape[2]))
             else:
                 *_, q_padded, _, _ = current_workspace_manager().get_simultaneous(
                     *self.workspace_specs
