@@ -16,7 +16,12 @@ else:
 # The ring and raw rows a ratio-2 request program pools are not adjacent, so
 # reading them as one tile means joining two pointers. ROCm's Triton fails to
 # legalize `tt.join` on pointers, so there the two rows are loaded separately.
-_JOIN_ROW_PTRS = not current_platform.is_rocm()
+# MUSA: load the two pooled rows separately, as on ROCm, instead of joining
+# their pointers.
+_JOIN_ROW_PTRS = not (
+    current_platform.is_rocm()
+    or getattr(current_platform, "is_musa", lambda: False)()
+)
 
 
 def fused_save_compress_norm(
