@@ -16,14 +16,21 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
-# This test module is ROCm/Triton specific. Avoid import-time failures on
-# non-ROCm or environments without Triton by skipping early.
-if not current_platform.is_rocm():
-    pytest.skip("ROCm only", allow_module_level=True)
+
+def _on_musa() -> bool:
+    # Platform has no is_musa(); only the MUSA subclass defines it.
+    _check = getattr(current_platform, "is_musa", None)
+    return callable(_check) and _check()
+
+
+# This test module is ROCm/MUSA Triton specific. Avoid import-time failures on
+# other platforms or environments without Triton by skipping early.
+if not (current_platform.is_rocm() or _on_musa()):
+    pytest.skip("ROCm/MUSA only", allow_module_level=True)
 
 pytest.importorskip("triton")
 
-device = "cuda"
+device = current_platform.device_type
 
 triton_w4a16_module = importlib.import_module(
     "vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16"
@@ -140,7 +147,10 @@ def test_triton_w4a16_gemm_fake_impl():
         )
 
 
-@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm only")
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() or _on_musa()),
+    reason="ROCm/MUSA only",
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "M,K,N,G,has_zp",
@@ -152,10 +162,15 @@ def test_triton_w4a16_gemm_fake_impl():
         (64, 1024, 256, 256, False),
         (128, 256, 1024, 32, True),
         (64, 512, 512, 64, True),
+        # The first width past the M=64 tile boundary and the engine's
+        # 16384-token warmup width: both select a wider kernel tile.
+        (65, 256, 256, 128, False),
+        (128, 256, 256, 128, False),
+        (16384, 256, 256, 128, False),
     ],
 )
 def test_triton_w4a16_gemm_matches_reference(dtype, M, K, N, G, has_zp):
-    if not torch.cuda.is_available():
+    if not (torch.cuda.is_available() or _on_musa()):
         pytest.skip("CUDA/HIP device not available")
     if N % 8 != 0 or K % G != 0:
         pytest.skip("Invalid test shape")
@@ -195,9 +210,12 @@ def test_triton_w4a16_gemm_matches_reference(dtype, M, K, N, G, has_zp):
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm only")
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() or _on_musa()),
+    reason="ROCm/MUSA only",
+)
 def test_triton_w4a16_gemm_requires_contiguous_inputs():
-    if not torch.cuda.is_available():
+    if not (torch.cuda.is_available() or _on_musa()):
         pytest.skip("CUDA/HIP device not available")
 
     set_random_seed(0)
@@ -218,9 +236,12 @@ def test_triton_w4a16_gemm_requires_contiguous_inputs():
         )
 
 
-@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm only")
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() or _on_musa()),
+    reason="ROCm/MUSA only",
+)
 def test_triton_w4a16_process_weights_after_loading_repacks_layout():
-    if not torch.cuda.is_available():
+    if not (torch.cuda.is_available() or _on_musa()):
         pytest.skip("CUDA/HIP device not available")
 
     from vllm.config import VllmConfig, set_current_vllm_config
@@ -335,10 +356,13 @@ def test_triton_w4a16_process_weights_after_loading_repacks_layout():
     torch.testing.assert_close(layer.weight_zero_point, expected_zeros_gn8)
 
 
-@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm only")
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() or _on_musa()),
+    reason="ROCm/MUSA only",
+)
 def test_triton_w4a16_process_weights_after_loading_keeps_gptq_qzeros_layout():
     """AutoGPTQ qzeros are already [K//G, N//8] (output_dim=1): no transpose."""
-    if not torch.cuda.is_available():
+    if not (torch.cuda.is_available() or _on_musa()):
         pytest.skip("CUDA/HIP device not available")
 
     from vllm.config import VllmConfig, set_current_vllm_config
@@ -441,7 +465,10 @@ def test_triton_w4a16_process_weights_after_loading_keeps_gptq_qzeros_layout():
     torch.testing.assert_close(layer.qzeros, zeros_gptq_gn8)
 
 
-@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm only")
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() or _on_musa()),
+    reason="ROCm/MUSA only",
+)
 def test_triton_w4a16_symmetric_apply_ignores_qzeros(monkeypatch):
     """For symmetric (uint4b8) layers, apply_weights must pass qzeros=None."""
     from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
