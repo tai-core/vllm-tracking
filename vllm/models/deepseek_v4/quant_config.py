@@ -161,7 +161,16 @@ class DeepseekV4FP8Config(Fp8Config):
         ):
             return None
         model_type = getattr(hf_config, "model_type", None)
-        if model_type == "deepseek_v4" or user_quant == "deepseek_v4_fp8":
+        if (
+            model_type
+            in (
+                "deepseek_v4",
+                "deepseek_v4_text",
+                "deepseek_v41",
+                "deepseek_v41_text",
+            )
+            or user_quant == "deepseek_v4_fp8"
+        ):
             return "deepseek_v4_fp8"
         return None
 
