@@ -111,6 +111,27 @@ def mhc_pre_delayed_tilelang(
         (tokens, hc_mult, hc_mult), (tokens, hidden_size), and (tokens, hc_mult).
 
     """
+    # MUSA: the delayed pre block has no MUSA kernel and its prenorm GEMM needs
+    # deep_gemm's tf32_hc_prenorm_gemm; use the MUSA MHC provider.
+    if residual.device.type == "musa":
+        from vllm_musa.deepseek_v4_mhc import mhc_pre_delayed_musa
+
+        return mhc_pre_delayed_musa(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            pre_mix=pre_mix,
+            x=x,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         _HC_PRENORM_GEMM_TILELANG_KERNEL,
         mhc_pre_big_fuse_tilelang,
@@ -323,6 +344,30 @@ def mhc_fused_post_pre_delayed_tilelang(
         and (tokens, hidden_size).
 
     """
+    # MUSA: same gap as mhc_pre_delayed_tilelang; run the post + delayed pre
+    # pair through the MUSA MHC provider.
+    if residual.device.type == "musa":
+        from vllm_musa.deepseek_v4_mhc import mhc_fused_post_pre_delayed_musa
+
+        return mhc_fused_post_pre_delayed_musa(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            pre_mix=pre_mix,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            capture_aux=capture_aux,
+        )
+
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         _HC_PRENORM_GEMM_TILELANG_KERNEL,
         _MHC_FUSED_TILELANG_KERNEL,
