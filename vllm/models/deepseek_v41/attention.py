@@ -27,6 +27,10 @@ from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter
+from vllm.models.deepseek_v4.attention import (
+    _musa_deepseek_v4_linear_out_dtype,
+    _musa_deepseek_v4_serialize_long_prefill,
+)
 from vllm.models.deepseek_v41.common.ops import (
     MXFP4_BLOCK_SIZE,
     fused_indexer_q_rope_quant,
@@ -864,6 +868,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         index_weights_out: torch.Tensor | None = None
         latent: torch.Tensor | None = None
         aux_stream = aux_streams[0] if aux_streams is not None else None
+        if _musa_deepseek_v4_serialize_long_prefill(hidden_states.size(0)):
+            aux_stream = None
 
         if compressor is not None:
             # Q projection / KV insertion on the default stream overlaps the
@@ -874,6 +880,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.ln_events[0],
                 self.ln_events[1],
                 aux_stream,
+                use_stream_waits=current_platform.is_musa(),
             )
         else:
             q = project_query_and_cache_kv()
@@ -897,6 +904,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.ln_events[0],
                 self.ln_events[1],
                 aux_stream,
+                use_stream_waits=current_platform.is_musa(),
             )
         else:
             indexer_result = prepare_indexer()
@@ -952,10 +960,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
-                return torch.mm(
+                return _musa_deepseek_v4_linear_out_dtype(
                     hidden_states,
-                    compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
+                    compressor.fused_wkv_wgate.weight,
+                    torch.float32,
                 )
 
             aux_fns[0] = compressor_kv_score
@@ -976,8 +984,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.ln_events[0],
             self.ln_events[1:3],
             aux_streams,
-            enable=hidden_states.shape[0]
-            <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+            enable=(
+                hidden_states.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+                and not _musa_deepseek_v4_serialize_long_prefill(
+                    hidden_states.shape[0]
+                )
+            ),
+            use_stream_waits=current_platform.is_musa(),
         )
 
         return qr_kv, kv_score, indexer_weights
@@ -1054,6 +1067,23 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         cache_dtype = swa_kv_cache.dtype
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
+        if cache_dtype == torch.uint8 and current_platform.is_musa():
+            assert not self.kv_mxfp8
+            from vllm_musa import _custom_ops as _musa_custom_ops
+
+            return _musa_custom_ops.deepseek_v4_qnorm_rope_kv_insert(
+                q,
+                kv,
+                swa_kv_cache,
+                swa_metadata.slot_mapping,
+                positions,
+                cos_sin_cache,
+                self.eps,
+                swa_metadata.block_size,
+                self.padded_heads,
+                apply_q_norm=False,
+            )
+
         if cache_dtype == torch.uint8:
             # fp8_ds_mla UE8M0 paged path. Horizontally fused:
             #   Q side: GPT-J RoPE, zero-filling the padding head slots; the
