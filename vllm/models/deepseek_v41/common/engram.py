@@ -605,11 +605,17 @@ def _engram_head_shard_weight_loader(
     param: torch.nn.Parameter, loaded_weight: torch.Tensor
 ) -> None:
     """Load this rank's complete head buckets. ue8m0 scales arrive as
-    float8_e8m0fnu; keep the raw bytes (the param stores uint8)."""
+    float8_e8m0fnu, or as power-of-two float32 whose exponent field is the
+    ue8m0 byte; keep the raw bytes (the param stores uint8)."""
     part_rows = param.shape[0]
     if loaded_weight.dtype == torch.float8_e8m0fnu:
         loaded_weight = loaded_weight.view(torch.uint8)
     shard = loaded_weight.narrow(0, param.engram_vocab_start, part_rows)
+    if param.dtype == torch.uint8 and shard.dtype == torch.float32:
+        bits = shard.contiguous().view(torch.int32)
+        if (bits <= 0).any() or (bits & 0x7FFFFF).any():
+            raise ValueError("float32 engram scales must be positive powers of two")
+        shard = ((bits >> 23) & 0xFF).to(torch.uint8)
     assert shard.shape == param.shape, (
         f"engram shard {tuple(shard.shape)} does not fit param {tuple(param.shape)}"
     )
