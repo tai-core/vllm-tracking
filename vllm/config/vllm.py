@@ -2103,6 +2103,33 @@ class VllmConfig:
             if self.model_config is None or self.model_config.is_moe
             else 1
         )
+        # DeepEP HT dispatch synchronizes with the CPU and must stay outside
+        # graph capture. Enforce this independently of compilation mode so
+        # Model Runner V2 / breakable graphs cannot bypass the restriction.
+        if (
+            self.parallel_config.all2all_backend == "deepep_high_throughput"
+            and self.parallel_config.use_all2all
+            and (self.model_config is None or self.model_config.is_moe)
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            if (
+                envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+                and self.use_v2_model_runner
+                and self.compilation_config.mode == CompilationMode.NONE
+                and not self.parallel_config.use_ubatching
+            ):
+                logger.info(
+                    "DeepEP HT: Using PIECEWISE graphs with eager MoE "
+                    "and replay-stable output buffers."
+                )
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+            else:
+                logger.info(
+                    "DeepEP: Disabling CUDA Graphs because the current "
+                    "high-throughput integration requires CPU synchronization."
+                )
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
         self.compilation_config.set_splitting_ops_for_v1(
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
@@ -3345,6 +3372,8 @@ class VllmConfig:
         kda_architectures = (
             "KimiLinearForCausalLM",
             "KimiK3ForConditionalGeneration",
+            "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
         )
         is_kda_model = (
             self.model_config is not None
@@ -3376,13 +3405,8 @@ class VllmConfig:
                     "SSM state caches, not --enable-mamba-cache-stochastic-"
                     "rounding, which requires an explicit float16 cache"
                 )
-            if (
-                self.cache_config.mamba_cache_mode == "align"
-                and not self.use_v2_model_runner
-            ):
-                raise ValueError(
-                    "RecoverSSM with align mode requires VLLM_USE_V2_MODEL_RUNNER=1"
-                )
+            if not self.use_v2_model_runner:
+                raise ValueError("KDA RecoverSSM requires VLLM_USE_V2_MODEL_RUNNER=1")
             if self.parallel_config.pipeline_parallel_size > 1:
                 raise ValueError(
                     "RecoverSSM currently requires pipeline_parallel_size=1"
@@ -3423,9 +3447,16 @@ class VllmConfig:
                 "Triton ReplaySSM requires Model Runner V1; use "
                 "--mamba-backend flashinfer or Model Runner V1"
             )
+        # DecodeBench only fills local cache for fake-decode tests. Mooncake
+        # has an explicit quiescent checkpoint-only P/D path for KDA RecoverSSM.
         if (
             self.kv_transfer_config is not None
             and self.kv_transfer_config.is_kv_transfer_instance
+            and self.kv_transfer_config.kv_connector != "DecodeBenchConnector"
+            and not (
+                self.cache_config.use_kda_recoverssm
+                and self.kv_transfer_config.kv_connector == "MooncakeConnector"
+            )
         ):
             raise ValueError(
                 "--use-replayssm is incompatible with KV connectors "
