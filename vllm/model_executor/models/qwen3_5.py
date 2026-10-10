@@ -519,6 +519,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
                 prefix=maybe_prefix(prefix, "visual"),
             )
 
+        from vllm_musa.optimization_contract.rotary import install_model_rotary
+
+        install_model_rotary(self, vllm_config)
+
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3_5ForCausalLM(
                 vllm_config=vllm_config, prefix=maybe_prefix(prefix, "language_model")
