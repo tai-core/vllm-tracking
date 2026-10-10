@@ -110,6 +110,9 @@ class SharedExperts(torch.nn.Module):
 
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda_alike()
+            # MUSA: graph capture runs on a torch_musa-owned stream that the
+            # cached current_stream() does not track, so the fork escapes it.
+            and not current_platform.is_musa()
             and self._stream is not None
             and hidden_states.shape[0]
             <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
