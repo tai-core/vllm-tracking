@@ -95,7 +95,7 @@ def find_seq_idx(
     we search the plain cumulative-length prefix (used by
     ``reduce_segments`` which iterates over raw query tokens).
     """
-    left: tl.int32 = 0
+    left = 0
     right = num_seqs
     while left < right:
         mid = (left + right) // 2
