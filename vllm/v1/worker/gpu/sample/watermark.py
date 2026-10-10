@@ -441,11 +441,21 @@ def draft_watermarking_mask(
     return active
 
 
-@triton.jit
-def _mulhilo32(multiplier: tl.constexpr, value):
-    high = tl_math.umulhi(multiplier, value)
-    low = tl.mul(multiplier, value, sanitize_overflow=False)
-    return high, low
+if hasattr(tl, "mul"):
+
+    @triton.jit
+    def _mulhilo32(multiplier: tl.constexpr, value):
+        high = tl_math.umulhi(multiplier, value)
+        low = tl.mul(multiplier, value, sanitize_overflow=False)
+        return high, low
+
+else:
+    # MUSA: Triton 3.2 has no tl.mul; the uint32 product wraps to the low word.
+    @triton.jit
+    def _mulhilo32(multiplier: tl.constexpr, value):
+        high = tl_math.umulhi(multiplier, value)
+        low = multiplier * value
+        return high, low
 
 
 @triton.jit
