@@ -352,6 +352,20 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
     for (int ii = 0; ii < VPT; ++ii) {
       row_chunk[ii] = 0.f;
     }
+#ifdef USE_MUSA
+  } else {
+    // MUSA: mcc miscompiles the vectorized row loads below for 320/384/448
+    // experts, so load the row element by element.
+  #pragma unroll
+    for (int ii = 0; ii < LDG_PER_THREAD; ++ii) {
+  #pragma unroll
+      for (int jj = 0; jj < ELTS_PER_LDG; ++jj) {
+        row_chunk[ii * ELTS_PER_LDG + jj] = toFloat(
+            thread_read_ptr[ii * THREADS_PER_ROW * ELTS_PER_LDG + jj]);
+      }
+    }
+  }
+#else
   } else if constexpr (std::is_same_v<InputType, float>) {
     using VecType = AlignedArray<float, ELTS_PER_LDG>;
     VecType* row_chunk_vec_ptr = reinterpret_cast<VecType*>(&row_chunk);
@@ -409,6 +423,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
       }
     }
   }
+#endif
   constexpr float threshold = 20.0f;
   constexpr float beta = 1.0f;
 
