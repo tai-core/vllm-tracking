@@ -56,6 +56,7 @@ from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4Model,
     _linear_scale_param_name,
+    _resolve_expert_dtype,
     _use_sequence_parallel,
     make_deepseek_v4_expert_params_mapping,
     maybe_init_gemm_rs,
@@ -292,7 +293,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         self.config = self.draft_model_config.hf_config
         self.quant_config = vllm_config.quant_config
         self.linear_scale_name = _linear_scale_param_name(
-            vllm_config, getattr(self.config, "expert_dtype", "fp4")
+            vllm_config, _resolve_expert_dtype(self.config, self.quant_config)
         )
         self.pad_shared_expert = getattr(
             self.quant_config, "weight_block_size", None
@@ -393,7 +394,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             )
         expert_scale_suffix = (
             ".weight_scale"
-            if getattr(self.config, "expert_dtype", "fp4") == "fp4"
+            if _resolve_expert_dtype(self.config, self.quant_config) == "fp4"
             else ".weight_scale_inv"
         )
 

@@ -56,6 +56,7 @@ from .model import (
     DeepseekV41LLMForCausalLM,
     _linear_scale_param_name,
     _make_deepseek_v4_weights_mapper,
+    _resolve_expert_dtype,
 )
 
 
@@ -185,7 +186,7 @@ class DeepseekV41ForCausalLM(
             self.language_model.make_empty_intermediate_tensors
         )
 
-        expert_dtype = getattr(config, "expert_dtype", "fp4")
+        expert_dtype = _resolve_expert_dtype(config, vllm_config.quant_config)
         self.hf_to_vllm_mapper = _make_deepseek_v4_vl_weights_mapper(
             expert_dtype, _linear_scale_param_name(vllm_config, expert_dtype)
         )

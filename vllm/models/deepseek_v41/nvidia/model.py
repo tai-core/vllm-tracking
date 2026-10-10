@@ -1426,6 +1426,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 layer.hc_attn_fn_broadcast.copy_(broadcast)
 
 
+def _resolve_expert_dtype(config, quant_config) -> str:
+    """Expert dtype for the weight mapper. Converted FP8 checkpoints omit
+    ``expert_dtype`` from their config; the DeepSeek quant config resolves it
+    from hf_overrides, which do not reach nested text or draft configs."""
+    expert_dtype = getattr(config, "expert_dtype", None)
+    resolved = getattr(quant_config, "expert_dtype", None)
+    if resolved in ("fp4", "fp8") and (
+        expert_dtype is None or (expert_dtype == "fp4" and resolved == "fp8")
+    ):
+        expert_dtype = resolved
+    return expert_dtype or "fp4"
+
+
 def _linear_scale_param_name(vllm_config: VllmConfig, expert_dtype: str) -> str:
     """Parameter name the linear quant method registers for weight scales.
 
@@ -1561,7 +1574,7 @@ class DeepseekV41LLMForCausalLM(
 
         config = vllm_config.model_config.hf_config
         self.config = config
-        expert_dtype = getattr(config, "expert_dtype", "fp4")
+        expert_dtype = _resolve_expert_dtype(config, vllm_config.quant_config)
         self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(
             expert_dtype, _linear_scale_param_name(vllm_config, expert_dtype)
         )

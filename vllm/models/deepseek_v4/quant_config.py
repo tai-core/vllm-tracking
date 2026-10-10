@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+import copy
 from typing import TYPE_CHECKING, cast
+
+import regex as re
 
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.fused_moe import (
@@ -12,7 +15,7 @@ from vllm.model_executor.layers.fused_moe import (
     UnquantizedFusedMoEMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
-from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
@@ -51,6 +54,12 @@ class DeepseekV4FP8Config(Fp8Config):
         self._resolved_expert_dtype: str | None = None
         self._resolved_moe_quant_algo: str | None = None
         self._nvfp4_config: ModelOptNvFp4Config | None = None
+        # FP8 routed experts may use a coarser block than the linear layers,
+        # e.g. 128x128 experts converted from MXFP4 beside 32x32 linears.
+        self.expert_weight_block_size: list[int] | None = (
+            list(self.weight_block_size) if self.weight_block_size else None
+        )
+        self._expert_fp8_config: Fp8Config | None = None
         # ``is_scale_e8m0`` is a property that resolves on first read,
         # by which time the current vllm_config has been set.
 
@@ -175,6 +184,27 @@ class DeepseekV4FP8Config(Fp8Config):
             }
         return cast("DeepseekV4FP8Config", super().from_config(config))
 
+    def maybe_update_config(
+        self,
+        model_name: str,
+        hf_config=None,
+        revision: str | None = None,
+    ) -> None:
+        if self.weight_block_size is None:
+            return
+        block = getattr(hf_config, "expert_weight_block_size", None)
+        if block is None:
+            block = _checkpoint_expert_weight_block_size(model_name, revision)
+        if block is not None:
+            self.expert_weight_block_size = [int(b) for b in block]
+
+    def _get_expert_fp8_config(self) -> Fp8Config:
+        if self._expert_fp8_config is None:
+            expert_config = copy.copy(self)
+            expert_config.weight_block_size = list(self.expert_weight_block_size)
+            self._expert_fp8_config = expert_config
+        return self._expert_fp8_config
+
     def get_quant_method(self, layer, prefix):
         if isinstance(layer, RoutedExperts):
             if is_layer_skipped(
@@ -194,6 +224,43 @@ class DeepseekV4FP8Config(Fp8Config):
                         moe_config=layer.moe_config,
                     )
                 return Mxfp4MoEMethod(layer.moe_config)
+            if (
+                self.expert_weight_block_size is not None
+                and self.expert_weight_block_size != self.weight_block_size
+            ):
+                return Fp8MoEMethod(self._get_expert_fp8_config(), layer)
             # expert_dtype == "fp8": fall through to Fp8Config which
             # returns Fp8MoEMethod with block-wise float32 scales.
         return super().get_quant_method(layer, prefix)
+
+
+_EXPERT_W1_WEIGHT = re.compile(r"\.experts\.\d+\.w1\.weight$")
+
+
+def _checkpoint_expert_weight_block_size(
+    model_name: str, revision: str | None
+) -> list[int] | None:
+    """Block shape of a local checkpoint's routed-expert FP8 weights, read
+    from the first expert weight and its scale in the safetensors metadata."""
+    from pathlib import Path
+
+    from vllm.transformers_utils.config import get_safetensors_params_metadata
+
+    if not Path(model_name).is_dir():
+        return None
+    try:
+        metadata = get_safetensors_params_metadata(model_name, revision=revision)
+    except Exception:
+        return None
+    for name, info in metadata.items():
+        if not _EXPERT_W1_WEIGHT.search(name):
+            continue
+        scale = metadata.get(name[: -len("weight")] + "scale")
+        if scale is None or info.get("dtype") not in ("F8_E4M3", "F8_E5M2"):
+            return None
+        rows, cols = info["shape"]
+        scale_rows, scale_cols = scale["shape"]
+        if rows % scale_rows or cols % scale_cols:
+            return None
+        return [rows // scale_rows, cols // scale_cols]
+    return None
