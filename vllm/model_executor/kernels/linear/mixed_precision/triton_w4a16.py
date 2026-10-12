@@ -347,6 +347,12 @@ def _triton_w4a16_gemm_impl(
             BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 64
         else:
             BLOCK_M, BLOCK_N, BLOCK_K = 64, 32, 64
+        if M <= 16 and N >= 8192:
+            # The widest projection (gate_up, N=17920) has 560 N-programs at BLOCK_N=32,
+            # and with BLOCK_M=32 each of them re-reads an A tile 4x the size of its B
+            # tile, so the kernel is load-issue-bound at ~100 GB/s. A 16x64 tile with
+            # BLOCK_K=64 rebalances that and measures ~240 GB/s (swept on S5000).
+            BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, 64
         if group_size < BLOCK_K:
             BLOCK_K = group_size
 
