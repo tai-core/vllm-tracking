@@ -890,7 +890,15 @@ def choose_mp_linear_kernel(
         if _cc is not None:
             compute_capability = _cc[0] * 10 + _cc[1]
 
-    platform_kernels = _POSSIBLE_KERNELS.get(current_platform._enum, [])
+    platform_kernels = _POSSIBLE_KERNELS.get(current_platform._enum)
+    if platform_kernels is None:
+        # MUSA is an out-of-tree platform (PlatformEnum.OOT), so it has no
+        # dedicated entry above. Its W4A16 weight-only dequant GEMM is the
+        # Triton kernel: no PTX, no mcc build, and no Marlin port required.
+        _is_musa = getattr(current_platform, "is_musa", None)
+        platform_kernels = (
+            [TritonW4A16LinearKernel] if callable(_is_musa) and _is_musa() else []
+        )
 
     # Apply --linear-backend filtering when set.
     platform_kernels = _resolve_backend_kernels(

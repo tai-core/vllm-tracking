@@ -231,7 +231,12 @@ class AutoAWQConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75
+        # MUSA reports capability (3, 1) and serves 4-bit AWQ through the Triton
+        # W4A16 kernel, which has no CUDA-architecture requirement: the kernel's
+        # own can_implement() is the real validator, and the capability tuple is a
+        # vendor number rather than an ISA requirement.
+        _is_musa = getattr(current_platform, "is_musa", None)
+        return 31 if callable(_is_musa) and _is_musa() else 75
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
@@ -299,12 +304,18 @@ class AutoAWQConfig(QuantizationConfig):
             ):
                 return UnquantizedLinearMethod()
 
-            # On CPU and XPU, use the Marlin linear method which uses
+            # On CPU, XPU and MUSA, use the Marlin linear method which uses
             # choose_mp_linear_kernel to select the best available kernel
-            # (CPUWNA16LinearKernel on CPU, XPUwNa16LinearKernel on XPU).
+            # (CPUWNA16LinearKernel on CPU, XPUwNa16LinearKernel on XPU,
+            # TritonW4A16LinearKernel on MUSA).
             # The AWQ checkpoint is converted to the standard GPTQ-like format
             # in process_weights_after_loading before being handed to the kernel.
-            if current_platform.is_cpu() or current_platform.is_xpu():
+            _is_musa = getattr(current_platform, "is_musa", None)
+            if (
+                current_platform.is_cpu()
+                or current_platform.is_xpu()
+                or (callable(_is_musa) and _is_musa())
+            ):
                 return AutoAWQMarlinLinearMethod(self)
 
             # Check if Marlin is supported and not using batch invariant mode
@@ -406,9 +417,15 @@ class AutoAWQMarlinLinearMethod(LinearMethodBase):
         self.quant_type = scalar_types.uint4
         self.input_dtype = None
 
-        # Skip Marlin verification on CPU/XPU - they use dedicated WNA16
-        # kernels (CPUWNA16LinearKernel / XPUwNa16LinearKernel) instead.
-        if not (current_platform.is_cpu() or current_platform.is_xpu()):
+        # Skip Marlin verification on CPU/XPU/MUSA - they use dedicated WNA16
+        # kernels (CPUWNA16LinearKernel / XPUwNa16LinearKernel /
+        # TritonW4A16LinearKernel) instead.
+        _is_musa = getattr(current_platform, "is_musa", None)
+        if not (
+            current_platform.is_cpu()
+            or current_platform.is_xpu()
+            or (callable(_is_musa) and _is_musa())
+        ):
             verify_marlin_supported(
                 quant_type=self.quant_config.quant_type,
                 group_size=self.quant_config.group_size,

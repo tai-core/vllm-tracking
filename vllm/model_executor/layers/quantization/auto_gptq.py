@@ -59,6 +59,7 @@ from vllm.model_executor.parameter import (
     PackedColumnParameter,
     PackedvLLMParameter,
 )
+from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.config import get_safetensors_params_metadata
 from vllm.utils.collection_utils import is_list_of
@@ -180,7 +181,10 @@ class AutoGPTQConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 60
+        # See AutoAWQConfig.get_min_capability: on MUSA the WNA16 path is the
+        # Triton W4A16 kernel, whose can_implement() validates the checkpoint.
+        _is_musa = getattr(current_platform, "is_musa", None)
+        return 31 if callable(_is_musa) and _is_musa() else 60
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
@@ -313,11 +317,15 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         self.input_dtype = None
         self.quant_type = self.quant_config.quant_type
 
-        # Verify supported on platform.
-        verify_marlin_supported(
-            quant_type=self.quant_config.quant_type,
-            group_size=self.quant_config.group_size,
-        )
+        # Verify supported on platform. MUSA has no Marlin kernel: the WNA16
+        # kernel selector picks the Triton W4A16 kernel, which validates the
+        # quant type, group size and shapes in its own can_implement().
+        _is_musa = getattr(current_platform, "is_musa", None)
+        if not (callable(_is_musa) and _is_musa()):
+            verify_marlin_supported(
+                quant_type=self.quant_config.quant_type,
+                group_size=self.quant_config.group_size,
+            )
 
     def create_weights(
         self,
