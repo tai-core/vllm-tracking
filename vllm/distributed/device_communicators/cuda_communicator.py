@@ -395,9 +395,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
-        world_size = self.world_size
+        # Uniform fallback (mirrors all_gather): when the PyNccl
+        # communicator is missing OR disabled (e.g. VLLM_DISABLE_PYNCCL=1,
+        # the matched DCP2 diagnostic environment), route through the
+        # base-class torch.distributed.reduce_scatter_tensor. Without
+        # this, the assert below fires for a missing communicator, and a
+        # DISABLED one returns the unwritten torch.empty buffer (the
+        # PyNccl no-op leaves the sentinel garbage) — a silent
+        # numerical corruption (the device-verified FAIL_NUMERIC root:
+        # reference errors 0.779 > 0.02 with all-finite garbage).
         pynccl_comm = self.pynccl_comm
-        assert pynccl_comm is not None
+        if pynccl_comm is None or pynccl_comm.disabled:
+            return super().reduce_scatter(input_, dim)
+
+        world_size = self.world_size
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
