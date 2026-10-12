@@ -946,6 +946,11 @@ def _default_block_size() -> int:
         return 64
     if current_platform.is_cpu():
         return 128
+    # MUSA: the attention backend needs a kernel block size that is a multiple of
+    # 64. Platform has no is_musa(); only the MUSA subclass defines it.
+    _is_musa = getattr(current_platform, "is_musa", None)
+    if callable(_is_musa) and _is_musa():
+        return 64
     return 16
 
 
@@ -958,7 +963,8 @@ class VllmRunner:
     - `seed`: Set to `0` instead of `None` for test reproducibility.
     - `max_model_len`: Set to `1024` instead of `None` to reduce memory usage.
     - `block_size`: To reduce memory usage, set default to `64` if on XPU
-        devices, otherwise default to `16`.
+        devices, otherwise default to `16`. MUSA also uses `64`: its attention
+        backend requires a kernel block size that is a multiple of 64.
     - `enable_chunked_prefill`: Set to `False` instead of `None` for
       test reproducibility.
     - `enforce_eager`: Set to `False` to test CUDA graph.
