@@ -342,8 +342,7 @@ def _triton_w4a16_gemm_impl(
         # expose 24-64 programs, so the k-chain is serial and they stream at 7-13 GB/s.
         # Splitting K raises the program count and shortens each chain. SPLIT is derived
         # from the static shape only (never from data), and the M boundary matches the
-        # tile table below, so capture behaviour is unchanged. Larger M keeps the wide
-        # tile that the entry above this one selects.
+        # tile table below, so capture behaviour is unchanged.
         if M <= 32:
             BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 64
         else:
@@ -356,22 +355,30 @@ def _triton_w4a16_gemm_impl(
         while SPLIT < 8 and tiles_n * SPLIT < 256:
             SPLIT *= 2
 
+    if callable(_is_musa) and _is_musa() and M <= 64:
+        # The split kernel's 3-D reshape unpack is ~2.5x cheaper than the main
+        # kernel's tl.interleave expansion, so decode uses it even when the shape
+        # already exposes enough programs (SPLIT == 1) - then it writes the output
+        # directly and no reduce kernel is launched.
+        partials = None
         if SPLIT > 1:
             partials = torch.empty((SPLIT, M, N), dtype=torch.float32, device=a.device)
-            grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(M, BLOCK_M), SPLIT)
-            triton_w4a16_gemm_split_kernel[grid](
-                a, b_q, scales, zeros_ptr, partials,
-                M, N, K,
-                a.stride(0), a.stride(1), b_q.stride(0), b_q.stride(1),
-                c.stride(0), c.stride(1),
-                group_size, SPLIT,
-                HAS_ZP=has_zp, ZP_BIAS=zp_bias,
-                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-            )
+        out = partials if SPLIT > 1 else c
+        grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(M, BLOCK_M), SPLIT)
+        triton_w4a16_gemm_split_kernel[grid](
+            a, b_q, scales, zeros_ptr, out,
+            M, N, K,
+            a.stride(0), a.stride(1), b_q.stride(0), b_q.stride(1),
+            c.stride(0), c.stride(1),
+            group_size, SPLIT,
+            HAS_ZP=has_zp, ZP_BIAS=zp_bias,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        )
+        if SPLIT > 1:
             triton_w4a16_reduce_kernel[(triton.cdiv(N, 1024), M)](
                 partials, c, M, N, SPLIT, c.stride(0), c.stride(1), 1024,
             )
-            return c
+        return c
 
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
