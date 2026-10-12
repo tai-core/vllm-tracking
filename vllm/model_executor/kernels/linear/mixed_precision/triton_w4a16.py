@@ -207,7 +207,15 @@ def _triton_w4a16_gemm_impl(
     # Provide a dummy pointer when HAS_ZP=False (Triton requires a valid ptr)
     zeros_ptr = qzeros if has_zp else b_q
 
-    if current_platform.is_rocm():
+    _is_musa = getattr(current_platform, "is_musa", None)
+    if callable(_is_musa) and _is_musa() and M > 64:
+        # mtgpu Triton 3.2 computes this kernel's wider tiles incorrectly on MUSA:
+        # BLOCK_N=128 with this tile returns NaN or large errors and is not even
+        # deterministic across runs, while BLOCK_N<=64 with BLOCK_K=32 is correct.
+        # The generic branch below would pick BLOCK_N=128 for M > 64, i.e. for every
+        # prefill longer than 64 tokens.
+        BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 32
+    elif current_platform.is_rocm():
         from vllm.platforms.rocm import on_gfx1x
 
         if on_gfx1x():
