@@ -30,6 +30,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
+    DeepseekV32IndexerPrefillChunkMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -233,6 +234,120 @@ def _gather_workspace_shapes(
     return (
         ((total_seq_lens, head_dim), fp8_dtype),
         ((total_seq_lens, 4), torch.uint8),
+    )
+
+
+def _prefill_chunk_dcp_inputs(
+    chunk: DeepseekV32IndexerPrefillChunkMetadata,
+    k_quant_full: torch.Tensor,
+    k_scale_full: torch.Tensor,
+    q_num_rows: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+    bool,
+    torch.Tensor | None,
+]:
+    """Resolve one prefill chunk's gather/topk inputs for THIS rank.
+
+    The chunk's explicit ``dcp_world_size`` (set by the metadata
+    builder from the real parallel config; default 1 for legacy
+    manual metadata) selects the path — NEVER tensor identity.
+
+    DCP1 keeps the legacy behavior exactly: the global cu_seq_lens /
+    token_to_seq drive the gather and the workspace is sliced by
+    ``total_seq_lens``.
+
+    DCP>1 switches every address-bearing input to the rank-local
+    views AND to EXACT local lengths: the HCU gather kernel derives
+    its grid from ``k_fp8.size(0)`` and loads
+    ``token_to_seq_ptr + tid`` for every tid in that grid (the
+    gfx950 variant with no mask at all; the generic variant masks
+    only against the same num_tokens), so the destination, scale,
+    and map handed to it must all be the ``[:local_total_seq_lens]``
+    views — a padded max_local-sized destination would read the map
+    out of bounds on any rank whose local share is shorter than the
+    largest rank's. The (shared, over-allocated) workspace is still
+    reserved at max_local; only the EFFECTIVE gather/logits view is
+    local_total-wide. The logits bounds (cu_seqlen_ks/ke) are the
+    rank-local row bounds from the metadata builder. A rank whose
+    local share is empty skips the gather entirely and returns
+    ``empty_logits`` of shape [q_num_rows, 0] so the caller still
+    walks the SAME chunk-loop body and can fill the fixed-K
+    all-(-1) candidate lanes for the (later) global merge — no early
+    return of the whole batch.
+
+    Raises:
+        ValueError: DCP>1 but the chunk lacks the local fields (a
+            legacy manual metadata must not silently degrade to the
+            global mapping).
+    """
+    if chunk.dcp_world_size <= 1:
+        return (
+            k_quant_full[: chunk.total_seq_lens],
+            k_scale_full[: chunk.total_seq_lens],
+            chunk.cu_seq_lens,
+            chunk.token_to_seq,
+            chunk.cu_seqlen_ks,
+            chunk.cu_seqlen_ke,
+            chunk.skip_kv_gather,
+            None,
+        )
+    if chunk.local_cu_seq_lens is None or chunk.local_token_to_seq is None:
+        # Rejected BEFORE the empty branch: a local_total of 0 (the
+        # dataclass default) must not mask missing fields on a DCP>1
+        # chunk — that would fabricate an empty shard.
+        raise ValueError(
+            "DCP prefill chunk is missing local_cu_seq_lens/"
+            "local_token_to_seq (legacy manual metadata); refusing to "
+            "silently use the global pool mapping"
+        )
+    if chunk.local_total_seq_lens == 0:
+        # Empty local shard: no gather, no logits; the caller still
+        # produces the fixed-width invalid candidates for the merge.
+        empty_logits = torch.empty(
+            (q_num_rows, 0), dtype=torch.float32, device=k_quant_full.device
+        )
+        empty_map = torch.empty(0, dtype=torch.int32, device=k_quant_full.device)
+        empty_cu = torch.zeros(
+            chunk.num_reqs + 1, dtype=torch.int32, device=k_quant_full.device
+        )
+        return (
+            k_quant_full[:0],
+            k_scale_full[:0],
+            empty_cu,
+            empty_map,
+            chunk.cu_seqlen_ks,
+            chunk.cu_seqlen_ke,
+            True,  # skip the gather
+            empty_logits,
+        )
+    # EXACT local views: the gather consumes exactly local_total rows
+    # of the destination/scale and exactly len(map) entries. Only the
+    # sync-FREE shape check runs here; the value consistency
+    # (cu[-1] == local_total) is guaranteed by the builder's host
+    # counts and pinned by CPU tests — reading cu[-1] would be a
+    # per-layer GPU->host sync in the hot path.
+    local_total = chunk.local_total_seq_lens
+    if chunk.local_token_to_seq.shape[0] != local_total:
+        raise ValueError(
+            f"DCP prefill chunk local_token_to_seq length "
+            f"{chunk.local_token_to_seq.shape[0]} != local_total_seq_lens "
+            f"{local_total}"
+        )
+    return (
+        k_quant_full[:local_total],
+        k_scale_full[:local_total],
+        chunk.local_cu_seq_lens,
+        chunk.local_token_to_seq,
+        chunk.cu_seqlen_ks,
+        chunk.cu_seqlen_ke,
+        chunk.skip_kv_gather,
+        None,
     )
 
 
@@ -462,10 +577,26 @@ def sparse_attn_indexer_kpool(
             scales_spec,
         )
         for chunk in prefill_metadata.chunks if not short_prefill else ():
-            k_quant = k_quant_full[: chunk.total_seq_lens]
-            k_scale = k_scale_full[: chunk.total_seq_lens]
+            q_slice_pre = q_quant[chunk.token_start : chunk.token_end]
+            # The chunk's trusted topology fields select the DCP path.
+            chunk_dcp = chunk.dcp_world_size > 1
+            (
+                k_quant,
+                k_scale,
+                gather_cu,
+                gather_token_to_seq,
+                logits_ks,
+                logits_ke,
+                skip_gather,
+                empty_logits,
+            ) = _prefill_chunk_dcp_inputs(
+                chunk,
+                k_quant_full,
+                k_scale_full,
+                q_slice_pre.shape[0],
+            )
 
-            if not chunk.skip_kv_gather:
+            if not skip_gather:
                 if current_platform.is_rocm():
                     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
                         cp_gather_indexer_k_quant_cache_triton,
@@ -476,8 +607,8 @@ def sparse_attn_indexer_kpool(
                         k_quant,
                         k_scale,
                         chunk.block_table,
-                        chunk.cu_seq_lens,
-                        token_to_seq=chunk.token_to_seq,
+                        gather_cu,
+                        token_to_seq=gather_token_to_seq,
                     )
                 else:
                     ops.cp_gather_indexer_k_quant_cache(
@@ -485,7 +616,7 @@ def sparse_attn_indexer_kpool(
                         k_quant,
                         k_scale,
                         chunk.block_table,
-                        chunk.cu_seq_lens,
+                        gather_cu,
                     )
 
             q_slice = q_quant[chunk.token_start : chunk.token_end]
@@ -496,79 +627,202 @@ def sparse_attn_indexer_kpool(
             )
             # DeepGEMM scalar-type tags (zero-copy): MXFP4 values → int8
             # (kPackedFP4), scales → int32 squeezed to 1-D kv_sf / 2-D q_sf.
-            if use_fp4_cache:
-                q_slice_cast = q_slice.view(torch.int8)
-                k_quant_cast = k_quant.view(torch.int8)
-                k_scale_cast = k_scale.view(torch.int32).squeeze(-1)
+            if empty_logits is not None:
+                # Empty local shard: no native logits/topk on this
+                # rank, but it STILL enters the same merge — the
+                # all-(-1) local candidates participate in both
+                # collectives exactly like any other rank's, so the
+                # gather shapes stay uniform.
+                logits = empty_logits
+                num_rows = logits.shape[0]
+                select_k = (
+                    topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
+                )
+                if chunk_dcp:
+                    from vllm.distributed import get_dcp_group
+                    from vllm.v1.attention.backends.mla.dcp_pool_merge_utils import (
+                        select_global_pool_topk_dcp,
+                    )
+
+                    empty_ids = torch.full(
+                        (num_rows, select_k),
+                        -1,
+                        dtype=torch.int64,
+                        device=logits.device,
+                    )
+                    empty_scores = torch.full(
+                        (num_rows, select_k),
+                        float("-inf"),
+                        dtype=torch.float32,
+                        device=logits.device,
+                    )
+                    group = get_dcp_group()
+                    if (
+                        group.world_size != chunk.dcp_world_size
+                        or group.rank_in_group != chunk.dcp_rank
+                    ):
+                        raise ValueError(
+                            "DCP group topology "
+                            f"({group.world_size}, {group.rank_in_group}) does "
+                            f"not match the prefill chunk metadata "
+                            f"({chunk.dcp_world_size}, {chunk.dcp_rank})"
+                        )
+                    global_pool_ids, _ = select_global_pool_topk_dcp(
+                        empty_scores,
+                        empty_ids,
+                        logits_ks,
+                        logits_ke,
+                        chunk.pool_interleave,
+                        group,
+                        select_k,
+                        phase="prefill",
+                    )
+                    if index_kpool > 1:
+                        pool_ids = global_pool_ids
+                    else:
+                        topk_indices_buffer[
+                            chunk.token_start : chunk.token_end, :select_k
+                        ] = global_pool_ids.to(torch.int32)
+                elif index_kpool > 1:
+                    pool_topk = torch.full(
+                        (num_rows, select_k),
+                        -1,
+                        dtype=torch.int32,
+                        device=logits.device,
+                    )
+                else:
+                    topk_indices_buffer[
+                        chunk.token_start : chunk.token_end, :select_k
+                    ] = -1
             else:
-                q_slice_cast = q_slice
-                k_quant_cast = k_quant
-                k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-            if current_platform.is_rocm():
-                from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-                    rocm_fp8_mqa_logits,
-                )
+                if use_fp4_cache:
+                    q_slice_cast = q_slice.view(torch.int8)
+                    k_quant_cast = k_quant.view(torch.int8)
+                    k_scale_cast = k_scale.view(torch.int32).squeeze(-1)
+                else:
+                    q_slice_cast = q_slice
+                    k_quant_cast = k_quant
+                    k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
+                if current_platform.is_rocm():
+                    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+                        rocm_fp8_mqa_logits,
+                    )
 
-                assert q_scale_slice is None
-                logits = rocm_fp8_mqa_logits(
-                    q_slice_cast,
-                    (k_quant_cast, k_scale_cast),
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                )
-            else:
-                from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
+                    assert q_scale_slice is None
+                    logits = rocm_fp8_mqa_logits(
+                        q_slice_cast,
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        logits_ks,
+                        logits_ke,
+                    )
+                else:
+                    from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
 
-                logits = fp8_fp4_mqa_logits(
-                    (q_slice_cast, q_scale_slice),
-                    (k_quant_cast, k_scale_cast),
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    clean_logits=False,
-                )
-            num_rows = logits.shape[0]
+                    logits = fp8_fp4_mqa_logits(
+                        (q_slice_cast, q_scale_slice),
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        logits_ks,
+                        logits_ke,
+                        clean_logits=False,
+                    )
+                num_rows = logits.shape[0]
 
-            # kpool: logits are pool-granular (compress_ratio == index_kpool),
-            # so topk selects pools. We pick topk_tokens // kpool pools then
-            # expand each pool back to its kpool constituent tokens.
-            select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
-            if index_kpool > 1:
-                pool_topk = torch.empty(
-                    (num_rows, select_k), dtype=torch.int32, device=logits.device
+                # kpool: logits are pool-granular (compress_ratio ==
+                # index_kpool), so topk selects pools. We pick
+                # topk_tokens // kpool pools then expand each pool back
+                # to its kpool constituent tokens.
+                select_k = (
+                    topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
                 )
-                topk_dst = pool_topk
-            else:
-                topk_dst = topk_indices_buffer[
-                    chunk.token_start : chunk.token_end, :topk_tokens
-                ]
+                topk_dst = None
+                if index_kpool > 1:
+                    pool_topk = torch.empty(
+                        (num_rows, select_k), dtype=torch.int32, device=logits.device
+                    )
+                    topk_dst = pool_topk
+                else:
+                    topk_dst = topk_indices_buffer[
+                        chunk.token_start : chunk.token_end, :topk_tokens
+                    ]
 
-            if current_platform.is_xpu():
-                xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
-                    logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    topk_dst,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    select_k,
-                )
-            else:
-                torch.ops._C.top_k_per_row_prefill(
-                    logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    topk_dst,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    select_k,
-                )
+                if chunk_dcp:
+                    # DCP>1: the deterministic pure-torch LOCAL
+                    # selection (the native kernel's tie behavior at
+                    # the local K boundary is undocumented; dropping a
+                    # smaller-id equal-score candidate there cannot be
+                    # repaired by the later stable merge), then the
+                    # pack -> all_gather -> stable-select adapter for
+                    # the GLOBAL ids. The group is fetched lazily
+                    # (DCP branch only) and cross-checked against the
+                    # chunk's trusted topology fields — never inferred
+                    # from tensor identity.
+                    from vllm.distributed import get_dcp_group
+                    from vllm.v1.attention.backends.mla.dcp_pool_merge_utils import (
+                        select_global_pool_topk_dcp,
+                        select_local_pool_candidates,
+                    )
 
-            if index_kpool > 1:
+                    local_ids_sel, local_scores_sel = select_local_pool_candidates(
+                        logits, logits_ks, logits_ke, select_k
+                    )
+                    group = get_dcp_group()
+                    if (
+                        group.world_size != chunk.dcp_world_size
+                        or group.rank_in_group != chunk.dcp_rank
+                    ):
+                        raise ValueError(
+                            "DCP group topology "
+                            f"({group.world_size}, {group.rank_in_group}) does "
+                            f"not match the prefill chunk metadata "
+                            f"({chunk.dcp_world_size}, {chunk.dcp_rank})"
+                        )
+                    global_pool_ids, _ = select_global_pool_topk_dcp(
+                        logits,
+                        local_ids_sel,
+                        logits_ks,
+                        logits_ke,
+                        chunk.pool_interleave,
+                        group,
+                        select_k,
+                        phase="prefill",
+                    )
+                    if index_kpool > 1:
+                        # The expand consumes the int64 GLOBAL ids
+                        # directly — no int32 narrowing before it.
+                        pool_ids = global_pool_ids
+                    else:
+                        topk_indices_buffer[
+                            chunk.token_start : chunk.token_end, :select_k
+                        ] = global_pool_ids.to(torch.int32)
+                elif current_platform.is_xpu():
+                    xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
+                        logits,
+                        logits_ks,
+                        logits_ke,
+                        topk_dst,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        select_k,
+                    )
+                else:
+                    torch.ops._C.top_k_per_row_prefill(
+                        logits,
+                        logits_ks,
+                        logits_ke,
+                        topk_dst,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        select_k,
+                    )
+
+            if index_kpool > 1 and not chunk_dcp:
+                # The W1 native path: pool ids from the local topk.
                 pool_ids = pool_topk.to(torch.int64)
+            if index_kpool > 1:
                 if positions is not None:
                     # Fused expand-pools + append-tail into one Triton kernel
                     # (replaces ~25 elementwise ops). seq_len is token-granular
@@ -592,6 +846,38 @@ def sparse_attn_indexer_kpool(
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
+        # DCP decode entry validation — BEFORE any tail write, padding
+        # pack, or native logits: the merge requires inputs the later
+        # stages cannot recover, so reject early instead of running
+        # them for nothing.
+        if decode_metadata.dcp_world_size > 1:
+            if decode_metadata.indices is not None:
+                # The indices/varlen decode layout's row semantics are
+                # NOT the [B*next_n] alignment the merge assumes; the
+                # caller-level check makes the rejection explicit (the
+                # helper cannot see this field).
+                raise ValueError(
+                    "DCP sparse indexer decode does not support the "
+                    "indices/varlen layout (decode_metadata.indices is "
+                    "set); refusing to guess a row alignment"
+                )
+            if index_kpool <= 1:
+                # Only the GLM KPool path (R > 1) is adapted; the
+                # token-granular expand contract is not wired for DCP.
+                raise NotImplementedError(
+                    "DCP sparse indexer decode supports only "
+                    "index_kpool > 1 (pool-granular) batches; got "
+                    f"index_kpool={index_kpool}"
+                )
+            if positions is None:
+                # The tail expansion needs the GLOBAL token lengths;
+                # with positions absent they cannot be reconstructed
+                # (the metadata's seq_lens are local POOL lengths at
+                # this point) — reject before any work.
+                raise ValueError(
+                    "DCP sparse indexer decode requires positions to "
+                    "recover global token lengths for the tail expansion"
+                )
         kv_cache_raw = kv_cache  # raw [num_blocks, block_size, head_dim+4] for writes
         kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
 
@@ -797,57 +1083,108 @@ def sparse_attn_indexer_kpool(
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.
         select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
-        if index_kpool > 1:
-            pool_topk = torch.empty(
-                (num_rows, select_k), dtype=torch.int32, device=logits.device
+        decode_dcp = decode_metadata.dcp_world_size > 1
+        if decode_dcp:
+            # DCP>1: the deterministic pure-torch LOCAL selection with
+            # per-token bounds derived from the SAME seq_lens the
+            # paged-MQA logits consumed (each query row's own rank-local
+            # compressed causal bound — never a request-level length
+            # broadcast over MTP tokens; padded rows clamp to 0 and
+            # still participate in both collectives with fixed K
+            # invalid candidates), then the pack -> all_gather ->
+            # stable-select adapter for the GLOBAL ids.
+            from vllm.distributed import get_dcp_group
+            from vllm.v1.attention.backends.mla.dcp_pool_merge_utils import (
+                derive_decode_row_bounds,
+                select_global_pool_topk_dcp,
+                select_local_pool_candidates,
             )
-            topk_dst = pool_topk
-        else:
-            topk_dst = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if current_platform.is_cuda() and select_k in (512, 1024, 2048):
-            workspace_manager = current_workspace_manager()
-            (topk_workspace,) = workspace_manager.get_simultaneous(
-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+            dec_starts, dec_ends = derive_decode_row_bounds(
+                seq_lens, num_rows, next_n, decode_lens
             )
-            torch.ops._C.persistent_topk(
+            local_ids_dec, _ = select_local_pool_candidates(
+                logits, dec_starts, dec_ends, select_k
+            )
+            group = get_dcp_group()
+            if (
+                group.world_size != decode_metadata.dcp_world_size
+                or group.rank_in_group != decode_metadata.dcp_rank
+            ):
+                raise ValueError(
+                    "DCP group topology "
+                    f"({group.world_size}, {group.rank_in_group}) does not "
+                    "match the decode metadata "
+                    f"({decode_metadata.dcp_world_size}, "
+                    f"{decode_metadata.dcp_rank})"
+                )
+            global_pool_ids_dec, _ = select_global_pool_topk_dcp(
                 logits,
-                seq_lens,
-                topk_dst,
-                topk_workspace,
+                local_ids_dec,
+                dec_starts,
+                dec_ends,
+                decode_metadata.pool_interleave,
+                group,
                 select_k,
-                attn_metadata_narrowed.max_seq_len,
+                phase="decode",
             )
+            pool_ids = global_pool_ids_dec
+            topk_dst = None
         else:
-            if current_platform.is_xpu():
-                xpu_ops.top_k_per_row_decode(  # type: ignore[attr-defined]
+            if index_kpool > 1:
+                pool_topk = torch.empty(
+                    (num_rows, select_k), dtype=torch.int32, device=logits.device
+                )
+                topk_dst = pool_topk
+            else:
+                topk_dst = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+
+            if current_platform.is_cuda() and select_k in (512, 1024, 2048):
+                workspace_manager = current_workspace_manager()
+                (topk_workspace,) = workspace_manager.get_simultaneous(
+                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                )
+                torch.ops._C.persistent_topk(
                     logits,
-                    next_n,
                     seq_lens,
                     topk_dst,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
+                    topk_workspace,
                     select_k,
+                    attn_metadata_narrowed.max_seq_len,
                 )
             else:
-                torch.ops._C.top_k_per_row_decode(
-                    logits,
-                    next_n,
-                    seq_lens,
-                    topk_dst,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    select_k,
-                )
+                if current_platform.is_xpu():
+                    xpu_ops.top_k_per_row_decode(  # type: ignore[attr-defined]
+                        logits,
+                        next_n,
+                        seq_lens,
+                        topk_dst,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        select_k,
+                    )
+                else:
+                    torch.ops._C.top_k_per_row_decode(
+                        logits,
+                        next_n,
+                        seq_lens,
+                        topk_dst,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        select_k,
+                    )
 
         # Resolve to token-level indices in the output buffer.
-        if index_kpool > 1:
+        if index_kpool > 1 and not decode_dcp:
             pool_ids = pool_topk.to(torch.int64)
-            n = pool_topk.shape[0]
-            # Decode seq_lens are pool-granular; recover token lengths from
-            # positions using the padded [B, next_n] row layout when needed.
+        if index_kpool > 1:
+            n = num_rows
+            # Decode seq_lens are pool-granular; recover GLOBAL token
+            # lengths from positions using the padded [B, next_n] row
+            # layout when needed — the local pool count is NEVER used
+            # as a token length.
             if positions is not None:
                 dec_seq = _decode_topk_seq_lens(
                     positions,

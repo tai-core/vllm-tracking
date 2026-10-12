@@ -242,6 +242,24 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     local_cu_seq_lens: torch.Tensor | None = None
     local_total_seq_lens: int = 0
     max_local_total_seq_lens: int = 0
+    # Per-LOCAL-pool request index [local_total_seq_lens] int32 under
+    # DCP (each rank-local pool -> its request's index within the
+    # chunk); ALIASES token_to_seq when DCP is off. Legacy manual
+    # metadata may leave this None — DCP>1 consumers MUST reject None
+    # instead of silently using the global map.
+    local_token_to_seq: torch.Tensor | None = None
+    # The builder's ACTUAL DCP world size for this chunk (explicit
+    # topology; default 1 keeps legacy manual metadata on the W1
+    # path). Consumers must never infer parallelism from tensor
+    # identity/aliasing — a W1 clone of cu_seq_lens is still W1, and
+    # a DCP>1 chunk missing the local fields is a hard error.
+    dcp_world_size: int = 1
+    # The builder's ACTUAL DCP rank and POOL-space interleave J for
+    # this chunk (trusted fields, same provenance as
+    # dcp_world_size; defaults 0/1 keep legacy W1 metadata valid).
+    # The merge consumes these instead of re-deriving them.
+    dcp_rank: int = 0
+    pool_interleave: int = 1
 
 
 _BUILD_PREFILL_CHUNK_METADATA_INPUT_VARIANTS = (
@@ -380,16 +398,27 @@ class BuildPrefillChunkMetadataKernel(
         index_kpool = getattr(hf_config, "index_kpool", None)
         if index_kpool and index_kpool > 1 and index_kpool not in compress_ratios:
             compress_ratios = compress_ratios + (index_kpool,)
-        return self._trace_dispatch(self.dispatch)(
-            query_slice_start=WarmupIntRange(0, 2),
-            query_slice_stop=(1, 2 * max_tokens - 1, 2 * max_tokens),
-            DCP_RANK=dcp_rank,
-            DCP_WORLD=dcp_world,
-            DCP_INTERLEAVE=dcp_interleave,
-            BLOCK_SIZE=self.BLOCK_SIZE,
-            COMPRESS_RATIO=list(compress_ratios),
-            input_variant=_BUILD_PREFILL_CHUNK_METADATA_INPUT_VARIANTS,
-        )
+        # Each ratio pairs with its OWN pool-space interleave
+        # J = I // R so the warmup compile keys match the runtime
+        # derivation exactly (no wrong-unit key is cached). An
+        # unsupported (I, R, W) combination raises here — fail-closed
+        # — rather than warming a key the runtime would reject.
+        warmups = []
+        for ratio in compress_ratios:
+            pool_interleave = derive_pool_interleave(dcp_interleave, ratio, dcp_world)
+            warmups.extend(
+                self._trace_dispatch(self.dispatch)(
+                    query_slice_start=WarmupIntRange(0, 2),
+                    query_slice_stop=(1, 2 * max_tokens - 1, 2 * max_tokens),
+                    DCP_RANK=dcp_rank,
+                    DCP_WORLD=dcp_world,
+                    DCP_INTERLEAVE=pool_interleave,
+                    BLOCK_SIZE=self.BLOCK_SIZE,
+                    COMPRESS_RATIO=[ratio],
+                    input_variant=_BUILD_PREFILL_CHUNK_METADATA_INPUT_VARIANTS,
+                )
+            )
+        return warmups
 
     def compile(self, compile_key: CompileKey) -> None:
         warmup = getattr(self.kernel, "warmup", None)
@@ -474,6 +503,13 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_is_uniform: bool = True
     write_max_decode_len: int = 0
     indices: torch.Tensor | None = None
+    # Trusted DCP topology for the decode merge (same provenance as
+    # the prefill chunk fields; defaults 1/0/1 keep legacy W1
+    # metadata valid). Consumers must never infer parallelism from
+    # tensor shapes or object identity.
+    dcp_world_size: int = 1
+    dcp_rank: int = 0
+    pool_interleave: int = 1
 
 
 @dataclass
@@ -502,10 +538,46 @@ def compute_kpool_tail_slot_mapping(
     positions: torch.Tensor,
     num_actual_tokens: int,
     num_reqs: int,
-    kpool: int,
+    tail_capacity: int | None = None,
     out: torch.Tensor | None = None,
+    *,
+    kpool: int | None = None,
 ) -> torch.Tensor:
-    """Map every token to its request's one circular tail block."""
+    """Map every token to its request's one circular tail block.
+
+    ``tail_capacity`` is the PHYSICAL ring capacity C (the tail
+    spec's block_size — NOT the logical pool size): the slot encodes
+    ``physical_block * C + pos % C``, matching the seed/decode
+    kernels' tslot decode. Each request uses its own block, so
+    tokens never cross requests.
+
+    Validity is RECOMPUTED per token: a token maps to a real slot
+    only if its position is non-negative AND its request resolves to
+    a valid row with a non-negative block id; everything else
+    (padded positions, invalid requests, negative block ids) maps to
+    -1 — never a bogus address formed from a negative remainder.
+    The incoming ``slot_mapping``'s sign is NOT trusted: the generic
+    value may be -1 for unrelated reasons (other shards, compressed
+    slots) while the tail needs a REAL slot for every real token,
+    and conversely a stale positive generic value must not leak
+    through for a padded token.
+    """
+    # Legacy keyword alias: `kpool` was the parameter's old name
+    # (it always meant the tail allocation size — the physical
+    # capacity). Both may be given only if they agree.
+    if kpool is not None:
+        if tail_capacity is not None and kpool != tail_capacity:
+            raise ValueError(
+                f"conflicting tail capacities: tail_capacity="
+                f"{tail_capacity} vs kpool={kpool}"
+            )
+        tail_capacity = kpool
+    if tail_capacity is None:
+        raise ValueError("tail_capacity (or the legacy kpool) is required")
+    if type(tail_capacity) is not int or tail_capacity < 1:
+        raise ValueError(
+            f"tail_capacity must be a positive exact int, got {tail_capacity!r}"
+        )
     if out is None:
         out = slot_mapping.clone()
     else:
@@ -513,12 +585,25 @@ def compute_kpool_tail_slot_mapping(
         out.copy_(slot_mapping)
     if num_actual_tokens == 0:
         return out
+    if num_reqs <= 0 or block_table.shape[0] == 0:
+        # No valid requests: every token maps to -1 (never an
+        # index_select on an empty table).
+        out[:num_actual_tokens] = -1
+        return out
     tokens = torch.arange(num_actual_tokens, device=slot_mapping.device)
-    req = torch.searchsorted(query_start_loc, tokens, right=True) - 1
-    req = req.clamp_(min=0, max=num_reqs - 1)
-    own_block = block_table[:num_reqs, 0].index_select(0, req).to(torch.int64)
+    raw_req = torch.searchsorted(query_start_loc, tokens, right=True) - 1
+    # Validity from the RAW request index (BEFORE the clamp): a
+    # token beyond the last request's range belongs to no request
+    # and must not inherit the clamped row's block.
+    req_valid = (raw_req >= 0) & (raw_req < num_reqs)
+    safe_req = raw_req.clamp_(min=0, max=num_reqs - 1)
+    own_block = block_table[:num_reqs, 0].index_select(0, safe_req).to(torch.int64)
     pos = positions[:num_actual_tokens].to(torch.int64)
-    out[:num_actual_tokens] = own_block * kpool + torch.remainder(pos, kpool)
+    valid = (pos >= 0) & req_valid & (own_block >= 0)
+    computed = own_block * tail_capacity + torch.remainder(pos, tail_capacity)
+    out[:num_actual_tokens] = torch.where(
+        valid, computed, torch.full_like(computed, -1)
+    )
     return out
 
 
@@ -558,6 +643,9 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
             slot_mapping_buffer = self.slot_mapping_buffer[
                 : slot_mapping.numel()
             ].view_as(slot_mapping)
+            # kv_cache_spec.block_size IS the physical tail capacity
+            # C (the spec's block_size follows the ring allocation);
+            # the logical pool size never enters the slot mapping.
             slot_mapping = compute_kpool_tail_slot_mapping(
                 slot_mapping,
                 common_attn_metadata.block_table_tensor,
@@ -622,6 +710,242 @@ def _supports_native_decode(next_n: int) -> bool:
     return next_n in (1, 2)
 
 
+# Backend capability flag: the wired HCU plugin's indexer patch may set
+# this on the builder CLASS (never an instance field, never a user
+# parameter) to attest that THIS deployment's compressed-indexer DCP
+# implementation (merge primitives, kernels, collectives) is present.
+# Default False everywhere in core: the DCP+compression combination
+# below stays rejected unless the flag is explicitly granted.
+SUPPORTS_GLM_KPOOL_BF16_DCP = False
+# The FP8 MLA + compressed-indexer opt-in: DEFAULT FALSE in core. Only a
+# matching HCU plugin indexer patch may set this True on the class (it
+# attests the wired FP8 DS-656 MLA storage with the compressed indexer:
+# the rank-local writer/reader, the collectives, and the runtime gate
+# this worktree validated). When True, the validator below admits the
+# global MLA cache_dtype 'fp8_ds_mla' IN ADDITION to 'bfloat16' for the
+# restricted candidate; the INDEXER's own spec format is checked
+# separately (the actual registered cache's spec — never assumed from
+# the global dtype). NOT a user parameter.
+SUPPORTS_GLM_KPOOL_FP8_MLA_DCP = False
+
+
+def validate_dcp_compressed_indexer_support(
+    vllm_config: VllmConfig,
+    compress_ratio: int,
+    cp_kv_cache_interleave_size: int,
+    *,
+    capability_enabled: bool,
+    actual_spec: MLAAttentionSpec | None = None,
+    fp8_mla_enabled: bool = False,
+) -> None:
+    """The capability predicate replacing the two blanket DCP guards.
+
+    Only the fully-validated combination passes — DCP>1 together with
+    compressed (R>1) or interleaved (I>1) indexer KV requires ALL of:
+    the backend capability flag (set only by the wired HCU plugin
+    patch), a REAL ``Glm5NextTextConfig`` text config (an
+    ``isinstance`` check against the imported real class — resolved
+    through ``model_config.hf_text_config``; a same-named unrelated
+    class is NOT accepted), ``index_kpool_compress`` enabled with
+    ``index_kpool == R > 1``, PCP==1, pool-coherent interleave
+    (I >= R, I % R == 0), the ACTUAL spec layout proof (when
+    ``actual_spec`` is given — the constructor always passes it —
+    ``actual_spec.block_size % I == 0`` and
+    ``actual_spec.tokens_per_state == R``; the cache_config
+    ``block_size`` alone is the CONFIG value, not a layout proof), an
+    explicitly authorized MLA KV ``cache_dtype == "bfloat16"``
+    ("auto" is rejected: resolving it requires the model dtype and
+    is NOT proven here), no ``kv_transfer_config`` (single-node
+    candidate), and a RESOLVED non-negative MTP ``S`` (a present
+    speculative_config with ``num_speculative_tokens is None`` is
+    rejected with a named reason — it would fail later in the tail
+    helper after buffers are allocated; no speculative_config means
+    S = 0 and is legal) with the tail capacity derived by the
+    existing ``Glm5NextTailCache`` contract (``C = R + S`` when
+    DCP>1). Everything else — V4, plain NVIDIA, FP8 MLA, PCP>1,
+    transfer, misaligned I, capability flag False — fails CLOSED
+    with a named reason. DCP1 keeps the legacy behavior for ANY
+    (I, R) and returns immediately (no rejection path).
+    """
+    parallel_config = vllm_config.parallel_config
+    dcp_world = parallel_config.decode_context_parallel_size
+    if dcp_world <= 1:
+        # DCP1: legacy behavior for any (I, R); nothing to validate.
+        return
+    interleave = cp_kv_cache_interleave_size
+    if interleave <= 1 and compress_ratio <= 1:
+        # DCP without compression/interleave: the long-supported path.
+        return
+    # --- DCP>1 with compression (R>1) and/or interleave (I>1): the
+    # restricted capability zone. Fail closed with named reasons.
+
+    def _reject(reason: str) -> None:
+        raise NotImplementedError(
+            "DCP sparse indexer with compressed/interleaved KV requires "
+            f"the GLM kpool BF16 DCP capability (all conditions must hold); "
+            f"rejected: {reason}."
+        )
+
+    if not capability_enabled:
+        _reject(
+            "backend capability flag supports_glm_kpool_bf16_dcp is not "
+            "granted (default False; only the wired HCU plugin indexer "
+            "patch may set it)"
+        )
+    model_config = vllm_config.model_config
+    text_config = getattr(model_config, "hf_text_config", None)
+    from vllm.transformers_utils.configs.glm5_next import Glm5NextTextConfig
+
+    if (
+        not isinstance(text_config, Glm5NextTextConfig)
+        or getattr(text_config, "model_type", None) != "glm5_next_text"
+    ):
+        # The nested/real text config must BE the real GLM text config
+        # CLASS (isinstance — a same-named fabricated type is not
+        # accepted; hf_text_config resolves the outer glm5_next
+        # wrapper). Real HF subclasses pass per HF semantics.
+        _reject(
+            "model text config is not the real Glm5NextTextConfig "
+            f"(got {type(text_config).__name__}, model_type="
+            f"{getattr(text_config, 'model_type', None)!r})"
+        )
+    if getattr(text_config, "index_kpool_compress", False) is not True:
+        _reject("index_kpool_compress is not enabled")
+    model_kpool = getattr(text_config, "index_kpool", None)
+    if (
+        type(model_kpool) is not int
+        or model_kpool != compress_ratio
+        or model_kpool <= 1
+    ):
+        _reject(
+            f"index_kpool ({model_kpool!r}) does not match the cache "
+            f"compress_ratio ({compress_ratio!r}) or is not > 1"
+        )
+    if parallel_config.prefill_context_parallel_size != 1:
+        _reject(
+            "prefill_context_parallel_size must be 1 (got "
+            f"{parallel_config.prefill_context_parallel_size})"
+        )
+    # Pool-coherent interleave: derive_pool_interleave is the single
+    # source of truth for I>=R and I%R==0 (it raises ValueError with
+    # the exact reason).
+    derive_pool_interleave(interleave, compress_ratio, dcp_world)
+    block_size = vllm_config.cache_config.block_size
+    if type(block_size) is not int or block_size % interleave != 0:
+        _reject(
+            f"cache block_size ({block_size!r}) is not divisible by "
+            f"cp_kv_cache_interleave_size ({interleave!r}) — the storage "
+            "layout is incompatible with interleaved DCP sharding"
+        )
+    if actual_spec is not None:
+        # The ACTUAL spec layout proof (the constructor always passes
+        # the spec it will allocate against): the spec's own block
+        # size must tile the interleave, and its tokens_per_state
+        # must agree with the compress_ratio the caller derived. The
+        # cache_config block_size above is the CONFIG value; this is
+        # the LAYOUT the buffers will actually use.
+        spec_block = actual_spec.block_size
+        if type(spec_block) is not int or spec_block % interleave != 0:
+            _reject(
+                f"actual kv_cache_spec block_size ({spec_block!r}) is not "
+                f"divisible by cp_kv_cache_interleave_size "
+                f"({interleave!r}) — the allocated layout is incompatible "
+                "with interleaved DCP sharding"
+            )
+        spec_tps = actual_spec.tokens_per_state
+        if type(spec_tps) is not int or spec_tps != compress_ratio:
+            _reject(
+                f"actual kv_cache_spec tokens_per_state ({spec_tps!r}) "
+                f"does not match the compress_ratio ({compress_ratio!r})"
+            )
+    cache_dtype = vllm_config.cache_config.cache_dtype
+    # The GLOBAL MLA cache dtype: 'bfloat16' (the BF16 candidate) or,
+    # ONLY under the separate FP8 MLA opt-in, 'fp8_ds_mla' (the FP8
+    # DS-656 MLA storage with the compressed indexer — the global MLA
+    # dtype, DISTINCT from the indexer's own spec format checked
+    # separately below). "auto" resolution is NOT proven here (it
+    # depends on the model dtype path) — fail closed, named.
+    if cache_dtype == "fp8_ds_mla":
+        if not fp8_mla_enabled:
+            _reject(
+                "cache_dtype 'fp8_ds_mla' requires the separate FP8 MLA "
+                "opt-in (SUPPORTS_GLM_KPOOL_FP8_MLA_DCP, default False; "
+                "only the wired HCU plugin indexer patch may set it)"
+            )
+        # The FP8 grant's OWN restrictions: the EXACT single-module
+        # MTP4 profile (method 'mtp', resolved int S == 4,
+        # parallel_drafting False, draft_model_config present,
+        # use_multi_module_mtp() False — the OBSERVED production
+        # MTP4 class is the single-module MTPSpeculator; the class
+        # is NEVER guessed from S=4 alone and MultiModule stays
+        # rejected for FP8; the draft KV override must be None or
+        # fp8_ds_mla), or NO speculative config at all (the verified
+        # MTP-off FP8 candidate — unchanged), the ag_rs comm
+        # backend, eager compilation, and no KV transfer (the last
+        # re-checked below for BOTH dtypes).
+        from vllm.v1.attention.backends.mla.dcp_mtp_capability import (
+            _fp8_single_module_mtp4_profile,
+        )
+
+        if vllm_config.speculative_config is not None and not (
+            _fp8_single_module_mtp4_profile(vllm_config)
+        ):
+            _reject(
+                "cache_dtype 'fp8_ds_mla' with a speculative config "
+                "requires the EXACT single-module MTP4 profile "
+                "(method 'mtp', resolved int S == 4, "
+                "parallel_drafting False, draft_model_config present, "
+                "use_multi_module_mtp() False, draft KV override None "
+                "or fp8_ds_mla); every other MTP shape (MultiModule, "
+                "other S, parallel drafting, wrong method/override) "
+                "stays rejected"
+            )
+        if parallel_config.dcp_comm_backend != "ag_rs":
+            _reject(
+                "cache_dtype 'fp8_ds_mla' requires the default 'ag_rs' DCP "
+                f"comm backend (got {parallel_config.dcp_comm_backend!r})"
+            )
+        from vllm.config import CompilationMode
+
+        if vllm_config.compilation_config.mode != CompilationMode.NONE:
+            _reject(
+                "cache_dtype 'fp8_ds_mla' requires eager compilation "
+                "(CompilationMode.NONE)"
+            )
+        if vllm_config.kv_transfer_config is not None:
+            _reject(
+                "cache_dtype 'fp8_ds_mla' requires no KV transfer config "
+                "(the candidate is single-node)"
+            )
+    elif cache_dtype != "bfloat16":
+        _reject(
+            f"cache_dtype must be explicitly 'bfloat16' for this candidate "
+            f"(got {cache_dtype!r}; 'auto' is not resolved to BF16 here; "
+            f"'fp8_ds_mla' requires the separate FP8 opt-in)"
+        )
+    if vllm_config.kv_transfer_config is not None:
+        _reject("kv_transfer_config is set (the candidate is single-node)")
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None:
+        num_spec = 0  # no spec config: S = 0 is legal
+    else:
+        num_spec = speculative_config.num_speculative_tokens
+        if num_spec is None:
+            # A present-but-unresolved speculative config would fail
+            # later in the tail helper (after buffers are allocated);
+            # reject HERE with the named reason instead.
+            _reject(
+                "speculative_config is present but "
+                "num_speculative_tokens is not resolved (None)"
+            )
+        if type(num_spec) is not int or num_spec < 0:
+            _reject(f"num_speculative_tokens is not a non-negative int ({num_spec!r})")
+    # The tail capacity C = R + S is derived by Glm5NextTailCache from
+    # the SAME vllm_config (its own DCP>1 branch); the 1-block copy
+    # strategy and C>R-with-transfer rejection live THERE. This
+    # validator does not re-derive or fake-check it.
+
+
 def _use_flattening(vllm_config: VllmConfig) -> bool:
     speculative_config = vllm_config.speculative_config
     next_n = 1 + vllm_config.num_speculative_tokens
@@ -637,6 +961,15 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     # so this is None; its own split uses self.decode_threshold.
     reorder_batch_threshold: int | None = None
     requires_block_table_width = True
+    # Backend capability for the GLM kpool BF16 DCP candidate: DEFAULT
+    # FALSE in core. Only a matching HCU plugin indexer patch may set
+    # this True on the class (it attests the wired implementation —
+    # the merge primitives, kernels, and collectives this worktree
+    # validated). This is NOT a user parameter; absence of the plugin
+    # keeps DCP+compression rejected exactly as before.
+    supports_glm_kpool_bf16_dcp = SUPPORTS_GLM_KPOOL_BF16_DCP
+    # Same restricted opt-in pattern for the FP8 MLA storage variant.
+    supports_glm_kpool_fp8_mla_dcp = SUPPORTS_GLM_KPOOL_FP8_MLA_DCP
 
     @classmethod
     def get_cudagraph_support(
@@ -657,15 +990,34 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
-        # The DCP sparse-indexer code is parameterized by interleave size, but
-        # interleave > 1 is not yet validated end-to-end (gsm8k parity fails),
-        # so fail closed here rather than silently produce wrong output.
-        if self.dcp_world_size > 1 and self.cp_kv_cache_interleave_size > 1:
-            raise NotImplementedError(
-                "DCP sparse indexer currently supports only "
-                f"cp_kv_cache_interleave_size=1 (got "
-                f"{self.cp_kv_cache_interleave_size})."
-            )
+        # KV compression. Default to 1 for no compression. Determined
+        # UP FRONT (before any device buffer allocation) so the DCP
+        # capability predicate below can reject unsupported
+        # combinations without first allocating large GPU buffers.
+        self.compress_ratio = 1
+        # Get compress_ratio for DeepseekV4 support
+        if isinstance(self.kv_cache_spec, MLAAttentionSpec):
+            # MLA compression is a whole number of tokens per state (fractions
+            # are whisper block pooling and never reach MLA).
+            assert isinstance(self.kv_cache_spec.tokens_per_state, int)
+            self.compress_ratio = self.kv_cache_spec.tokens_per_state
+        # The DCP+compression/interleave capability predicate (replaces
+        # the former blanket rejections): DCP>1 with R>1 or I>1 passes
+        # ONLY through the validated GLM kpool BF16 candidate; every
+        # other combination fails closed with a named reason. DCP1 and
+        # the R1/I1 DCP path keep the legacy behavior untouched.
+        validate_dcp_compressed_indexer_support(
+            self.vllm_config,
+            self.compress_ratio,
+            self.cp_kv_cache_interleave_size,
+            capability_enabled=type(self).supports_glm_kpool_bf16_dcp,
+            actual_spec=(
+                self.kv_cache_spec
+                if isinstance(self.kv_cache_spec, MLAAttentionSpec)
+                else None
+            ),
+            fp8_mla_enabled=type(self).supports_glm_kpool_fp8_mla_dcp,
+        )
         # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
         self.num_speculative_tokens = (
@@ -742,20 +1094,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.scheduler_metadata_buffer = torch.empty(
             (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
         )
-
-        # KV compression. Default to 1 for no compression.
-        self.compress_ratio = 1
-        # Get compress_ratio for DeepseekV4 support
-        if isinstance(self.kv_cache_spec, MLAAttentionSpec):
-            # MLA compression is a whole number of tokens per state (fractions
-            # are whisper block pooling and never reach MLA).
-            assert isinstance(self.kv_cache_spec.tokens_per_state, int)
-            self.compress_ratio = self.kv_cache_spec.tokens_per_state
-        if self.dcp_world_size > 1 and self.compress_ratio > 1:
-            raise NotImplementedError(
-                "DCP is not supported with sparse indexer KV compression "
-                f"(compress_ratio={self.compress_ratio})."
-            )
 
         # Pre-allocate buffers for CUDA graph compatibility when
         if self.compress_ratio > 1:
@@ -900,15 +1238,44 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens_buffer = self.decode_seq_lens_buffer[
                     : num_decodes * max_decode_len
                 ].view(num_decodes, max_decode_len)
-                # Clamp at 0: padding requests have seq_len == 0, which would
-                # otherwise make token 0 negative (next_n=2 gives 0-2+1+0 = -1).
-                # Downstream kernels read these as uint32, turning -1 into ~4e9.
-                seq_lens_buffer[:] = (
-                    seq_lens.unsqueeze(1)
-                    - max_decode_len
-                    + 1
-                    + self.offsets_buffer[:max_decode_len]
-                ).clamp_(min=0)
+                if self.dcp_world_size > 1:
+                    # DCP: build the per-token GLOBAL bounds from each
+                    # request's ACTUAL decode_len — token j's bound is
+                    # L_b - decode_len_b + 1 + j for j < decode_len_b
+                    # and 0 (masked) beyond — NOT from the batch-wide
+                    # max_decode_len. With the legacy construction a
+                    # short request's REAL query row gets the wrong
+                    # bound (e.g. L=[10,7], decode_lens=[2,1],
+                    # next_n=2: legacy [[9,10],[6,7]] — row 6 for the
+                    # actual token whose true bound is 7) and its pad
+                    # row gets a spurious positive bound; the DCP
+                    # merge would then read both rows as valid against
+                    # localized bounds. The mask zeroes pad rows
+                    # BEFORE localization and //R; W1 keeps the legacy
+                    # construction byte-for-byte.
+                    per_req = (
+                        seq_lens.unsqueeze(1)
+                        - decode_lens.unsqueeze(1)
+                        + 1
+                        + self.offsets_buffer[:max_decode_len]
+                    )
+                    valid_j = self.offsets_buffer[:max_decode_len] < (
+                        decode_lens.unsqueeze(1)
+                    )
+                    seq_lens_buffer[:] = torch.where(
+                        valid_j, per_req.clamp_min(0), torch.zeros_like(per_req)
+                    )
+                else:
+                    # Clamp at 0: padding requests have seq_len == 0, which
+                    # would otherwise make token 0 negative (next_n=2 gives
+                    # 0-2+1+0 = -1). Downstream kernels read these as uint32,
+                    # turning -1 into ~4e9.
+                    seq_lens_buffer[:] = (
+                        seq_lens.unsqueeze(1)
+                        - max_decode_len
+                        + 1
+                        + self.offsets_buffer[:max_decode_len]
+                    ).clamp_(min=0)
                 seq_lens = seq_lens_buffer
             return seq_lens, block_table, decode_lens, num_decodes, requires_padding
 
@@ -1011,6 +1378,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 self.kv_cache_spec.num_states,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
+                dcp_world_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                pool_interleave=derive_pool_interleave(
+                    self.cp_kv_cache_interleave_size,
+                    self.compress_ratio,
+                    self.dcp_world_size,
+                ),
             )
             if self.pcp_world_size > 1:
                 compressed_slot_mapping = get_pcp_group().all_gather(
@@ -1227,6 +1601,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
                 decode_is_uniform=write_is_uniform,
                 write_max_decode_len=max_decode_len,
+                dcp_world_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                pool_interleave=derive_pool_interleave(
+                    self.cp_kv_cache_interleave_size,
+                    self.compress_ratio,
+                    self.dcp_world_size,
+                ),
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(
@@ -1242,6 +1623,55 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
 
         return attn_metadata
+
+
+def derive_pool_interleave(
+    cp_kv_cache_interleave_size: int,
+    compress_ratio: int,
+    dcp_world_size: int,
+) -> int:
+    """Derive the POOL-space interleave J from the TOKEN-space I.
+
+    The public ``cp_kv_cache_interleave_size`` stays in TOKEN units
+    (I). Pool-granular DCP localization (pool-granular lengths, the
+    prefill chunk kernel's DCP_INTERLEAVE, and the compressed slot
+    mapping) must shard in POOL units: J = I // R. Requirements for
+    DCP with compression (W > 1 and R > 1): I >= R and I % R == 0
+    (pool-coherent sharding; every pool's R tokens sit on one rank).
+    DCP1 (W == 1) keeps the legacy behavior for ANY I and R — the
+    value is unused there and 1 is returned for I == 1 exactly as
+    before. R == 1 keeps J == I (no compression, token == pool).
+    """
+    if type(cp_kv_cache_interleave_size) is not int or (
+        cp_kv_cache_interleave_size < 1
+    ):
+        raise ValueError(
+            "cp_kv_cache_interleave_size must be a positive exact "
+            f"int, got {cp_kv_cache_interleave_size!r}"
+        )
+    if type(compress_ratio) is not int or compress_ratio < 1:
+        raise ValueError(
+            f"compress_ratio must be a positive exact int, got {compress_ratio!r}"
+        )
+    if type(dcp_world_size) is not int or dcp_world_size < 1:
+        raise ValueError(
+            f"dcp_world_size must be a positive exact int, got {dcp_world_size!r}"
+        )
+    if dcp_world_size == 1 or compress_ratio == 1:
+        # Legacy/unused path: DCP1 never localizes; R==1 means token
+        # IS pool. Preserve the historical value (1 for I==1).
+        return cp_kv_cache_interleave_size
+    if (
+        cp_kv_cache_interleave_size < compress_ratio
+        or cp_kv_cache_interleave_size % compress_ratio != 0
+    ):
+        raise ValueError(
+            "DCP with compressed indexer KV requires "
+            "cp_kv_cache_interleave_size >= compress_ratio and divisible "
+            f"by it (pool-coherent sharding); got interleave="
+            f"{cp_kv_cache_interleave_size}, compress_ratio={compress_ratio}"
+        )
+    return cp_kv_cache_interleave_size // compress_ratio
 
 
 def build_prefill_chunk_metadata(
@@ -1276,6 +1706,16 @@ def build_prefill_chunk_metadata(
     local_cu_seq_lens = cu_seq_lens
     local_total_seq_lens = total_seq_lens
     max_local_total_seq_lens = total_seq_lens
+    # Aliases the global map when DCP is off (same tensor, same
+    # semantics: one entry per pool in request order).
+    local_token_to_seq = token_to_seq
+    # The POOL-space interleave for every DCP localization below. The
+    # public parameter stays TOKEN units (I); pool-granular lengths
+    # shard in pool units (J = I // R). DCP1 and R==1 keep the legacy
+    # value; DCP+compression validates pool coherence here.
+    pool_interleave = derive_pool_interleave(
+        cp_kv_cache_interleave_size, compress_ratio, dcp_world_size
+    )
     if dcp_world_size > 1:
         # Per-rank local KV length under interleave-aware DCP sharding, shape
         # [num_reqs, dcp_world_size]. Reuse the canonical CP helper so the
@@ -1284,13 +1724,23 @@ def build_prefill_chunk_metadata(
             compressed_seq_lens[start_idx:end_idx],
             dcp_world_size,
             None,
-            cp_kv_cache_interleave_size,
+            pool_interleave,
         )
         this_rank_counts = local_seq_lens[:, dcp_rank].to(torch.int32)
         local_cu_seq_lens = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
         torch.cumsum(this_rank_counts, dim=0, out=local_cu_seq_lens[1:])
         local_total_seq_lens = int(local_cu_seq_lens[-1].item())
         max_local_total_seq_lens = int(local_seq_lens.sum(dim=0).max().item())
+        # Rank-local pool -> request index, mirroring the global
+        # token_to_seq the kernel writes (one entry per LOCAL pool in
+        # request order). repeat_interleave over the local counts is
+        # the same construction the kernel performs per request; the
+        # host total above bounds output_size, so no extra sync.
+        local_token_to_seq = torch.repeat_interleave(
+            torch.arange(num_reqs, dtype=torch.int32, device=device),
+            this_rank_counts,
+            output_size=local_total_seq_lens,
+        )
 
     query_start_loc = (
         query_start_loc[start_idx : end_idx + 1] - query_start_loc[start_idx]
@@ -1324,7 +1774,7 @@ def build_prefill_chunk_metadata(
         qs_stop,
         dcp_rank,
         dcp_world_size,
-        cp_kv_cache_interleave_size,
+        pool_interleave,
         num_reqs=num_reqs,
         COMPRESS_RATIO=compress_ratio,
     )
@@ -1351,4 +1801,8 @@ def build_prefill_chunk_metadata(
         local_cu_seq_lens=local_cu_seq_lens,
         local_total_seq_lens=local_total_seq_lens,
         max_local_total_seq_lens=max_local_total_seq_lens,
+        local_token_to_seq=local_token_to_seq,
+        dcp_world_size=dcp_world_size,
+        dcp_rank=dcp_rank,
+        pool_interleave=pool_interleave,
     )

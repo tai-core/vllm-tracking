@@ -223,6 +223,19 @@ class FlashMLASparseMetadataBuilder(
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     require_uniform_decodes: ClassVar[bool] = True
     metadata_cls = FlashMLASparseMetadata
+    supports_bf16_dcp: ClassVar[bool] = False
+    # Backend opt-in for the restricted GLM kpool BF16 DCP candidate
+    # (see dcp_mtp_capability); the HCU subclass sets True.
+    supports_glm_kpool_bf16_dcp: ClassVar[bool] = False
+    # The SEPARATE FP8 MLA opt-in (same pattern as the indexer
+    # builder's SUPPORTS_GLM_KPOOL_FP8_MLA_DCP): DEFAULT FALSE in
+    # core; only a matching HCU plugin patch may set it True (it
+    # attests the wired FP8 DS-656 MLA storage). When True it
+    # authorizes — together with the EXACT single-module MTP4
+    # profile and the full candidate conditions — the FP8 MTP4
+    # varlen/threshold grant via dcp_mtp_capability. The legacy
+    # BF16 grant alone NEVER authorizes FP8.
+    supports_glm_kpool_fp8_mla_dcp: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -244,10 +257,30 @@ class FlashMLASparseMetadataBuilder(
             threshold = {16: 128, 32: 128, 64: 256, 128: 256}.get(num_q_heads, 256)
         # Varlen decodes are safe under DCP: causality comes from the
         # indexer's top-k indices, not from the kernel metadata.
+        # Under the ADAPTED GLM kpool BF16 DCP candidate (the same
+        # restricted conditions as dcp_mtp_capability — granted only
+        # by a backend subclass that opts in), varlen decode is ALSO
+        # safe with a non-trivial interleave: the MTP per-token rows
+        # route through the adapted decode merge and the per-token
+        # causal indices; the spec-as-decode threshold then covers
+        # 1 + S rows (the base helper derives it from the resolved
+        # speculative config). Every other DCP>1 + I>1 combination
+        # keeps threshold=1 (the original behavior).
+        from vllm.v1.attention.backends.mla.dcp_mtp_capability import (
+            builder_supports_dcp_varlen_with_interleave,
+        )
+
         self._init_reorder_batch_threshold(
             threshold,
             supports_spec_as_decode=True,
-            supports_dcp_with_varlen=(parallel_config.cp_kv_cache_interleave_size == 1),
+            supports_dcp_with_varlen=(
+                parallel_config.cp_kv_cache_interleave_size == 1
+                or builder_supports_dcp_varlen_with_interleave(
+                    vllm_config,
+                    self.supports_glm_kpool_bf16_dcp,
+                    fp8_mla_enabled=type(self).supports_glm_kpool_fp8_mla_dcp,
+                )
+            ),
         )
 
         sm_count = num_compute_units(device.index)
@@ -313,32 +346,35 @@ class FlashMLASparseMetadataBuilder(
                     "default 'ag_rs' DCP comm backend; got "
                     f"'{parallel_config.dcp_comm_backend}'"
                 )
-            if not self.fp8_use_mixed_batch:
-                raise NotImplementedError(
-                    "DCP for FlashMLA sparse is only supported on the "
-                    "mixed-batch fp8 path (num_heads < "
-                    f"{MIN_HEADS_FOR_BF16_PREFILL}); the separate "
-                    "prefill/decode path returns the LSE for decode tokens "
-                    "only, while the DCP merge needs it for every token"
+            if self.use_fp8_kv_cache or not self.supports_bf16_dcp:
+                if not self.fp8_use_mixed_batch:
+                    raise NotImplementedError(
+                        "DCP for FlashMLA sparse is only supported on the "
+                        "mixed-batch fp8 path (num_heads < "
+                        f"{MIN_HEADS_FOR_BF16_PREFILL}); the separate "
+                        "prefill/decode path returns the LSE for decode tokens "
+                        "only, while the DCP merge needs it for every token"
+                    )
+                # Head padding (and the tile-scheduler metadata sized from it) is
+                # computed from the local head count, but the kernel runs on the
+                # DCP-gathered heads.
+                gathered_num_heads = (
+                    self.num_heads * parallel_config.decode_context_parallel_size
                 )
-            # Head padding (and the tile-scheduler metadata sized from it) is
-            # computed from the local head count, but the kernel runs on the
-            # DCP-gathered heads.
-            gathered_num_heads = (
-                self.num_heads * parallel_config.decode_context_parallel_size
-            )
-            gathered_padded_heads = FlashMLASparseImpl._compute_fp8_decode_padded_heads(
-                gathered_num_heads
-            )
-            if self.fp8_decode_padded_heads != gathered_padded_heads:
-                raise NotImplementedError(
-                    "DCP for FlashMLA sparse requires the local and "
-                    "DCP-gathered head counts to pad to the same fp8 decode "
-                    f"kernel envelope; got {self.num_heads} local heads "
-                    f"(pad to {self.fp8_decode_padded_heads}) vs "
-                    f"{gathered_num_heads} gathered heads (pad to "
-                    f"{gathered_padded_heads})"
+                gathered_padded_heads = (
+                    FlashMLASparseImpl._compute_fp8_decode_padded_heads(
+                        gathered_num_heads
+                    )
                 )
+                if self.fp8_decode_padded_heads != gathered_padded_heads:
+                    raise NotImplementedError(
+                        "DCP for FlashMLA sparse requires the local and "
+                        "DCP-gathered head counts to pad to the same fp8 decode "
+                        f"kernel envelope; got {self.num_heads} local heads "
+                        f"(pad to {self.fp8_decode_padded_heads}) vs "
+                        f"{gathered_num_heads} gathered heads (pad to "
+                        f"{gathered_padded_heads})"
+                    )
 
     def _build_fp8_mixed_decode_prefill(
         self,
@@ -539,6 +575,19 @@ class FlashMLASparseMetadataBuilder(
 
 class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
     can_return_lse_for_decode: bool = True
+    supports_bf16_dcp: bool = False
+    # Backend opt-in for the restricted GLM kpool BF16 DCP candidate's
+    # MTP-with-interleave capability (see dcp_mtp_capability). The
+    # HCU subclass sets True; the core default keeps every core
+    # deployment rejected.
+    supports_glm_kpool_bf16_dcp: bool = False
+    # The SEPARATE FP8 MLA opt-in (see dcp_mtp_capability and the
+    # indexer builder's SUPPORTS_GLM_KPOOL_FP8_MLA_DCP): DEFAULT
+    # FALSE in core; only a matching HCU plugin patch may set it
+    # True. Authorizes the FP8 single-module MTP4 interleave
+    # capability ONLY together with the exact profile conditions;
+    # the legacy BF16 grant alone NEVER authorizes FP8.
+    supports_glm_kpool_fp8_mla_dcp: bool = False
 
     @staticmethod
     def _compute_fp8_decode_padded_heads(num_heads: int) -> int:
@@ -588,9 +637,11 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         vllm_config = get_current_vllm_config()
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         q_concat_heads = num_heads
+        if self.supports_bf16_dcp and not is_quantized_kv_cache(kv_cache_dtype):
+            q_concat_heads *= self.dcp_world_size
         if not is_quantized_kv_cache(kv_cache_dtype):
             q_concat_heads = (
-                (num_heads + self.prefill_padding - 1)
+                (q_concat_heads + self.prefill_padding - 1)
                 // self.prefill_padding
                 * self.prefill_padding
             )
@@ -601,8 +652,10 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 "fp8_ds_mla kv-cache dtype"
             )
 
-        if self.need_to_return_lse_for_decode and not is_quantized_kv_cache(
-            kv_cache_dtype
+        if (
+            self.need_to_return_lse_for_decode
+            and not is_quantized_kv_cache(kv_cache_dtype)
+            and not self.supports_bf16_dcp
         ):
             raise NotImplementedError(
                 "DCP for FlashMLA sparse requires an fp8_ds_mla kv-cache; "
@@ -626,6 +679,26 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             (self.q_concat_buffer,) = current_workspace_manager().get_simultaneous(
                 (q_concat_shape, torch.bfloat16),
             )
+
+        # Restricted MTP-with-interleave capability (instance-level,
+        # from the REAL current config): granted ONLY for the adapted
+        # GLM kpool BF16 DCP candidate AND only when this backend
+        # subclass explicitly opts in (supports_glm_kpool_bf16_dcp).
+        # The base class keeps the AttentionImpl default False, so
+        # every unadapted combination stays rejected by
+        # check_attention_cp_compatibility. Derived in __init__ from
+        # real configuration — never mocked onto the field later.
+        from vllm.v1.attention.backends.mla.dcp_mtp_capability import (
+            attention_impl_supports_mtp_with_cp_interleave,
+        )
+
+        self.supports_mtp_with_cp_non_trivial_interleave_size = (
+            attention_impl_supports_mtp_with_cp_interleave(
+                vllm_config,
+                backend_grants_capability=self.supports_glm_kpool_bf16_dcp,
+                fp8_mla_enabled=type(self).supports_glm_kpool_fp8_mla_dcp,
+            )
+        )
 
     def _forward_bf16_kv(
         self,

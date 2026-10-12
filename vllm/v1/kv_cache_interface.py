@@ -858,6 +858,11 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 class KpoolTailSpec(SlidingWindowSpec):
     """One-block circular scratch cache for a kpool indexer's raw tail."""
 
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        """Keep one per-request scratch page on each rank, including DCP."""
+        del vllm_config
+        return self.page_size_bytes
+
     def max_admission_blocks_per_request(
         self, max_in_flight_tokens: int, max_model_len: int
     ) -> int:

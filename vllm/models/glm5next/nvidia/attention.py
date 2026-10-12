@@ -180,23 +180,68 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
         prefix: str,
         cache_config,
         index_kpool: int,
+        vllm_config: VllmConfig | None = None,
     ):
         super().__init__(
             head_dim=head_dim, dtype=dtype, prefix=prefix, cache_config=cache_config
         )
         assert index_kpool > 1, "Glm5NextTailCache expects index_kpool > 1"
         self._index_kpool = index_kpool
+        # PHYSICAL tail-ring capacity C (candidate source enablement):
+        # only DCP world > 1 grows the ring, from the EXISTING
+        # speculative_config.num_speculative_tokens upper bound S via
+        # the approved contract C = R + S. DCP1 keeps the legacy
+        # C = R baseline for ANY MTP configuration (the legacy W1/MTP
+        # ring-aliasing risk stays a separately-tracked OPEN item —
+        # NOT claimed fixed). No new provider/user switch is
+        # introduced. C > R with a PD transfer configured is rejected
+        # (the current single-node DCP does not adapt the tail
+        # transfer to the changed shape identity); the rejection
+        # applies ONLY to the enlarged combination — legacy C = R
+        # services are unaffected.
+        self._tail_capacity = index_kpool
+        if vllm_config is not None:
+            dcp_world = vllm_config.parallel_config.decode_context_parallel_size
+            if dcp_world > 1:
+                from vllm.models.glm5next.tail_capacity import (
+                    kpool_tail_ring_capacity,
+                )
+
+                spec = vllm_config.speculative_config
+                S = spec.num_speculative_tokens if spec is not None else 0
+                capacity = kpool_tail_ring_capacity(index_kpool, S)
+                if capacity > index_kpool and (
+                    vllm_config.kv_transfer_config is not None
+                ):
+                    raise NotImplementedError(
+                        "Enlarging the KPool tail ring (C = "
+                        f"{capacity} > R = {index_kpool}) under DCP with a "
+                        "kv_transfer_config is not supported: the P/D tail "
+                        "transfer is not adapted to the changed tail shape. "
+                        "Disable the transfer or the speculative config to "
+                        "keep the legacy C = R tail."
+                    )
+                self._tail_capacity = capacity
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig):
         # The two head slots form [K, gate score] in the generic
-        # [block, head, state, content] cache view.
+        # [block, head, state, content] cache view. block_size is the
+        # PHYSICAL ring capacity C (>= the logical index_kpool R) —
+        # the allocator's page size follows C, and the kernels derive
+        # C from this shape at launch.
+        # Single source of truth: C is derived ONCE in __init__ from
+        # the vllm_config the model was constructed with; this
+        # method's vllm_config argument is the standard spec-build
+        # entry point and is NOT a second derivation (the value used
+        # here is the constructor's). A mismatched pair would be a
+        # caller bug; no unauthorized switch reads anything else.
         return KpoolTailSpec(
-            block_size=self._index_kpool,
+            block_size=self._tail_capacity,
             num_kv_heads=2,
             head_size=self.head_dim,
             head_size_v=0,
             dtype=torch.bfloat16,
-            sliding_window=self._index_kpool,
+            sliding_window=self._tail_capacity,
         )
 
     def get_attn_backend(self):
@@ -295,6 +340,7 @@ class Indexer(nn.Module):
             prefix=f"{prefix}.tail_cache",
             cache_config=cache_config,
             index_kpool=self.index_kpool,
+            vllm_config=vllm_config,
         )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.prefix = prefix

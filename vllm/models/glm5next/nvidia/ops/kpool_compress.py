@@ -377,35 +377,41 @@ def _kpool_tail_seed_kernel(
     n_tokens,
     HEAD_DIM: tl.constexpr,
     KPOOL: tl.constexpr,
+    TAIL_CAPACITY: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Copy token ``i``'s raw K + gate into its request's tail block.
 
-    Token ``i`` is among its request's last KPOOL tokens iff the token KPOOL
-    ahead belongs to a different tail block (or is past the batch / padding,
-    slot < 0). ``tslot = block * KPOOL + pos % KPOOL``; the destination is
-    ``tail[block, {0:K, 1:score}, pos % KPOOL, :]``.
+    Token ``i`` is among its request's last TAIL_CAPACITY tokens iff the
+    token TAIL_CAPACITY ahead belongs to a different tail block (or is past
+    the batch / padding, slot < 0). ``tslot = block * TAIL_CAPACITY +
+    pos % TAIL_CAPACITY``; the destination is the tail's [K, gate] halves.
+    KPOOL (the logical pool size) does not participate in the seed — only
+    the physical cache sizing does; with TAIL_CAPACITY == KPOOL this is
+    byte-identical to the original kernel.
     """
     i = tl.program_id(0)
     t = tl.load(tslot_ptr + i).to(tl.int64)
     if t < 0:
         return
-    blk = t // KPOOL  # t >= 0 here, so trunc == floor
-    ahead = tl.load(tslot_ptr + i + KPOOL, mask=i + KPOOL < n_tokens, other=-1).to(
-        tl.int64
-    )
+    blk = t // TAIL_CAPACITY  # t >= 0 here, so trunc == floor
+    ahead = tl.load(
+        tslot_ptr + i + TAIL_CAPACITY,
+        mask=i + TAIL_CAPACITY < n_tokens,
+        other=-1,
+    ).to(tl.int64)
     # Match the torch semantics exactly: a negative ahead slot floors to a
     # block id that differs from every real block -> token is in the tail.
     # Only divide non-negative slots (Triton int div truncates, torch floors).
-    if ahead >= 0 and ahead // KPOOL == blk:
+    if ahead >= 0 and ahead // TAIL_CAPACITY == blk:
         return
     offs = tl.arange(0, BLOCK_D)
     m = offs < HEAD_DIM
-    base = (blk * 2 * KPOOL + t % KPOOL) * HEAD_DIM
+    base = (blk * 2 * TAIL_CAPACITY + t % TAIL_CAPACITY) * HEAD_DIM
     k = tl.load(key_ptr + i * HEAD_DIM + offs, mask=m)
     s = tl.load(score_ptr + i * HEAD_DIM + offs, mask=m)
     tl.store(tail_ptr + base + offs, k, mask=m)
-    tl.store(tail_ptr + base + KPOOL * HEAD_DIM + offs, s, mask=m)
+    tl.store(tail_ptr + base + TAIL_CAPACITY * HEAD_DIM + offs, s, mask=m)
 
 
 def kpool_seed_tail_cache(
@@ -416,9 +422,67 @@ def kpool_seed_tail_cache(
     kpool: int,
     head_dim: int = INDEX_HEAD_DIM,
 ) -> None:
-    """Seed the paged tail cache from a prefill batch (see the kernel)."""
+    """Seed the paged tail cache from a prefill batch (see the kernel).
+
+    The PHYSICAL ring capacity C comes from the tail tensor's shape
+    (a single source of truth); the ``kpool`` (logical R) argument is
+    kept for the legacy signature and must satisfy C >= R. The
+    ``tslot`` values are expected to encode
+    ``block * C + pos % C`` — i.e. the CALLER's slot mapping must use
+    the same C as the allocated tail cache. With C == R this is
+    byte-identical to the original behavior.
+    """
     assert tail_kv_cache.dtype == torch.bfloat16
     assert key.dtype == torch.bfloat16
+    # Explicit shape validation (no silent ndim fallback — the
+    # contract requires the [blocks, 2, C, head_dim] paged layout).
+    assert tail_kv_cache.ndim == 4, (
+        f"tail cache must be 4-D [blocks, 2, C, head_dim], got {tail_kv_cache.ndim}-D"
+    )
+    assert tail_kv_cache.shape[1] == 2
+    assert tail_kv_cache.shape[3] == head_dim
+    tail_capacity = tail_kv_cache.shape[2]
+    assert tail_capacity >= kpool, (
+        f"tail ring capacity ({tail_capacity}) must be >= kpool ({kpool})"
+    )
+    assert key.ndim == 2 and key.shape[1] == head_dim, (
+        f"key must be [n_tokens, head_dim], got {tuple(key.shape)}"
+    )
+    assert gate_score.shape == key.shape and gate_score.dtype == key.dtype
+    assert tslot.ndim == 1
+    # The seed kernel indexes key/gate as i*HEAD_DIM (contiguous rows)
+    # and tslot as i — validate the layouts it actually assumes,
+    # without over-rejecting legal padded block/head tail strides.
+    assert key.is_contiguous() and gate_score.is_contiguous(), (
+        "the tail seed requires C-contiguous key/gate rows"
+    )
+    assert tslot.is_contiguous()
+    assert tslot.dtype in (torch.int32, torch.int64)
+    assert tail_kv_cache.device == key.device == tslot.device, (
+        "tail cache, key, and tslot must share a device"
+    )
+    assert tail_kv_cache.stride(3) == 1 and tail_kv_cache.stride(2) == head_dim, (
+        "the tail seed requires head-contiguous tail slots "
+        f"(strides {tail_kv_cache.stride(3)}, {tail_kv_cache.stride(2)}; "
+        f"head_dim {head_dim})"
+    )
+    # NVIDIA's seed kernel additionally assumes a fully contiguous
+    # tail layout and requires enough key/gate rows for tslot.
+    assert tail_kv_cache.is_contiguous(), (
+        "the NVIDIA tail seed requires a contiguous tail cache"
+    )
+    assert tslot.shape[0] <= key.shape[0], (
+        f"tslot has {tslot.shape[0]} entries but only {key.shape[0]} "
+        "key/gate rows — a longer tslot would read out of bounds"
+    )
+    # The NVIDIA seed kernel assumes a CONTIGUOUS tail layout (its
+    # base formula is (blk * 2 * C + t % C) * HEAD_DIM); a strided
+    # view would silently compute wrong addresses.
+    assert tail_kv_cache.is_contiguous(), (
+        "the NVIDIA tail seed requires a contiguous tail cache"
+    )
+    assert key.is_contiguous() and gate_score.is_contiguous()
+    assert tslot.is_contiguous()
     n = tslot.shape[0]
     if n == 0:
         return
@@ -430,6 +494,7 @@ def kpool_seed_tail_cache(
         n,
         HEAD_DIM=head_dim,
         KPOOL=kpool,
+        TAIL_CAPACITY=tail_capacity,
         BLOCK_D=triton.next_power_of_2(head_dim),
     )
 
@@ -454,6 +519,7 @@ def _kpool_decode_update_batched_kernel(
     slot_mapping_ptr,  # [B, NEXT_N] int32
     positions_ptr,  # [B, NEXT_N] int32
     NEXT_N,  # runtime token count per request (no .item() needed)
+    TAIL_CAPACITY: tl.constexpr,  # physical ring capacity C (>= POOL_SIZE)
     PAGE_SIZE: tl.constexpr,
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     POOL_SIZE: tl.constexpr,
@@ -487,8 +553,8 @@ def _kpool_decode_update_batched_kernel(
         safe_pos = tl.maximum(pos, 0)
         pos_valid = (cache_loc >= 0) & (pos >= 0)
 
-        slot = safe_pos % POOL_SIZE
-        phys_slot = safe_pos % POOL_SIZE
+        slot = safe_pos % POOL_SIZE  # the LOGICAL pool slot (completion)
+        phys_slot = safe_pos % TAIL_CAPACITY  # the PHYSICAL ring slot
 
         # Derive the tail block from THIS token's tail_slot (the request's block
         # is constant across a pool, but a padded / invalid entry carries a
@@ -496,7 +562,7 @@ def _kpool_decode_update_batched_kernel(
         # token's base address). Clamp so an invalid entry can never form an
         # out-of-bounds base; the accesses below are gated on pos_valid anyway.
         tail_slot = tl.load(tail_slot_mapping_ptr + idx)
-        block = tl.maximum(tail_slot, 0).to(tl.int64) // POOL_SIZE
+        block = tl.maximum(tail_slot, 0).to(tl.int64) // TAIL_CAPACITY
         block_base = block * TAIL_BLOCK_ELEMS
 
         # The tail-ring stash must run for EVERY real token, so it is gated on
@@ -524,7 +590,7 @@ def _kpool_decode_update_batched_kernel(
             max_score = tl.full((BLOCK_D,), -float("inf"), tl.float32)
             for pool_slot in tl.static_range(0, POOL_SIZE):
                 is_current = pool_slot == slot
-                phys = (pool_logical_start + pool_slot) % POOL_SIZE
+                phys = (pool_logical_start + pool_slot) % TAIL_CAPACITY
                 score_buf = tl.load(
                     tail_kv_ptr + block_base + KPOOL_HEAD + phys * HEAD_DIM + offs,
                     mask=dim_mask,
@@ -542,7 +608,7 @@ def _kpool_decode_update_batched_kernel(
             denom = tl.full((BLOCK_D,), 0.0, tl.float32)
             for pool_slot in tl.static_range(0, POOL_SIZE):
                 is_current = pool_slot == slot
-                phys = (pool_logical_start + pool_slot) % POOL_SIZE
+                phys = (pool_logical_start + pool_slot) % TAIL_CAPACITY
                 score_buf = tl.load(
                     tail_kv_ptr + block_base + KPOOL_HEAD + phys * HEAD_DIM + offs,
                     mask=dim_mask,
@@ -646,7 +712,16 @@ def kpool_decode_update_and_maybe_write_cache_batched(
         return
     assert tail_kv_cache.ndim == 4
     assert tail_kv_cache.shape[1] == 2
-    assert tail_kv_cache.shape[2] == pool_size
+    # The PHYSICAL tail-ring capacity C comes from the tensor's shape
+    # (a single source of truth — no second parameter to disagree);
+    # the LOGICAL pool size stays ``pool_size`` (R) for the completion
+    # condition, the pool window, the APE layout, and the compressed
+    # slot mapping. C >= R is required; C == R reproduces the legacy
+    # behavior exactly.
+    tail_capacity = tail_kv_cache.shape[2]
+    assert tail_capacity >= pool_size, (
+        f"tail ring capacity ({tail_capacity}) must be >= pool_size ({pool_size})"
+    )
     assert tail_kv_cache.shape[3] == head_dim
     assert tail_kv_cache.dtype == torch.bfloat16
     assert key.ndim == 3 and key.shape[2] == head_dim
@@ -657,6 +732,17 @@ def kpool_decode_update_and_maybe_write_cache_batched(
     assert positions.shape == (num_requests, next_n)
     assert key.dtype == torch.bfloat16
     assert slot_score.dtype == torch.bfloat16
+    # The kernel's last-dim accesses assume head-contiguous rows for
+    # key/score (their B/T strides ARE passed and may be padded).
+    assert key.stride(2) == 1 and slot_score.stride(2) == 1, (
+        "the decode update requires head-contiguous key/score rows"
+    )
+    assert tail_kv_cache.device == key.device == tail_slot_mapping.device, (
+        "tail cache, key, and tail_slot_mapping must share a device"
+    )
+    assert tail_slot_mapping.numel() == num_requests * next_n, (
+        "tail_slot_mapping must cover exactly the padded token rows"
+    )
     assert ape.dtype == torch.float32
     assert kv_cache.dtype == torch.uint8
 
@@ -689,6 +775,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
         slot_mapping,
         positions,
         next_n,
+        TAIL_CAPACITY=tail_capacity,
         PAGE_SIZE=page_size,
         BUF_NUMEL_PER_PAGE=buf.stride(0),
         POOL_SIZE=pool_size,

@@ -20,6 +20,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
@@ -619,12 +620,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
         if dcp_world_size > 1:
             # DCP shards full-attention KV across ranks and replicates Mamba
-            # state; other spec types (e.g. sliding window) have no DCP-aware
-            # handling yet, so reject them explicitly.
+            # state. KPool tail uses a per-rank, one-block scratch ring and
+            # never participates in prefix caching or context sharding.
+            # Ordinary sliding windows still lack DCP-aware handling.
             for g in kv_cache_config.kv_cache_groups:
-                assert isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec)), (
+                assert isinstance(
+                    g.kv_cache_spec, (FullAttentionSpec, MambaSpec, KpoolTailSpec)
+                ), (
                     "DCP with hybrid KV cache layouts only supports "
-                    "full-attention and Mamba groups, got: "
+                    "full-attention, Mamba and KPool tail groups, got: "
                     f"{type(g.kv_cache_spec).__name__}."
                 )
         # Fine-grained hash hits require Mamba "align" and compatible cache
