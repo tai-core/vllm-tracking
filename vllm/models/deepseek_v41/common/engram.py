@@ -63,7 +63,7 @@ from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.model_executor.utils import set_weight_attrs
@@ -1556,18 +1556,39 @@ class Engram(nn.Module):
         # suffix rule.
         self.embed_tokens = self._create_embedding(layout, layer_hash_index)
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
-        # Without sequence parallelism every TP rank holds every token, so
-        # shard the output columns instead of replicating the projection.
-        self.wkv = ColumnParallelLinear(
-            n_hash_cols * layout.head_dim,
-            self.dim * (self.hc_mult + 1),
-            bias=False,
-            gather_output=True,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.wkv",
-            disable_tp=use_sequence_parallel,
+        # MUSA: every rank holds a contiguous slice of the hash heads, so wkv runs
+        # row-parallel on that K slice and one all-reduce sums the partial rows.
+        tp_size = get_tensor_model_parallel_world_size()
+        self.wkv_row_parallel = (
+            current_platform.is_musa()
+            and tp_size > 1
+            and not use_sequence_parallel
+            and getattr(self.embed_tokens, "dp_size", 1) == 1
+            and self.embed_tokens.part_n_hash_cols * tp_size == n_hash_cols
         )
+        if self.wkv_row_parallel:
+            self.wkv = RowParallelLinear(
+                n_hash_cols * layout.head_dim,
+                self.dim * (self.hc_mult + 1),
+                bias=False,
+                input_is_parallel=True,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.wkv",
+            )
+        else:
+            # Without sequence parallelism every TP rank holds every token, so
+            # shard the output columns instead of replicating the projection.
+            self.wkv = ColumnParallelLinear(
+                n_hash_cols * layout.head_dim,
+                self.dim * (self.hc_mult + 1),
+                bias=False,
+                gather_output=True,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.wkv",
+                disable_tp=use_sequence_parallel,
+            )
         self.q_weight = nn.Parameter(
             torch.empty(self.hc_mult, self.dim, dtype=torch.bfloat16),
             requires_grad=False,
@@ -1662,6 +1683,8 @@ class Engram(nn.Module):
         rows = self._ready_rows(hash_ids.shape[0])
         if self.embed_tokens.tp_size == 1:
             return rows[:, : self.embed_tokens.n_hash_cols]
+        if self.wkv_row_parallel:
+            return rows
         if self.use_sequence_parallel:
             tp_size = self.embed_tokens.tp_size
             num_tokens, local_heads, dim = rows.shape
