@@ -609,6 +609,19 @@ def sparse_attn_indexer_kpool(
                         chunk.block_table,
                         gather_cu,
                         token_to_seq=gather_token_to_seq,
+                        # Read with the same page layout the kpool writer
+                        # used (preshuffle or linear, see kpool_compress).
+                        # (The resolver lives in the AMD ops module — the
+                        # ROCm-only branch this call site sits in; the
+                        # NVIDIA twin this module types against is linear
+                        # and never reaches here.)
+                        layout=(
+                            "SHUFFLE"
+                            if kpool_ops.indexer_cache_preshuffle(  # type: ignore[attr-defined]
+                                kv_cache.shape[1]
+                            )
+                            else "NORMAL"
+                        ),
                     )
                 else:
                     ops.cp_gather_indexer_k_quant_cache(

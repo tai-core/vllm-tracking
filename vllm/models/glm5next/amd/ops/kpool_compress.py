@@ -12,10 +12,60 @@ helpers (select pools -> expand to tokens -> append tail).
 
 from __future__ import annotations
 
+import functools
+import os
+
 import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+# ---------------------------------------------------------------------------
+# Indexer K-cache page layout (single source of truth for writers AND readers).
+#
+# Each storage page holds ``page_size * head_dim`` fp8 K bytes followed by
+# ``page_size * 4`` fp32 scale bytes. Inside the K region the codes are either
+#   preshuffle - 16x16 tiles (AITER gluon / gfx942 paged-MQA contract), or
+#   linear     - ``pos * head_dim + d`` (lightop paged_mqa_logits contract on
+#                gfx936).
+# ``VLLM_HCU_GLM_INDEXER_CACHE_LAYOUT`` = auto | preshuffle | linear.  ``auto``
+# (default) picks ``linear`` when the GLM paged-MQA backend
+# (``VLLM_HCU_GLM_PAGED_MQA_BACKEND``) needs it and ``preshuffle`` otherwise,
+# so existing deployments are unchanged.  Every kernel that writes or reads
+# this cache (kpool writers, prefill gather, all paged-MQA backends) must use
+# ``indexer_cache_preshuffle`` so both sides always agree.  PD peers must run
+# with the same layout: the connector copies the cache bytes verbatim.
+# ---------------------------------------------------------------------------
+INDEXER_CACHE_LAYOUT_ENV = "VLLM_HCU_GLM_INDEXER_CACHE_LAYOUT"
+INDEXER_CACHE_LAYOUTS = ("auto", "preshuffle", "linear")
+_PAGED_MQA_BACKEND_ENV = "VLLM_HCU_GLM_PAGED_MQA_BACKEND"
+_LINEAR_LAYOUT_PAGED_MQA_BACKENDS = ("lightop",)
+
+
+@functools.cache
+def indexer_cache_layout() -> str:
+    """Resolved indexer K-cache layout: ``"preshuffle"`` or ``"linear"``."""
+    selection = os.environ.get(INDEXER_CACHE_LAYOUT_ENV, "auto").strip().lower()
+    if selection not in INDEXER_CACHE_LAYOUTS:
+        raise ValueError(
+            f"{INDEXER_CACHE_LAYOUT_ENV}={selection!r} is invalid; expected one "
+            f"of {INDEXER_CACHE_LAYOUTS}"
+        )
+    if selection == "auto":
+        backend = os.environ.get(_PAGED_MQA_BACKEND_ENV, "").strip().lower()
+        selection = (
+            "linear" if backend in _LINEAR_LAYOUT_PAGED_MQA_BACKENDS else "preshuffle"
+        )
+    return selection
+
+
+def indexer_cache_preshuffle(page_size: int) -> bool:
+    """Whether the K region of a ``page_size``-slot page is 16x16 preshuffled.
+
+    Single-slot pages are always linear (there is nothing to tile).
+    """
+    return page_size > 1 and indexer_cache_layout() == "preshuffle"
+
 
 # The GLM-5.3-Flash indexer head dimension is fixed at 128.
 INDEX_HEAD_DIM = 128
@@ -313,7 +363,8 @@ def kpool_compress_and_write_cache(
         compressed_k = buf_fp8
         compressed_scale = buf_fp32
 
-    if page_size > 1:
+    preshuffle = indexer_cache_preshuffle(page_size)
+    if preshuffle:
         assert page_size % 16 == 0, "ROCm preshuffle requires 16-token tiles"
 
     _kpool_softmax_rotate_write_cache_kernel[(slot_k.shape[0],)](
@@ -337,7 +388,7 @@ def kpool_compress_and_write_cache(
         HEAD_DIM=head_dim,
         S_OFFSET_NBYTES_IN_PAGE=s_offset_nbytes_in_page,
         FP8_MAX=FP8_MAX,
-        PRESHUFFLE=page_size > 1,
+        PRESHUFFLE=preshuffle,
         ROUND_SCALE=round_scale,
         HAS_WRITE_MASK=has_write_mask,
         RETURN_COMPRESSED=return_compressed,
@@ -745,7 +796,8 @@ def kpool_decode_update_and_maybe_write_cache_batched(
     slot_mapping = slot_mapping.contiguous()
     positions = positions.contiguous()
 
-    if page_size > 1:
+    preshuffle = indexer_cache_preshuffle(page_size)
+    if preshuffle:
         assert page_size % 16 == 0, "ROCm preshuffle requires 16-token tiles"
 
     _kpool_decode_update_batched_kernel[(num_requests,)](
@@ -773,7 +825,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
         HEAD_DIM=head_dim,
         S_OFFSET_NBYTES_IN_PAGE=page_size * head_dim,
         FP8_MAX=FP8_MAX,
-        PRESHUFFLE=page_size > 1,
+        PRESHUFFLE=preshuffle,
         ROUND_SCALE=round_scale,
         BLOCK_D=triton.next_power_of_2(head_dim),
     )

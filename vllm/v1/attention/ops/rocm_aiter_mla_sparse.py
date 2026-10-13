@@ -427,7 +427,11 @@ def cp_gather_indexer_k_quant_cache_triton(
     token_to_seq: torch.Tensor,
     block_tile_size: int = 16,
     head_tile_size: int = 16,
+    layout: str | None = None,
 ):
+    """``layout``: ``"SHUFFLE"`` (16x16 tiles) or ``"NORMAL"`` (linear) for
+    the K region of each page; ``None`` keeps the historical default
+    (``NORMAL`` for single-slot pages, ``SHUFFLE`` otherwise)."""
     num_tokens = k_fp8.size(0)
     block_size = k_cache.size(1)
     block_table_stride = block_table.stride(0)
@@ -440,7 +444,9 @@ def cp_gather_indexer_k_quant_cache_triton(
     k_cache_scale = k_cache[:, block_size * head_dim :].view(torch.float32)
     grid = (num_tokens,)
     k_fp8_scale = k_fp8_scale.view(torch.float32)
-    layout = "NORMAL" if block_size == 1 else "SHUFFLE"
+    if layout is None:
+        layout = "NORMAL" if block_size == 1 else "SHUFFLE"
+    assert layout in ("NORMAL", "SHUFFLE"), layout
     kernel_args = (
         k_cache_value,
         k_cache_scale,

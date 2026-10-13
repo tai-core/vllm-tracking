@@ -500,6 +500,11 @@ def _drive_kpool_prefill(
     )
 
     class _FakeExpand:
+        # The layout resolver surface (the gather call consults it):
+        @staticmethod
+        def indexer_cache_preshuffle(page_size: int) -> bool:
+            return page_size > 1  # the historical default in the fakes
+
         def expand_pools_and_append_tail(self, pool_ids, q_seq, kpool):
             rec = _EXPAND_CALLS.setdefault(id(chunk), [])
             rec.append(pool_ids.clone())

@@ -113,6 +113,11 @@ def _drive_decode(
     )
 
     class _ExpandRec:
+        # The layout resolver surface (the gather path consults it):
+        @staticmethod
+        def indexer_cache_preshuffle(page_size: int) -> bool:
+            return page_size > 1  # the historical default in the fakes
+
         def expand_pools_and_append_tail(self, pool_ids, q_seq, kpool):
             _EXPAND_CALLS.setdefault(id(decode_md), []).append(
                 (pool_ids.clone(), q_seq.clone())
@@ -510,6 +515,11 @@ def test_decode_merge_mixed_batch_collective_order(monkeypatch):
     )
 
     class _ExpandRec:
+        # The layout resolver surface (the gather path consults it):
+        @staticmethod
+        def indexer_cache_preshuffle(page_size: int) -> bool:
+            return page_size > 1  # the historical default in the fakes
+
         def expand_pools_and_append_tail(self, pool_ids, q_seq, kpool):
             _EXPAND_CALLS.setdefault("mixed", []).append(pool_ids.clone())
             return torch.full(
