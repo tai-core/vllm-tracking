@@ -870,9 +870,20 @@ class DeepseekV4MoE(nn.Module):
         self.physical_expert_start = self.experts_start_idx
         self.physical_expert_end = self.experts_end_idx
 
+        # MUSA: the shared expert joins the routed FP8 experts as one more expert.
+        musa_shared_fold = False
+        if current_platform.is_musa():
+            from vllm_musa.model_executor.layers.fused_moe.shared_expert_fold import (
+                deepseek_v4_shared_expert_foldable,
+            )
+
+            musa_shared_fold = deepseek_v4_shared_expert_foldable(
+                vllm_config, self, config, quant_config
+            )
+
         self.experts = FusedMoEFactory(
             reduce_results=self.reduce_results,
-            shared_experts=self.shared_experts,
+            shared_experts=None if musa_shared_fold else self.shared_experts,
             gate=self.gate,
             num_experts=self.n_routed_experts,
             top_k=self.n_activated_experts,
@@ -894,6 +905,12 @@ class DeepseekV4MoE(nn.Module):
             num_redundant_experts=eplb_config.num_redundant_experts,
             is_sequence_parallel=self.use_sequence_parallel,
         )
+        if musa_shared_fold:
+            from vllm_musa.model_executor.layers.fused_moe.shared_expert_fold import (
+                fold_shared_expert,
+            )
+
+            fold_shared_expert(self.experts, self.shared_experts)
 
     def forward(
         self,
