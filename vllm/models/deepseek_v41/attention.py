@@ -177,6 +177,34 @@ def _resolve_dsv4_kv_cache_dtype(
     return kv_cache_dtype, torch.bfloat16
 
 
+
+def _musa_deepseek_v4_kv_rope_insert(
+    attn: "DeepseekV4Attention",
+    kv: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    """MUSA: the fused CUDA KV insert op is not built. The MUSA q-norm, RoPE
+    and KV insert takes a query; pass a zero one and discard its result."""
+    assert not attn.kv_mxfp8
+    from vllm_musa import _custom_ops as _musa_custom_ops
+
+    dummy_q = torch.zeros(
+        (kv.shape[0], attn.n_local_heads, attn.head_dim),
+        dtype=kv.dtype,
+        device=kv.device,
+    )
+    _musa_custom_ops.deepseek_v4_qnorm_rope_kv_insert(
+        dummy_q,
+        kv,
+        attn.swa_cache_layer.kv_cache,
+        slot_mapping.contiguous(),
+        positions.contiguous(),
+        attn.rotary_emb.cos_sin_cache,
+        attn.eps,
+        attn.swa_cache_layer.block_size,
+    )
+
 class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     """DeepseekV4 MLA attention layer.
 
@@ -696,7 +724,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         attn_metadata = get_forward_context().attn_metadata
         qr_kv, kv_score, _ = self._run_parallel_input_projections(hidden_states)
         _, _, kv = self._split_qkv_and_norm(qr_kv)
-        if isinstance(attn_metadata, dict):
+        if isinstance(attn_metadata, dict) and current_platform.is_musa():
+            _musa_deepseek_v4_kv_rope_insert(
+                self,
+                kv,
+                cast(Any, attn_metadata[self.swa_cache_layer.prefix]).slot_mapping,
+                positions,
+            )
+        elif isinstance(attn_metadata, dict):
             # The KV half of _fused_qnorm_rope_kv_insert, bit for bit, without
             # the unused query; same as dspark's _insert_context_kv.
             cache = self.swa_cache_layer.kv_cache

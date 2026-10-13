@@ -50,6 +50,8 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_padding_mask,
     sp_shard,
 )
+from vllm.models.deepseek_v41.attention import _musa_deepseek_v4_kv_rope_insert
+from vllm.platforms import current_platform
 
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from .model import (
@@ -266,6 +268,9 @@ def _insert_context_kv(
     # differ). block_size stays the layer's, so the op's size(1) check still
     # cross-checks the two rather than restating the tensor.
     cache = attn.swa_cache_layer.kv_cache
+    if current_platform.is_musa():
+        _musa_deepseek_v4_kv_rope_insert(attn, kv, slot_mapping, positions)
+        return
     torch.ops._C.fused_deepseek_v4_kv_rope_insert(
         kv,
         cache,
