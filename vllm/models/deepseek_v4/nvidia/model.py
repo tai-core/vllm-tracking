@@ -773,6 +773,16 @@ class DeepseekV4MoE(nn.Module):
                 requires_grad=False,
             )
 
+        if (
+            current_platform.is_musa()
+            and not self.use_native_mega_moe
+            and self.gate.tid2eid is None
+            and self.gate.e_score_correction_bias is not None
+        ):
+            # MUSA: the biased router widens the BF16 gate output itself, which
+            # saves an FP32 cast kernel per layer.
+            self.gate.out_dtype = None
+
         if config.n_shared_experts is None:
             self.shared_experts = None
         else:
