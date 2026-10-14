@@ -28,6 +28,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
 from vllm_musa.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
+    shared_decode_plan,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -235,6 +236,16 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             f"compress_ratio={self.compress_ratio}; "
             "DeepseekSparseSWAMetadataBuilder.build_tile_scheduler did not "
             "allocate one for this layer type."
+        )
+        # MUSA: each KV-cache group builds its own plans; reuse the forward's
+        # first plan for this layer type and cache layout.
+        tile_metadata = shared_decode_plan(
+            (
+                self.compress_ratio,
+                swa_cache.shape[1],
+                kv_cache.shape[1] if kv_cache is not None else None,
+            ),
+            tile_metadata,
         )
 
         out, _ = flash_mla_with_kvcache(
