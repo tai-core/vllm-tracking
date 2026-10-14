@@ -29,6 +29,7 @@ from vllm_musa.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
     shared_decode_plan,
+    shared_global_topk,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -186,12 +187,18 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             assert self.topk_indices_buffer is not None
             block_size = attn_metadata.block_size // self.compress_ratio
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
-            global_indices, topk_lens = compute_global_topk_indices_and_lens(
-                self.topk_indices_buffer[:num_decode_tokens],
-                swa_metadata.token_to_req_indices,
-                attn_metadata.block_table[:num_decodes],
-                block_size,
-                is_valid,
+            topk_indices_buffer = self.topk_indices_buffer
+            # MUSA: the layers after an index source read its indices through the
+            # same compressed cache until the next source; map them once.
+            global_indices, topk_lens = shared_global_topk(
+                (self.index_source_layer_id, self.compressed_cache_prefix),
+                lambda: compute_global_topk_indices_and_lens(
+                    topk_indices_buffer[:num_decode_tokens],
+                    swa_metadata.token_to_req_indices,
+                    attn_metadata.block_table[:num_decodes],
+                    block_size,
+                    is_valid,
+                ),
             )
             topk_indices = global_indices.view(num_decode_tokens, 1, -1)
 
