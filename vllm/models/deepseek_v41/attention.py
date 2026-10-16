@@ -28,8 +28,8 @@ from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter
 from vllm.models.deepseek_v4.attention import (
+    _musa_deepseek_v4_aux_overlap,
     _musa_deepseek_v4_linear_out_dtype,
-    _musa_deepseek_v4_serialize_long_prefill,
 )
 from vllm.models.deepseek_v41.common.ops import (
     MXFP4_BLOCK_SIZE,
@@ -903,7 +903,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         index_weights_out: torch.Tensor | None = None
         latent: torch.Tensor | None = None
         aux_stream = aux_streams[0] if aux_streams is not None else None
-        if _musa_deepseek_v4_serialize_long_prefill(hidden_states.size(0)):
+        if not _musa_deepseek_v4_aux_overlap():
             aux_stream = None
 
         if compressor is not None:
@@ -1021,9 +1021,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             aux_streams,
             enable=(
                 hidden_states.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
-                and not _musa_deepseek_v4_serialize_long_prefill(
-                    hidden_states.shape[0]
-                )
+                and _musa_deepseek_v4_aux_overlap()
             ),
             use_stream_waits=current_platform.is_musa(),
         )
