@@ -6,6 +6,11 @@
 # version library first.  Such assumption is critical for some customization.
 from .version import __version__, __version_tuple__  # isort:skip
 
+# MUSA: the MUSA image runs Python 3.10.
+from ._py310_compat import install as _install_py310_compat  # isort:skip
+
+_install_py310_compat()
+
 import typing
 
 # The environment variables override should be imported before any other
