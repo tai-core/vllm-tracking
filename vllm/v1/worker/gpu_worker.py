@@ -408,6 +408,8 @@ class Worker(WorkerBase):
         """Limit CUDA/ROCm allocator splitting, restoring settings on exit."""
         if (
             not current_platform.is_cuda_alike()
+            # MUSA: the accelerator allocator-settings API is CUDA/ROCm only.
+            or self.device_config.device_type == "musa"
             or torch.cuda.memory.get_allocator_backend() != "native"
         ):
             yield
