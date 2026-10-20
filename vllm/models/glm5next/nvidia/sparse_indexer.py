@@ -373,6 +373,14 @@ def sparse_attn_indexer_kpool(
 
             if logits.shape[1] == 0:
                 topk_dst.fill_(-1)
+            elif current_platform.is_musa():
+                from vllm_musa import _custom_ops as musa_ops
+
+                # Return window-relative pool IDs, as expected by the DCP
+                # merge and pool expansion below. Keep nonzero window starts.
+                musa_ops.sparse_indexer_topk(
+                    logits, cu_seqlen_ks, cu_seqlen_ke, topk_dst, select_k
+                )
             else:
                 torch.ops._C.top_k_per_row_prefill(
                     logits,

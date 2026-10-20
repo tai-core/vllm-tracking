@@ -311,6 +311,20 @@ class SparseIndexerTopk(torch.nn.Module):
         """Run the resolved decode top-k implementation, writing into
         topk_indices (int32, -1 fill for rows shorter than topk_tokens).
         """
+        if current_platform.is_musa() and self._backend in ("auto", "per_row"):
+            from vllm_musa import _custom_ops as musa_ops
+
+            # Native MTP supplies one pool length per query, including padded
+            # rows. Legacy request lengths need the next_n offsets applied.
+            row_ends = self._row_ends(seq_lens, next_n, logits.shape[0])
+            select = (
+                musa_ops.deepseek_v4_sparse_indexer_topk_decode
+                if topk_tokens <= 512
+                else musa_ops.sparse_indexer_topk_decode
+            )
+            select(logits, row_ends, topk_indices, topk_tokens)
+            return
+
         backend = self.resolve_backend(logits, topk_tokens, logits.shape[0])
         if backend == "deep_select":
             row_ends = self._row_ends(seq_lens, next_n, logits.shape[0])
