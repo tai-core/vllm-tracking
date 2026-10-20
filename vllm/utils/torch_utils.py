@@ -827,6 +827,12 @@ def current_stream() -> torch.cuda.Stream:
     """
     from vllm.platforms import current_platform
 
+    # MUSA graph/Stream contexts can switch streams without going through
+    # torch.cuda.set_stream, so the CUDA-only TLS cache can point at a stream
+    # outside the active capture and silently omit side-stream work.
+    if current_platform.is_musa():
+        return torch.musa.current_stream()
+
     if not hasattr(_current_stream_tls, "value") or _current_stream_tls.value is None:
         # when this function is called before any stream is set,
         # we return the default stream.
