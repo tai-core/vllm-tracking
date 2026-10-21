@@ -482,6 +482,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return ca_comm.custom_reduce_scatter(input_.contiguous())
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if current_platform.is_musa():
+            return super().all_gather(input_, dim)
+
         # Route uniform dim-0 all-gathers through NVLS symmetric memory when
         # enabled (mirrors reduce_scatter); otherwise fall back to the
         # PyNccl/base-class all-gather. Sequence parallelism's
@@ -518,6 +521,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+        # MUSA uses ProcessGroupMCCL; PyNccl may be disabled and silently
+        # skip the operation, leaving its output tensor uninitialized.
+        if current_platform.is_musa():
+            return super().reduce_scatter(input_, dim)
+
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None

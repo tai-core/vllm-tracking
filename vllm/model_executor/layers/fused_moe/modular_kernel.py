@@ -10,6 +10,7 @@ from typing import final
 import torch
 
 import vllm.envs as envs
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
@@ -1049,6 +1050,12 @@ class FusedMoEKernelModularImpl:
         self.shared_experts: SharedExperts | None = None
         moe_parallel_config = fused_experts.moe_config.moe_parallel_config
         self.moe_parallel_config = moe_parallel_config
+        self._dispatch_chunk_size = (
+            prepare_finalize.max_num_tokens_per_rank()
+            if moe_parallel_config is not None
+            and moe_parallel_config.use_deepep_ll_kernels
+            else None
+        )
         self.is_dp_ep = (
             moe_parallel_config is not None
             and moe_parallel_config.dp_size > 1
@@ -1422,6 +1429,65 @@ class FusedMoEKernelModularImpl:
         return output
 
     def apply(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        activation: MoEActivation = MoEActivation.SILU,
+        global_num_experts: int = -1,
+        expert_map: torch.Tensor | None = None,
+        apply_router_weight_on_input: bool = False,
+        shared_experts: SharedExperts | None = None,
+        shared_experts_input: torch.Tensor | None = None,
+    ) -> torch.Tensor | UnfinalizedMoEOutput:
+        chunk_size = self._dispatch_chunk_size
+        max_tokens = hidden_states.shape[0]
+        if chunk_size is not None and is_forward_context_available():
+            dp_meta = get_forward_context().dp_metadata
+            if dp_meta is not None:
+                # Includes SP/PCP redistribution. Empty ranks must participate
+                # in every dispatch/combine issued by the busiest rank.
+                sizes = dp_meta.get_chunk_sizes_across_dp_rank()
+                assert sizes is not None
+                max_tokens = max(max_tokens, max(sizes))
+
+        kwargs = dict(
+            w1=w1,
+            w2=w2,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )
+        if chunk_size is None or max_tokens <= chunk_size:
+            return self._apply(
+                hidden_states,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+                **kwargs,
+            )
+
+        output = torch.empty_like(hidden_states)
+        for start in range(0, max_tokens, chunk_size):
+            end = start + chunk_size
+            chunk_output = self._apply(
+                hidden_states[start:end],
+                topk_ids=topk_ids[start:end],
+                topk_weights=topk_weights[start:end],
+                # Shared experts consume the original batch exactly once.
+                shared_experts=shared_experts if start == 0 else None,
+                shared_experts_input=shared_experts_input if start == 0 else None,
+                **kwargs,
+            )
+            assert isinstance(chunk_output, torch.Tensor)
+            output[start:end].copy_(chunk_output)
+        return output
+
+    def _apply(
         self,
         hidden_states: torch.Tensor,
         w1: torch.Tensor,

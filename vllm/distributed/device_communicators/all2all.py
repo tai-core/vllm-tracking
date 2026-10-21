@@ -385,8 +385,14 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
             num_qps_per_rank=num_qps_per_rank,
             allow_nvlink_for_low_latency_mode=True,
             allow_mnnvl=envs.VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL,
-            enable_shrink=self.support_fault_tolerance,
         )
+        if supports_kw(deep_ep.Buffer, "enable_shrink"):
+            kwargs["enable_shrink"] = self.support_fault_tolerance
+        elif self.support_fault_tolerance:
+            raise ValueError(
+                "The installed DeepEP Buffer does not support enable_shrink; "
+                "fault tolerance is unavailable for this DeepEP version."
+            )
         return kwargs
 
     def get_handle(self, kwargs):

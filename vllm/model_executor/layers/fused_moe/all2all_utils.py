@@ -248,8 +248,33 @@ def maybe_make_prepare_finalize(
                 physical_to_global,
                 local_expert_global_ids,
             ) = routing_tables
+        # SP shards tokens before LL dispatch. Size both communication and
+        # batched expert workspaces for the largest local shard, not the
+        # scheduler's full batch. Keep PCP's redistribution bound unchanged.
+        max_tokens_per_rank = moe.max_num_tokens
+        if moe.is_sequence_parallel and moe.pcp_size == 1:
+            max_tokens_per_rank = (moe.max_num_tokens + moe.sp_size - 1) // moe.sp_size
+        # LL reserves worst-case receive storage for every local expert.
+        # Bound buffers; the modular kernel chunks larger batches.
+        dispatch_capacity = min(max_tokens_per_rank, 256)
+        if dispatch_capacity < max_tokens_per_rank:
+            logger.info_once(
+                "DeepEP LL MoE chunking enabled: "
+                "max_num_batched_tokens=%d, SP=%d, PCP=%d, "
+                "per-rank dispatch capacity=%d -> %d tokens. "
+                "Larger MoE batches use synchronized dispatch/combine "
+                "chunks to bound communication and expert workspace "
+                "memory; the scheduler token budget is unchanged.",
+                moe.max_num_tokens,
+                moe.sp_size,
+                moe.pcp_size,
+                max_tokens_per_rank,
+                dispatch_capacity,
+                scope="global",
+            )
+        max_tokens_per_rank = dispatch_capacity
         all_to_all_args = dict(
-            max_num_tokens_per_dp_rank=moe.max_num_tokens,
+            max_num_tokens_per_dp_rank=max_tokens_per_rank,
             token_hidden_size=moe.hidden_dim,
             num_ep_ranks=all2all_manager.world_size,
             num_global_experts=moe.num_experts,
@@ -266,7 +291,7 @@ def maybe_make_prepare_finalize(
 
         prepare_finalize = DeepEPLLPrepareAndFinalize(
             handle,
-            max_tokens_per_rank=moe.max_num_tokens,
+            max_tokens_per_rank=max_tokens_per_rank,
             num_dispatchers=all2all_manager.world_size,
             use_fp8_dispatch=use_fp8_dispatch,
             global_to_physical=global_to_physical,

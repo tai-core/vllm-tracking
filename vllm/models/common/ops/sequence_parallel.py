@@ -11,8 +11,15 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 
+from vllm.platforms import current_platform
+
 
 def _custom_collective(name: str, x: torch.Tensor) -> torch.Tensor | None:
+    # MUSA custom_all_gather is a last-dimension logits collective, not
+    # the dim-0 collective SP requires; custom_reduce_scatter is unavailable.
+    # Use the standard TP collectives (MCCL) for both SP operations.
+    if current_platform.is_musa():
+        return None
     device_communicator = get_tp_group().device_communicator
     if device_communicator is None:
         return None

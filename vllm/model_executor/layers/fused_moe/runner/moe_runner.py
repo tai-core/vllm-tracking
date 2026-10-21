@@ -109,6 +109,55 @@ def _resolve_layer_name(layer_name: str | LayerName) -> str:
     return layer_name
 
 
+def _run_moe_with_graph_boundary(layer, *inputs):
+    # Mirror upstream MoE splitting ops for the breakable-graph path.
+    # HT dispatch needs CPU-visible token counts; its entire dynamic MoE
+    # region must execute outside capture, including shared experts/combine.
+    if layer.moe_config.use_deepep_ht_kernels:
+        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+        from vllm.config.compilation import CUDAGraphMode
+        from vllm.utils.torch_utils import weak_ref_tensors
+
+        capture = BreakableCUDAGraphCapture.current()
+        if capture is not None and capture._capturing:
+            if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
+                raise RuntimeError("DeepEP HT requires PIECEWISE graph capture")
+            weak_inputs = weak_ref_tensors(inputs)
+            # add_eager replays side effects, not return values. Keep MoE's
+            # boundary outputs alive at fixed addresses for downstream graphs.
+            # Initialize them inside the eager call, outside the graph pool.
+            outputs = None
+
+            def forward_into_outputs():
+                nonlocal outputs
+                result = layer._forward_impl(*weak_inputs)
+                values = result if isinstance(result, tuple) else (result,)
+                if outputs is None:
+                    outputs = tuple(
+                        value.clone() if value is not None else None
+                        for value in values
+                    )
+                else:
+                    if len(values) != len(outputs):
+                        raise RuntimeError("MoE graph output structure changed")
+                    for dst, src in zip(outputs, values):
+                        if dst is None and src is None:
+                            continue
+                        if (
+                            dst is None
+                            or src is None
+                            or dst.shape != src.shape
+                            or dst.dtype != src.dtype
+                            or dst.device != src.device
+                        ):
+                            raise RuntimeError("MoE graph output metadata changed")
+                        dst.copy_(src)
+                return outputs if isinstance(result, tuple) else outputs[0]
+
+            return capture.add_eager(forward_into_outputs)
+    return layer._forward_impl(*inputs)
+
+
 # Note: _moe_forward and _moe_forward_shared should not contain any
 # implementation details, They should merely pass along control to
 # the runner's '_forward_impl' method.
@@ -125,7 +174,8 @@ def _moe_forward(
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     return cast(
         torch.Tensor,
-        layer._forward_impl(
+        _run_moe_with_graph_boundary(
+            layer,
             hidden_states,
             router_logits,
             shared_experts_input,
@@ -162,7 +212,8 @@ def _moe_forward_shared(
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     return cast(
         tuple[torch.Tensor, torch.Tensor],
-        layer._forward_impl(
+        _run_moe_with_graph_boundary(
+            layer,
             hidden_states,
             router_logits,
             shared_experts_input,

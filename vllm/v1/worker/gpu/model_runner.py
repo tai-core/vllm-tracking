@@ -1623,7 +1623,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for block_table in block_tables:
                 block_table[:, 0].copy_(state_slots)
         slot_mappings = block_table_provider.get_dummy_slot_mappings(
-            input_batch.num_tokens
+            input_batch.num_tokens_after_padding
         )
         return block_tables, slot_mappings
 
@@ -1881,15 +1881,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
             dummy_num_reqs = batch_desc.num_reqs or num_reqs
+            # PIECEWISE only pads execution tokens, not logical requests.
+            # Preserve the scheduler shape for MTP's reused DP agreement.
+            preserve_dummy_shape = batch_desc.cg_mode == CUDAGraphMode.PIECEWISE
+            dummy_num_tokens = num_toks if preserve_dummy_shape else batch_desc.num_tokens
             input_batch = InputBatch.make_dummy(
                 dummy_num_reqs,
-                batch_desc.num_tokens,
+                dummy_num_tokens,
                 self.input_buffers,
                 max_query_len=batch_desc.max_query_len,
                 # Profiling and warmup must route the dummy tokens to experts
                 # so MoE memory is measured and MoE kernels are exercised.
                 is_padding=not is_profile,
             )
+            if preserve_dummy_shape:
+                padded_tokens = batch_desc.num_tokens
+                input_batch.num_tokens_after_padding = padded_tokens
+                input_batch.input_ids = self.input_buffers.input_ids[:padded_tokens]
+                input_batch.positions = self.input_buffers.positions[:padded_tokens]
+                input_batch.is_padding = self.input_buffers.is_padding[:padded_tokens]
+                input_batch.input_ids[dummy_num_tokens:].zero_()
+                input_batch.positions[dummy_num_tokens:].zero_()
+                input_batch.is_padding[dummy_num_tokens:].fill_(True)
             if randomize_inputs:
                 # All-zero input_ids route every token to the same experts.
                 input_batch.input_ids.random_(0, self.vocab_size)
