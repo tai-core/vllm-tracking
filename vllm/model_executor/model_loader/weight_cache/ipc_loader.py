@@ -300,29 +300,51 @@ class IpcModelLoader(BaseModelLoader):
         modules = dict(model.named_modules(remove_duplicate=False))
         registered: dict[str, torch.Tensor] = {}
 
-        def _register(name: str, tensor: torch.Tensor, is_param: bool) -> None:
+        def _register(
+            name: str,
+            tensor: torch.Tensor,
+            is_param: bool,
+            *,
+            preserve_identity: bool = True,
+        ) -> None:
             module_name, _, leaf = name.rpartition(".")
             module = modules.get(module_name)
             if module is None:
                 raise RuntimeError(f"Cached tensor {name} has no matching module")
-            # Replace via registration rather than param.data assignment,
-            # which fails for meta tensors. Entries may also introduce
-            # post-quantization tensors absent from the meta model.
-            module._parameters.pop(leaf, None)
-            module._buffers.pop(leaf, None)
             if is_param:
                 obj: torch.Tensor = (
                     tensor
                     if isinstance(tensor, nn.Parameter)
                     else nn.Parameter(tensor, requires_grad=False)
                 )
-                module.register_parameter(leaf, obj)
+                placeholder = module._parameters.get(leaf)
+                if (
+                    preserve_identity
+                    and placeholder is not None
+                    and placeholder is not obj
+                    and placeholder.is_meta
+                ):
+                    # Ordinary objects (e.g. MoE routers) may hold this parameter.
+                    # Preserve its identity so their references see loaded data.
+                    torch.utils.swap_tensors(placeholder, obj)
+                    obj = placeholder
+                else:
+                    module._parameters.pop(leaf, None)
+                    module._buffers.pop(leaf, None)
+                    module.register_parameter(leaf, obj)
             else:
+                module._parameters.pop(leaf, None)
+                module._buffers.pop(leaf, None)
                 obj = tensor
                 module.register_buffer(leaf, obj)
             registered[name] = obj
 
-        for name, entry in state.entries.items():
+        # Drop registered views of meta parameters before swapping their bases,
+        # e.g. MambaMixer2.conv_weights holds a view of conv1d.weight.
+        entries = sorted(
+            state.entries.items(), key=lambda item: item[1].kind == "param"
+        )
+        for name, entry in entries:
             tensor = entry.rebuild(device_index)
             if self.mode == "copy":
                 tensor = tensor.clone()
@@ -340,7 +362,11 @@ class IpcModelLoader(BaseModelLoader):
                     canonical_name,
                 )
                 continue
-            _register(alias_name, obj, isinstance(obj, nn.Parameter))
+            # Never swap an alias placeholder with the loaded canonical object:
+            # doing so would move meta data back into the canonical parameter.
+            _register(
+                alias_name, obj, isinstance(obj, nn.Parameter), preserve_identity=False
+            )
 
     def _fetch_entries(self, model_config: ModelConfig) -> WeightCacheState:
         dp_group = get_dp_group()

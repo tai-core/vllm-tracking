@@ -484,3 +484,146 @@ def test_ipc_loader_copy_mode_reports_no_external_weight_memory():
     )
     loader = IpcModelLoader(copy_mode)
     assert loader.get_external_weight_memory(None) == 0
+
+
+@pytest.mark.parametrize("mode", ["zero_copy", "copy"])
+@pytest.mark.parametrize("alias_kind", ["none", "shared", "distinct"])
+def test_ipc_loader_preserves_parameter_references(mode, alias_kind):
+    """Router, container and closure references retain the loaded parameter."""
+    import torch
+    from torch import nn
+
+    from vllm.config import LoadConfig
+    from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
+        GroupedTopKRouter,
+    )
+    from vllm.model_executor.model_loader.weight_cache.ipc_loader import (
+        IpcModelLoader,
+    )
+    from vllm.model_executor.model_loader.weight_cache.protocol import (
+        TensorEntry,
+        WeightCacheState,
+    )
+
+    model = nn.Module()
+    model.gate = nn.Module()
+    model.gate.bias = nn.Parameter(torch.empty(8, device="meta"))
+    original = model.gate.bias
+    references = [original]
+
+    def get_bias():
+        return original
+
+    router = GroupedTopKRouter(
+        top_k=2,
+        global_num_experts=8,
+        num_expert_group=1,
+        topk_group=1,
+        e_score_correction_bias=original,
+    )
+    aliases = {}
+    if alias_kind != "none":
+        model.tied = nn.Module()
+        model.tied.bias = (
+            original
+            if alias_kind == "shared"
+            else nn.Parameter(torch.empty(8, device="meta"))
+        )
+        aliases["tied.bias"] = "gate.bias"
+
+    bias = torch.arange(8, dtype=torch.float32)
+    state = WeightCacheState(
+        entries={"gate.bias": TensorEntry(kind="param", cpu_tensor=bias)},
+        aliases=aliases,
+        attrs={},
+    )
+    loader = IpcModelLoader(
+        LoadConfig(load_format="ipc_cache", model_loader_extra_config={"mode": mode})
+    )
+    loader._apply_entries(model, state, device_index=0)
+
+    assert model.gate.bias is original
+    assert router.e_score_correction_bias is original
+    assert references[0] is original
+    assert get_bias() is original
+    if aliases:
+        assert model.tied.bias is original
+    assert not original.is_meta
+    torch.testing.assert_close(original, bias)
+    assert (original.data_ptr() == bias.data_ptr()) == (mode == "zero_copy")
+
+
+@pytest.mark.parametrize("mode", ["zero_copy", "copy"])
+def test_ipc_loader_replaces_buffer_views_before_swapping_parameters(mode):
+    """A registered meta view must be released before swapping its base."""
+    import torch
+    from torch import nn
+
+    from vllm.config import LoadConfig
+    from vllm.model_executor.model_loader.weight_cache.ipc_loader import (
+        IpcModelLoader,
+    )
+    from vllm.model_executor.model_loader.weight_cache.protocol import (
+        TensorEntry,
+        WeightCacheState,
+    )
+
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.empty(2, 4, device="meta"), requires_grad=False)
+    original = model.weight
+    model.register_buffer("view", model.weight.view(8))
+    weight = torch.arange(8, dtype=torch.float32).view(2, 4)
+    # Deliberately put the parameter first, as named_parameters() export does.
+    state = WeightCacheState(
+        entries={
+            "weight": TensorEntry(kind="param", cpu_tensor=weight),
+            "view": TensorEntry(kind="buffer", cpu_tensor=weight.view(8)),
+        },
+        aliases={},
+        attrs={},
+    )
+    loader = IpcModelLoader(
+        LoadConfig(load_format="ipc_cache", model_loader_extra_config={"mode": mode})
+    )
+    loader._apply_entries(model, state, device_index=0)
+    assert model.weight is original
+    torch.testing.assert_close(model.weight, weight)
+    torch.testing.assert_close(model.view, weight.view(8))
+    assert (model.weight.data_ptr() == weight.data_ptr()) == (mode == "zero_copy")
+
+
+def test_ipc_loader_registers_postprocessed_tensors():
+    """Daemon postprocessing can add tensors or change their registered kind."""
+    import torch
+    from torch import nn
+
+    from vllm.config import LoadConfig
+    from vllm.model_executor.model_loader.weight_cache.ipc_loader import (
+        IpcModelLoader,
+    )
+    from vllm.model_executor.model_loader.weight_cache.protocol import (
+        TensorEntry,
+        WeightCacheState,
+    )
+
+    model = nn.Module()
+    model.register_buffer("to_param", torch.empty(1, device="meta"))
+    model.to_buffer = nn.Parameter(torch.empty(1, device="meta"))
+    model.real_param = nn.Parameter(torch.zeros(1))
+    expected = torch.ones(1)
+    entries = {
+        name: TensorEntry(kind=kind, cpu_tensor=expected)
+        for name, kind in (
+            ("to_param", "param"),
+            ("to_buffer", "buffer"),
+            ("real_param", "param"),
+            ("new_param", "param"),
+            ("new_buffer", "buffer"),
+        )
+    }
+    loader = IpcModelLoader(LoadConfig(load_format="ipc_cache"))
+    loader._apply_entries(model, WeightCacheState(entries, {}, {}), device_index=0)
+    for name, entry in entries.items():
+        actual = getattr(model, name)
+        assert isinstance(actual, nn.Parameter) == (entry.kind == "param")
+        torch.testing.assert_close(actual, expected)
