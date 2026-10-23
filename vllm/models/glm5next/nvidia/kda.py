@@ -386,13 +386,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
     def merged_conv_weight(self) -> torch.Tensor:
         if self._merged_conv_weight is None:
-            self._merged_conv_weight = torch.cat(
-                [
-                    module.weight.view(module.weight.size(0), -1)
-                    for module in (self.q_conv1d, self.k_conv1d, self.v_conv1d)
-                ],
-                dim=0,
-            ).contiguous()
+            weights = []
+            for module in (self.q_conv1d, self.k_conv1d, self.v_conv1d):
+                weight = module.weight
+                assert isinstance(weight, torch.Tensor)
+                weights.append(weight.view(weight.size(0), -1))
+            self._merged_conv_weight = torch.cat(weights, dim=0).contiguous()
         return self._merged_conv_weight
 
     def prefill_core(
@@ -447,6 +446,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         indices = metadata.non_spec_state_indices_tensor
         has_initial = metadata.has_initial_state
         qsl = metadata.non_spec_query_start_loc
+        if indices is None or has_initial is None or qsl is None:
+            raise ValueError(
+                "KDA prefill metadata is missing state indices or boundaries"
+            )
         convolved = causal_conv1d_fn(
             qkv[:count].transpose(0, 1),
             weights,
