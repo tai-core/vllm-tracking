@@ -159,13 +159,19 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
     def get_state_shape(
         self,
+        *,
+        head_shards: int = 1,
     ) -> tuple[tuple[int, ...], ...]:
         # conv_state width must include num_spec so the spec-decode conv update
         # (causal_conv1d_update with num_accepted_tokens + max_query_len) can
         # slide the window across the draft-verify tokens without reading past
         # the allocated width. Matches qwen_gdn_linear_attn.get_state_shape.
+        if head_shards < 1 or self.num_heads % (self.tp_size * head_shards):
+            raise ValueError("KDA heads must be divisible by TP * head_shards")
+        if head_shards > 1 and (self.use_recoverssm or self.num_spec):
+            raise ValueError("Head-sharded KDA state supports prefill only")
         shapes = MambaStateShapeCalculator.kda_state_shape(
-            self.tp_size,
+            self.tp_size * head_shards,
             self.num_heads,
             self.head_dim,
             conv_kernel_size=self.conv_size,
@@ -318,12 +324,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # every _forward call (it reads an env-derived flag each time).
         self._conv_state_dim_first = is_conv_state_dim_first()
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
-        num_tokens = hidden_states.size(0)
+    def project_tokens(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project token-local inputs, retaining all TP-local heads."""
         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
         projected = self.in_proj_qkvbfg_a(hidden_states)[0]
         qkv, beta_raw, f_a, g_a = projected.split(
@@ -349,6 +353,22 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
         g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
 
+        return qkv, g1, beta, g2
+
+    def output_tokens(
+        self, core_attn_out: torch.Tensor, g2: torch.Tensor
+    ) -> torch.Tensor:
+        core_attn_out = self.o_norm(core_attn_out, g2)
+        core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
+        return self.o_proj(core_attn_out)[0]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = hidden_states.size(0)
+        qkv, g1, beta, g2 = self.project_tokens(hidden_states)
         core_attn_out = torch.empty(
             (1, num_tokens, self.local_num_heads, self.head_dim),
             dtype=hidden_states.dtype,
@@ -362,9 +382,104 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             beta=beta,
             core_attn_out=core_attn_out,
         )
-        core_attn_out = self.o_norm(core_attn_out, g2)
-        core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
-        return self.o_proj(core_attn_out)[0]
+        return self.output_tokens(core_attn_out, g2)
+
+    def merged_conv_weight(self) -> torch.Tensor:
+        if self._merged_conv_weight is None:
+            self._merged_conv_weight = torch.cat(
+                [
+                    module.weight.view(module.weight.size(0), -1)
+                    for module in (self.q_conv1d, self.k_conv1d, self.v_conv1d)
+                ],
+                dim=0,
+            ).contiguous()
+        return self._merged_conv_weight
+
+    def prefill_core(
+        self,
+        qkv: torch.Tensor,
+        g1: torch.Tensor,
+        beta: torch.Tensor,
+        metadata: GDNAttentionMetadata,
+        *,
+        head_start: int = 0,
+        head_count: int | None = None,
+    ) -> torch.Tensor:
+        """Advance chronological prefill for an explicit TP-local head interval.
+
+        Projection ownership stays TP-local. Cache ownership must match the
+        supplied interval: recurrent state is [request, head, value, key], and
+        conv channels are q|k|v for the same heads. Padding is excluded by the
+        canonical request metadata before either kernel advances state.
+        """
+        if metadata.num_decodes or metadata.num_spec_decodes:
+            raise ValueError("Head-local KDA supports prefill only")
+        if head_count is None:
+            head_count = self.local_num_heads
+        if (
+            head_count <= 0
+            or head_start < 0
+            or head_start + head_count > self.local_num_heads
+        ):
+            raise ValueError("Invalid KDA local head interval")
+        conv_state, recurrent_state = self.kv_cache[:2]
+        if not self._conv_state_dim_first:
+            conv_state = conv_state.transpose(-1, -2)
+        size = head_count * self.head_dim
+        if (
+            recurrent_state.shape[1:] != (head_count, self.head_dim, self.head_dim)
+            or conv_state.shape[1] != 3 * size
+        ):
+            raise ValueError("KDA cache shape does not match local recurrence heads")
+        if (
+            qkv.shape[-1] != 3 * size
+            or g1.shape[2:] != (head_count, self.head_dim)
+            or beta.shape[2] != head_count
+        ):
+            raise ValueError("KDA projected inputs do not match local recurrence heads")
+        start, stop = (
+            head_start * self.head_dim,
+            (head_start + head_count) * self.head_dim,
+        )
+        weights = self.merged_conv_weight().reshape(3, self.local_projection_size, -1)
+        weights = weights[:, start:stop].reshape(3 * size, -1).contiguous()
+        count = metadata.num_actual_tokens
+        indices = metadata.non_spec_state_indices_tensor
+        has_initial = metadata.has_initial_state
+        qsl = metadata.non_spec_query_start_loc
+        convolved = causal_conv1d_fn(
+            qkv[:count].transpose(0, 1),
+            weights,
+            self.q_conv1d.bias,
+            activation="silu",
+            conv_states=conv_state,
+            has_initial_state=has_initial,
+            cache_indices=indices,
+            query_start_loc=qsl,
+            metadata=metadata,
+        ).transpose(0, 1)
+        q, k, v = (
+            x.reshape(1, count, head_count, self.head_dim)
+            for x in convolved.split(size, dim=-1)
+        )
+        initial = gather_initial_states(recurrent_state, indices, has_initial)
+        output, final = chunk_kda_with_fused_gate(
+            q=q,
+            k=k,
+            v=v,
+            raw_g=g1[:, :count],
+            beta=_cast_sigmoid(beta[:, :count].squeeze(0)).unsqueeze(0),
+            A_log=self.A_log[:, :, head_start : head_start + head_count],
+            g_bias=self.dt_bias[start:stop],
+            initial_state=initial,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=qsl,
+            safe_gate=self.kda_safe_gate,
+            lower_bound=self.kda_lower_bound,
+        )
+        scatter_states(recurrent_state, final, indices)
+        return output
 
     @eager_break_during_capture
     def _forward(
@@ -386,6 +501,21 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # Profile/warmup dummy runs may omit mamba-family metadata.
             return
         assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
+        if self.kv_cache[1].shape[1] != self.local_num_heads:
+            raise ValueError(
+                "Head-sharded KDA state requires PCP prefill or explicit state "
+                "export before ordinary decode"
+            )
+        if (
+            attn_metadata_narrowed.num_prefills > 0
+            and attn_metadata_narrowed.num_decodes == 0
+            and attn_metadata_narrowed.num_spec_decodes == 0
+        ):
+            count = attn_metadata_narrowed.num_actual_tokens
+            core_attn_out[:, :count] = self.prefill_core(
+                qkv_proj_states, g1, beta, attn_metadata_narrowed
+            )
+            return
         has_initial_state = attn_metadata_narrowed.has_initial_state
         non_spec_query_start_loc = attn_metadata_narrowed.non_spec_query_start_loc
         non_spec_state_indices_tensor = (
@@ -419,22 +549,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         if not self._conv_state_dim_first:
             conv_state = conv_state.transpose(-1, -2)
 
-        # One merged short-conv over q|k|v instead of three separate calls. The
-        # 1D conv is independent per channel, so concatenating q/k/v along the
-        # channel dim and running a single causal_conv1d is bit-identical to
-        # three calls. The merged weight is q|k|v conv weights concatenated;
-        # built once and cached (params are fixed after load). conv_state is
-        # already stored as the merged q|k|v state, so it is used directly.
-        if self._merged_conv_weight is None:
-
-            def _w(m):
-                return m.weight.view(m.weight.size(0), m.weight.size(2))
-
-            self._merged_conv_weight = torch.cat(
-                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
-                dim=0,
-            ).contiguous()
-        conv_weights = self._merged_conv_weight
+        conv_weights = self.merged_conv_weight()
         conv_bias = self.q_conv1d.bias
 
         # Split projections / gating into spec (draft-verify) and non-spec token
