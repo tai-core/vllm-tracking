@@ -236,8 +236,10 @@ class ExpertMapManager:
 
         if self.use_ep and self.rocm_aiter_enabled:
             expert_mask = self.expert_mask
-            assert expert_mask is None or torch.all(
-                (expert_mask == 0) | (expert_mask == 1)
+            assert (
+                expert_mask is None
+                or expert_mask.is_meta
+                or torch.all((expert_mask == 0) | (expert_mask == 1))
             ), "Aiter Fused MoE kernel only supports expert_map with 0 and 1s."
 
         # Log EP configuration
@@ -333,6 +335,60 @@ class ExpertMapManager:
         """
         return self._routing_tables
 
+    def bind_cached_tensors(
+        self,
+        expert_map: torch.Tensor | None,
+        expert_mask: torch.Tensor | None,
+        routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    ) -> None:
+        """Bind restored buffers without replacing them with constructor meta state."""
+
+        def validate(
+            name: str,
+            actual: torch.Tensor | None,
+            expected: torch.Tensor | None,
+        ) -> None:
+            if expected is None:
+                if actual is not None:
+                    raise ValueError(f"Unexpected cached {name}")
+                return
+            if actual is None or actual.is_meta:
+                raise ValueError(f"Cached {name} was not restored")
+            if actual.shape != expected.shape or actual.dtype != expected.dtype:
+                raise ValueError(f"Cached {name} layout mismatch")
+            if not torch.equal(actual, expected.to(actual.device)):
+                raise ValueError(f"Cached {name} ownership mismatch")
+
+        # Reuse the canonical placement calculation for small routing metadata;
+        # imported expert weights are never transformed or copied here.
+        with torch.device("cpu"):
+            _, expected_map, expected_mask = determine_expert_map(
+                self.ep_size,
+                self.ep_rank,
+                self.global_num_experts,
+                self.placement_strategy,
+                self.num_fused_shared_experts,
+                self.rocm_aiter_enabled,
+            )
+            expected_tables = (
+                self._init_round_robin_expert_routing_tables()
+                if self._routing_tables is not None
+                else None
+            )
+        validate("expert map", expert_map, expected_map)
+        validate("expert mask", expert_mask, expected_mask)
+        if expected_tables is None:
+            if routing_tables is not None:
+                raise ValueError("Unexpected cached routing tables")
+        else:
+            if routing_tables is None or len(routing_tables) != 3:
+                raise ValueError("Cached routing tables were not restored")
+            for actual, expected in zip(routing_tables, expected_tables):
+                validate("routing table", actual, expected)
+        self._expert_map = expert_map
+        self._expert_mask = expert_mask
+        self._routing_tables = routing_tables
+
     def map_global_to_local(self, global_id: int) -> int:
         """
         Map global expert ID to local expert ID.
@@ -404,6 +460,9 @@ class ExpertMapManager:
         """
         if self._expert_map is None:
             return f"[0..{self.global_num_experts - 1}]"
+
+        if self._expert_map.is_meta:
+            return "<meta>"
 
         global_indices = torch.where(self._expert_map != -1)[0]
         local_indices = self._expert_map[global_indices]

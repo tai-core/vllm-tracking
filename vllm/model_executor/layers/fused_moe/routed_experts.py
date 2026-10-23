@@ -263,6 +263,12 @@ class RoutedExperts(PluggableLayer):
                 "expert_local_to_global", local_global, persistent=False
             )
 
+    def restore_weight_cache_state(self) -> None:
+        """Repair shared manager references before quant/kernel reconstruction."""
+        self.expert_map_manager.bind_cached_tensors(
+            self._expert_map, self.expert_mask, self._expert_routing_tables()
+        )
+
     def _expert_routing_tables(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
