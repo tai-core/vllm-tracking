@@ -401,6 +401,7 @@ def sparse_attn_indexer_kpool(
     # path and when the tail cache is disabled.
     tail_kv_cache: torch.Tensor | None = None,
     tail_prefix: str | None = None,
+    cache_prepared: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -465,7 +466,7 @@ def sparse_attn_indexer_kpool(
     if k is not None:
         k = k[:num_tokens]
 
-    if not skip_k_cache_insert:
+    if not skip_k_cache_insert and not cache_prepared:
         assert not use_fp4_cache, "Unfused FP4 Insert is not supported yet"
         if index_kpool > 1 and gate_score is not None and compress_ape is not None:
             # kpool prefill write: pool kpool consecutive prefill tokens via
@@ -906,6 +907,7 @@ def sparse_attn_indexer_kpool(
             and compress_ape is not None
             and positions is not None
             and not skip_k_cache_insert
+            and not cache_prepared
         ):
             num_requests = attn_metadata_narrowed.num_decodes
             # Kpool writes must recover the original request grouping after the
@@ -1281,6 +1283,7 @@ class SparseAttnIndexerKpool(CustomOp):
         compress_ape: torch.Tensor | None = None,
         index_kpool: int = 1,
         positions: torch.Tensor | None = None,
+        cache_prepared: bool = False,
     ):
         if current_platform.is_cuda() or current_platform.is_xpu():
             return self.forward_cuda(
@@ -1292,6 +1295,7 @@ class SparseAttnIndexerKpool(CustomOp):
                 compress_ape=compress_ape,
                 index_kpool=index_kpool,
                 positions=positions,
+                cache_prepared=cache_prepared,
             )
         elif current_platform.is_rocm():
             return self.forward_hip(
@@ -1303,6 +1307,7 @@ class SparseAttnIndexerKpool(CustomOp):
                 compress_ape=compress_ape,
                 index_kpool=index_kpool,
                 positions=positions,
+                cache_prepared=cache_prepared,
             )
         else:
             raise NotImplementedError(
@@ -1321,6 +1326,7 @@ class SparseAttnIndexerKpool(CustomOp):
         compress_ape: torch.Tensor | None = None,
         index_kpool: int = 1,
         positions: torch.Tensor | None = None,
+        cache_prepared: bool = False,
     ):
         # FP8 path: single tensor (per-token scale is folded into `weights`).
         # FP4 path: (values, scales) tuple with scales required by the kernel.
@@ -1351,6 +1357,7 @@ class SparseAttnIndexerKpool(CustomOp):
             positions,
             self.tail_cache.kv_cache if self.tail_cache is not None else None,
             self.tail_cache.prefix if self.tail_cache is not None else None,
+            cache_prepared,
         )
 
     def forward_hip(
@@ -1364,6 +1371,7 @@ class SparseAttnIndexerKpool(CustomOp):
         compress_ape: torch.Tensor | None = None,
         index_kpool: int = 1,
         positions: torch.Tensor | None = None,
+        cache_prepared: bool = False,
     ):
         assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"
         assert isinstance(q_quant, torch.Tensor), (
@@ -1385,7 +1393,7 @@ class SparseAttnIndexerKpool(CustomOp):
                     self.max_model_len,
                     self.max_total_seq_len,
                     self.topk_indices_buffer,
-                    skip_k_cache_insert=self.skip_k_cache_insert,
+                    skip_k_cache_insert=self.skip_k_cache_insert or cache_prepared,
                 )
             return self.forward_cuda(
                 hidden_states,
@@ -1396,6 +1404,7 @@ class SparseAttnIndexerKpool(CustomOp):
                 compress_ape=compress_ape,
                 index_kpool=index_kpool,
                 positions=positions,
+                cache_prepared=cache_prepared,
             )
         raise RuntimeError(
             "Sparse attention indexer ROCm path is only supported on AITER. "

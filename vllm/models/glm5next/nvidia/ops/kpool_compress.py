@@ -976,3 +976,56 @@ def expand_pools_and_append_tail(
         out_s0=out.stride(0),
     )
     return out
+
+
+def _insert_compressed_cache_bytes(
+    kv_cache: torch.Tensor,
+    values: torch.Tensor,
+    scales: torch.Tensor,
+    loc: torch.Tensor,
+    *,
+    preshuffle: bool = False,
+) -> None:
+    """Scatter quantized bytes into page K/scale regions without requantizing."""
+    assert kv_cache.dtype == torch.uint8 and kv_cache.ndim == 3
+    assert values.ndim == 2 and values.element_size() == 1
+    assert scales.dtype == torch.float32 and scales.shape == loc.shape
+    assert values.shape[0] == loc.numel()
+    page_size, head_dim = kv_cache.shape[1], values.shape[1]
+    assert kv_cache.shape[2] == head_dim + 4
+    assert kv_cache.stride(2) == 1 and kv_cache.stride(1) == head_dim + 4
+    if preshuffle:
+        assert page_size % 16 == 0 and head_dim % 16 == 0
+    if loc.numel() == 0:
+        return
+    pages = torch.as_strided(
+        kv_cache,
+        (kv_cache.shape[0], page_size * (head_dim + 4)),
+        (kv_cache.stride(0), 1),
+    )
+    block, token = loc // page_size, loc % page_size
+    dim = torch.arange(head_dim, device=loc.device)[None, :]
+    token = token[:, None]
+    if preshuffle:
+        offsets = (
+            token // 16 * 16 * head_dim + dim // 16 * 256 + token % 16 * 16 + dim % 16
+        )
+    else:
+        offsets = token * head_dim + dim
+    pages[block[:, None], offsets] = values.contiguous().view(torch.uint8)
+    scale_offsets = (
+        page_size * head_dim + token * 4 + torch.arange(4, device=loc.device)
+    )
+    pages[block[:, None], scale_offsets] = (
+        scales.contiguous().view(-1, 1).view(torch.uint8)
+    )
+
+
+def kpool_insert_compressed(
+    kv_cache: torch.Tensor,
+    values: torch.Tensor,
+    scales: torch.Tensor,
+    loc: torch.Tensor,
+) -> None:
+    """Insert owner-compressed FP8 bytes/scales into the NVIDIA page layout."""
+    _insert_compressed_cache_bytes(kv_cache, values, scales, loc)

@@ -22,10 +22,27 @@ the resolver contract and the writers' dispatch on it:
 
 from __future__ import annotations
 
-import importlib
+import importlib.util
+import sys
+from pathlib import Path
 
 import pytest
 import torch
+
+
+def _load_ops(platform, monkeypatch):
+    # Load only the ops module: importing the model package pulls GPU/model
+    # dependencies into this CPU-only layout suite.
+    name = f"vllm.models.glm5next.{platform}.ops.kpool_compress"
+    path = (
+        Path(__file__).parents[3]
+        / f"vllm/models/glm5next/{platform}/ops/kpool_compress.py"
+    )
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, mod)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _fresh_resolver(monkeypatch, layout_env=None, backend_env=None):
@@ -36,7 +53,7 @@ def _fresh_resolver(monkeypatch, layout_env=None, backend_env=None):
         monkeypatch.delenv("VLLM_HCU_GLM_PAGED_MQA_BACKEND", raising=False)
     else:
         monkeypatch.setenv("VLLM_HCU_GLM_PAGED_MQA_BACKEND", backend_env)
-    mod = importlib.import_module("vllm.models.glm5next.amd.ops.kpool_compress")
+    mod = _load_ops("amd", monkeypatch)
     mod.indexer_cache_layout.cache_clear()
     return mod
 
@@ -167,3 +184,53 @@ class TestWritersConsultResolver:
         args = self._writer_args(page_size=50)  # not a multiple of 16
         with pytest.raises(AssertionError, match="16-token tiles"):
             mod.kpool_compress_and_write_cache(*args)
+
+
+@pytest.mark.parametrize(
+    "platform,layout,page_size",
+    [
+        ("nvidia", "linear", 16),
+        ("amd", "linear", 16),
+        ("amd", "preshuffle", 32),
+        ("amd", "preshuffle", 1),
+    ],
+)
+def test_precompressed_insert_preserves_bytes_scales_and_page_stride(
+    monkeypatch, platform, layout, page_size
+):
+    """Owner-produced bytes must survive replication without requantization."""
+    _load_ops("nvidia", monkeypatch)
+    mod = _load_ops(platform, monkeypatch)
+    if platform == "amd":
+        monkeypatch.setenv("VLLM_HCU_GLM_INDEXER_CACHE_LAYOUT", layout)
+        mod.indexer_cache_layout.cache_clear()
+    storage = torch.full((3, page_size * 132 + 20), 193, dtype=torch.uint8)
+    cache = storage[:, : page_size * 132].view(3, page_size, 132)
+    values = torch.arange(3 * 128).remainder(256).byte().reshape(3, 128)
+    scales = torch.tensor([0.25, 8.0, 0.03125])
+    slots = torch.tensor([0, page_size + page_size - 1, page_size * 2])
+    assert hasattr(mod, "kpool_insert_compressed"), (
+        "precompressed cache boundary required"
+    )
+    mod.kpool_insert_compressed(cache, values, scales, slots)
+    expected = torch.full_like(storage, 193)
+    for row, slot in enumerate(slots.tolist()):
+        block, token = divmod(slot, page_size)
+        for d in range(128):
+            offset = (
+                (
+                    (token // 16) * 16 * 128
+                    + (d // 16) * 256
+                    + (token % 16) * 16
+                    + d % 16
+                )
+                if platform == "amd" and layout == "preshuffle" and page_size > 1
+                else token * 128 + d
+            )
+            expected[block, offset] = values[row, d]
+        expected[
+            block, page_size * 128 + token * 4 : page_size * 128 + (token + 1) * 4
+        ] = scales[row : row + 1].view(torch.uint8)
+    torch.testing.assert_close(storage, expected)
+    mod.kpool_insert_compressed(cache, values[:0], scales[:0], slots[:0])
+    torch.testing.assert_close(storage, expected)

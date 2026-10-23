@@ -1019,3 +1019,23 @@ def expand_pools_and_append_tail(
         out_s0=out.stride(0),
     )
     return out
+
+
+def kpool_insert_compressed(
+    kv_cache: torch.Tensor,
+    values: torch.Tensor,
+    scales: torch.Tensor,
+    loc: torch.Tensor,
+) -> None:
+    """Insert owner-compressed FP8 bytes/scales using the AMD reader layout."""
+    from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+        _insert_compressed_cache_bytes,
+    )
+
+    _insert_compressed_cache_bytes(
+        kv_cache,
+        values,
+        scales,
+        loc,
+        preshuffle=indexer_cache_preshuffle(kv_cache.shape[1]),
+    )

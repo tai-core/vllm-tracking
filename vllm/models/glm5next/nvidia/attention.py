@@ -359,9 +359,9 @@ class Indexer(nn.Module):
             tail_cache=self.tail_cache,
         )
 
-    def forward(
+    def project_tokens(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
 
@@ -435,6 +435,14 @@ class Indexer(nn.Module):
             q_fp8 = _pad_indexer_heads(q_fp8, pad)
             weights = _pad_indexer_heads(weights, pad)
 
+        return q_fp8, k, weights, gate_score
+
+    def forward(
+        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+    ) -> torch.Tensor:
+        q_fp8, k, weights, gate_score = self.project_tokens(
+            hidden_states, qr, positions, rotary_emb
+        )
         return self.indexer_op(
             hidden_states,
             q_fp8,
