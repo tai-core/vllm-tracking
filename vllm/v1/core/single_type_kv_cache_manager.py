@@ -1376,7 +1376,7 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> None:
         super().__init__(kv_cache_spec, block_pool, **kwargs)
         # Mamba layers use TP instead of DCP, so each rank holds the full
-        # recurrent state. Undo the DCP/PCP block_size scaling that the base
+        # recurrent state. Undo the DCP block_size scaling that the base
         # class applies for attention groups whose KV cache is partitioned.
         self.block_size = kv_cache_spec.block_size
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
@@ -1414,7 +1414,8 @@ class MambaManager(SingleTypeKVCacheManager):
             "MambaManager can only be used for mamba groups"
         )
         assert dcp_world_size == 1, "DCP not support mamba now."
-        assert pcp_world_size == 1, "PCP not support mamba now."
+        # PCP replicas advance the same request-global recurrent state, so
+        # checkpoint hashes and token boundaries use the physical block size.
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,

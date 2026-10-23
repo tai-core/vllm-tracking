@@ -6,7 +6,9 @@ import random
 import pytest
 import torch
 
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
@@ -19,17 +21,212 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     MambaManager,
     RSWAManager,
     SlidingWindowManager,
+    register_all_kvcache_specs,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
     FullAttentionSpec,
+    KpoolTailSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
     MambaSpec,
+    MLAAttentionSpec,
     RSWASpec,
     SlidingWindowSpec,
 )
+from vllm.v1.request import Request
 
 pytestmark = pytest.mark.cpu_test
+
+
+def _make_pcp_hybrid_coordinator(attention_spec, pcp_world_size):
+    register_all_kvcache_specs(None)
+    config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attention"], attention_spec),
+            KVCacheGroupSpec(
+                ["state"],
+                MambaSpec(
+                    block_size=4,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["tail"],
+                KpoolTailSpec(
+                    block_size=2,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=2,
+                ),
+            ),
+        ],
+    )
+    return HybridKVCacheCoordinator(
+        config,
+        max_model_len=32,
+        max_in_flight_tokens=16,
+        use_eagle=False,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+        pcp_world_size=pcp_world_size,
+        scheduler_block_size=4,
+        hash_block_size=2,
+    )
+
+
+@pytest.mark.parametrize("pcp_world_size", [1, 2, 4])
+@pytest.mark.parametrize("attention_type", [FullAttentionSpec, MLAAttentionSpec])
+def test_hybrid_pcp_prefix_cache_keeps_per_group_geometry(
+    pcp_world_size, attention_type
+):
+    coordinator = _make_pcp_hybrid_coordinator(
+        attention_type(block_size=2, num_kv_heads=1, head_size=1, dtype=torch.float32),
+        pcp_world_size,
+    )
+    request = Request(
+        request_id="producer",
+        prompt_token_ids=list(range(9)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+    )
+    request.block_hashes = [BlockHash(bytes([i])) for i in range(4)]
+    coordinator.allocate_new_blocks("producer", 8, 8)
+    coordinator.cache_blocks(request, 8)
+    coordinator.new_step_starts()
+    hits, hit_length, uncached = coordinator.find_longest_cache_hit(
+        request.block_hashes, 8
+    )
+    assert [manager.block_size for manager in coordinator.single_type_managers] == [
+        2,
+        4,
+        2,
+    ]
+    assert [[block.block_id for block in hit] for hit in hits] == [
+        [1, 2, 3, 4],
+        [0, 5],
+        [],
+    ]
+    assert (hit_length, uncached) == (8, 0)
+    coordinator.allocate_new_computed_blocks("consumer", hits, 8, 0)
+    coordinator.allocate_new_blocks("consumer", 12, 12)
+    assert [
+        [block.block_id for block in manager.req_to_blocks["consumer"]]
+        for manager in coordinator.single_type_managers
+    ] == [[1, 2, 3, 4, 7, 8], [0, 5, 9], [10]]
+
+
+@pytest.mark.parametrize(
+    "attention_type, window",
+    [
+        (SlidingWindowSpec, {"sliding_window": 4}),
+        (RSWASpec, {"rswa_window": 4}),
+    ],
+)
+def test_hybrid_pcp_rejects_unsupported_attention(attention_type, window):
+    with pytest.raises(AssertionError, match="PCP"):
+        _make_pcp_hybrid_coordinator(
+            attention_type(
+                block_size=2,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                **window,
+            ),
+            pcp_world_size=2,
+        )
+
+
+@pytest.mark.parametrize("pcp_world_size", [1, 2, 4])
+def test_mamba_pcp_reuses_request_global_state(pcp_world_size):
+    """PCP replicas retain the same checkpoint boundaries and resume slots."""
+    spec = MambaSpec(
+        block_size=4,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    pool = BlockPool(num_gpu_blocks=16, enable_caching=True, hash_block_size=4)
+    request = Request(
+        request_id="producer",
+        prompt_token_ids=list(range(13)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+    )
+    request.block_hashes = [BlockHash(bytes([i])) for i in range(3)]
+    managers = [
+        MambaManager(
+            spec,
+            block_pool=pool,
+            enable_caching=True,
+            kv_cache_group_id=group_id,
+            scheduler_block_size=4,
+            pcp_world_size=pcp_world_size,
+        )
+        for group_id in (0, 1)
+    ]
+    for manager in managers:
+        manager.allocate_new_blocks("producer", 8, 8)
+        manager.cache_blocks(request, 8)
+        manager.allocate_new_blocks("producer", 12, 12)
+        manager.cache_blocks(request, 12)
+        manager.new_step_starts()
+
+    assert [
+        [block.block_id for block in manager.req_to_blocks["producer"]]
+        for manager in managers
+    ] == [[0, 1, 2], [0, 3, 4]]
+
+    for max_length, expected_ids, expected_length in (
+        (3, [[], []], 0),
+        (11, [[0, 1], [0, 3]], 8),
+        (12, [[0, 0, 2], [0, 0, 4]], 12),
+    ):
+        hits, hit_length = MambaManager.find_longest_cache_hit(
+            block_hashes=request.block_hashes,
+            max_length=max_length,
+            kv_cache_group_ids=[0, 1],
+            block_pool=pool,
+            kv_cache_spec=spec,
+            drop_eagle_block=False,
+            alignment_tokens=4,
+            pcp_world_size=pcp_world_size,
+        )
+        assert [[block.block_id for block in hit] for hit in hits] == expected_ids
+        assert hit_length == expected_length
+
+    for manager, hit in zip(managers, hits):
+        assert manager.get_num_blocks_to_allocate("consumer", 16, hit, 12, 12, 16) == 1
+        manager.add_local_computed_blocks("consumer", hit, 12, 0)
+        manager.allocate_new_blocks("consumer", 16, 16)
+    assert [
+        [block.block_id for block in manager.req_to_blocks["consumer"]]
+        for manager in managers
+    ] == [[0, 0, 2, 5], [0, 0, 4, 6]]
+
+
+def test_mamba_prefix_lookup_still_rejects_dcp():
+    spec = MambaSpec(block_size=4, shapes=((1, 1),), dtypes=(torch.float32,))
+    pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=4)
+    with pytest.raises(AssertionError, match="DCP"):
+        MambaManager.find_longest_cache_hit(
+            block_hashes=[],
+            max_length=0,
+            kv_cache_group_ids=[0],
+            block_pool=pool,
+            kv_cache_spec=spec,
+            drop_eagle_block=False,
+            alignment_tokens=4,
+            dcp_world_size=2,
+            pcp_world_size=2,
+        )
 
 
 def test_external_computed_blocks_do_not_corrupt_free_pool():

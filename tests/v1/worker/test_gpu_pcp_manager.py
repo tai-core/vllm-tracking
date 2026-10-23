@@ -1,11 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
+
+
+@pytest.mark.parametrize(
+    "pcp_size, is_hybrid, rejected",
+    [(1, True, False), (2, False, False), (2, True, True)],
+)
+def test_default_pcp_requires_hybrid_runtime_support(pcp_size, is_hybrid, rejected):
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=pcp_size, pipeline_parallel_size=1
+        ),
+        model_config=SimpleNamespace(
+            use_mla=True,
+            is_hybrid=is_hybrid,
+            is_encoder_decoder=False,
+            hf_text_config=SimpleNamespace(),
+        ),
+        lora_config=None,
+        speculative_config=None,
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
+    )
+    if rejected:
+        with pytest.raises(NotImplementedError, match="hybrid"):
+            PCPManager.validate_config(config, supports_mm_inputs=False)
+    else:
+        PCPManager.validate_config(config, supports_mm_inputs=False)
 
 
 def _copy_to_cpu(value, out=None, device=None):

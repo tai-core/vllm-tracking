@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
+    MLAAttentionSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
@@ -617,7 +618,20 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             f"hash_block_size. block_sizes={group_block_sizes}, "
             f"hash_block_size={hash_block_size}"
         )
-        assert pcp_world_size == 1, "PCP not support hybrid attn now."
+        if pcp_world_size > 1:
+            # PCP keeps request-global KV ownership and replicated state.
+            # Runtime support is validated separately by the model runner.
+            for g in kv_cache_config.kv_cache_groups:
+                assert type(g.kv_cache_spec) in (
+                    FullAttentionSpec,
+                    MLAAttentionSpec,
+                    MambaSpec,
+                    KpoolTailSpec,
+                ), (
+                    "PCP with hybrid KV cache layouts only supports "
+                    "full-attention, MLA, Mamba and KPool tail groups, got: "
+                    f"{type(g.kv_cache_spec).__name__}."
+                )
         if dcp_world_size > 1:
             # DCP shards full-attention KV across ranks and replicates Mamba
             # state. KPool tail uses a per-rank, one-block scratch ring and
