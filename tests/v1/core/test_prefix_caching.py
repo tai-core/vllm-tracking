@@ -3,6 +3,7 @@
 """Compare the with and without prefix caching."""
 
 import copy
+from collections import deque
 from collections.abc import Callable
 from dataclasses import replace
 from math import lcm
@@ -6375,3 +6376,39 @@ def test_musa_dedicated_mamba_pool_keeps_prefix_cache(monkeypatch):
     manager.free(first)
     manager.free(second)
     assert mamba_manager.block_pool.null_block.ref_cnt == null_ref_count
+
+
+@pytest.mark.parametrize("release_path", ["cow", "deferred", "deferred_cow"])
+def test_scheduler_free_blocks_preserves_pool_ownership_and_order(release_path):
+    """Scheduler releases must honor block ownership, fences and eviction order."""
+    shared_pool = BlockPool(8, False, 16)
+    state_pool = BlockPool(8, False, 16)
+    shared_blocks = shared_pool.get_new_blocks(2)
+    state_blocks = state_pool.get_new_blocks(2)
+    manager = object.__new__(KVCacheManager)
+    manager.block_pool = shared_pool
+    scheduler = object.__new__(Scheduler)
+    scheduler.kv_cache_manager = manager
+    scheduler.defer_block_free = True
+    scheduler.processed_step_seq = 0
+    scheduler.deferred_frees = deque()
+    blocks = [shared_blocks[0], state_blocks[0], shared_blocks[1], state_blocks[1]]
+
+    if release_path == "cow":
+        scheduler._free_cow_retained_blocks(blocks[::-1], fence_seq=0)
+    else:
+        if release_path == "deferred":
+            scheduler.deferred_frees.append((1, blocks))
+        else:
+            scheduler._free_cow_retained_blocks(blocks[::-1], fence_seq=1)
+        scheduler._drain_deferred_frees()
+        assert all(block.ref_cnt == 1 for block in blocks)
+        scheduler.processed_step_seq = 1
+        scheduler._drain_deferred_frees()
+
+    assert not scheduler.deferred_frees
+    assert shared_pool.get_num_free_blocks() == 7
+    assert state_pool.get_num_free_blocks() == 7
+    assert all(block.ref_cnt == 0 for block in blocks)
+    assert shared_pool.get_new_blocks(2) == shared_blocks[::-1]
+    assert state_pool.get_new_blocks(2) == state_blocks[::-1]
