@@ -97,3 +97,45 @@ cross-run comparison: 3,797 named tensors including aliases, 1,375 nonempty IPC
 entries, one empty RoPE buffer, and 42 routed MoE layers per rank. Both process
 exits were zero. This result establishes loading/restart identity only; the
 separate Indexer numerical gate was failing and is not waived by this probe.
+
+## Prefill serving follow-up, 2026-10-25
+
+The companion [Plugin PR #57](https://github.com/tai-core/vllm-plugin-das-glm53-bw1000/pull/57)
+adds a separate final-token quality study using the same resident producer and
+zero-copy clients. Core's `vllm` runtime tree remains unchanged. The measured
+configuration is TP1/PCP8/EP8, eager text Prefill, with one generated token per
+request; it does not establish Decode or production P-D behavior.
+
+The current acceptance allows ordinary floating-point differences. Twenty
+constructed natural-language multiple-choice prompts scored 20/20 under both
+C1 and C4. Full-vocabulary total variation reached 0.36% for 2K and 1.38% for
+12K. Logits and some distribution screening alerts remain disclosed; this small
+smoke set cannot certify overall model quality. The 64-request study includes
+actual mixed continuation/fresh-request steps, complete ordered chunk coverage,
+and short requests repeated after long requests. Quality observation and forced
+four-request intake are excluded from performance timing.
+
+Default fast BF16 projections remain enabled. The maintained FlashKDA-DCU
+backend is not connected in these runs; recurrence uses core's AMD/FLA-derived
+implementation. The companion quality tools compare the same token's
+probability and full unmasked distributions, rather than requiring arbitrary
+random-prompt generated tokens to match exactly.
+
+See the companion [quality report](https://github.com/tai-core/vllm-plugin-das-glm53-bw1000/blob/5f04900f7b4930aabd48461f0d3973b60bd9ea97/docs/ep-prefill-quality-20261025.md)
+for source hashes, the frozen screening policy, preserved alerts, and limits.
+Loading/storage identity, model quality, and throughput are separate pieces of
+evidence; this IPC tool continues to validate loading and restart identity only.
+
+Separate uninstrumented ON/OFF and reverse-order follow-ups contain 832 valid
+requests, including 640 measurements. The secondary combined 2K/c4 result is
+6268.39 -> 7253.42 input tokens/s (+15.71%), with SSE TTFT p95
+1.4530 -> 1.1482 seconds (-20.98%). No ON window fell below the historical
+6000-token/s slow-band threshold (0/12 versus OFF7/12).
+
+The initial single-window C2 regression (-4.66% throughput) remains in the
+report. Reverse six-window confirmation measured +1.94%; the combined C2
+summary is +0.95% throughput and -3.22% p95. This does not prove zero overhead:
+C1 p95 rose 3.16% in a small sample, and long-control throughput varied
+-0.71% to +0.33%. The companion [performance report](https://github.com/tai-core/vllm-plugin-das-glm53-bw1000/blob/041074ce6762d779e9577c1392e859ddf3d574a4/docs/ep-async-prefill-recheck-20261025.md)
+preserves each pair, raw-source hashes, the excluded failed harness run, and
+the measurement limits. The producer and core runtime remain unchanged.
