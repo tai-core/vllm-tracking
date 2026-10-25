@@ -157,7 +157,7 @@ and first actual execution on every worker. Explicit unsupported selections or
 missing extensions fail instead of falling back. FlashKDA accepts FP32 cache
 buffers but rounds recurrent state through BF16 internally.
 
-The source-pinned native study passed 92 numerical checks against an independent
+The initial source-pinned native study passed 92 numerical checks against an independent
 FP64 recurrence, including C1/C4, head slicing and next-chunk continuity. It
 showed faster local H8 recurrence for 2K layouts, slower single-sequence 8K, and
 slightly higher FP64 error than AMD/FLA. The 5% relative-L2 component screen is
@@ -171,7 +171,7 @@ checks. Cross-backend full-vocabulary TV reached 0.48% on 2K and 1.35% on 12K;
 all numerical screening alerts remain disclosed. This is a small constructed
 task smoke test, not general model-quality certification.
 
-A separate uninstrumented 300-request comparison measured 2K/C2 throughput
+The initial uninstrumented 300-request comparison measured 2K/C2 throughput
 4252.67 -> 5144.16 input tokens/s (+20.96%), with SSE TTFT p95
 1.03995 -> 0.81952 seconds (-21.20%). 2K/C4 throughput rose 5.40% and C1 rose
 16.76%, while 8K and 32767-token controls lost 5.87%-6.39% throughput. FLA
@@ -182,3 +182,28 @@ See the companion [full report](https://github.com/tai-core/vllm-plugin-das-glm5
 and JSON for matching hashes, per-window results, quality limits and cleanup.
 The same resident producer survived every run; no daemon restart, checkpoint
 fallback or changes to node08 were needed.
+
+### FlashKDA long-request optimization follow-up
+
+The final native candidate `25c67a311ed2645feb3aeb59912dc350b598dcf9`
+adds value-column partitioning, DPP layout exchanges, operand prefetch and
+overlapping loader reads. AUTO uses one loader wave for narrow value partitions;
+the core and plugin runtime remain the same as the earlier client study.
+
+A new matched 486-request run (360 measured, 102 warmup, 24 ingress audit)
+measured 8K/32767-token throughput 5.57%-5.85% above the original FlashKDA,
+with TTFT p95 5.16%-5.42% lower. The optimized long controls remain
+0.51%-1.28% below FLA throughput. 2K/C1/C2/C4 throughput is respectively
+15.92%/16.84%/9.18% above FLA, preserving the short-request gains.
+
+The candidate passed 153 CPU contracts, 83 exact native output/state and
+continuation checks, and 92 FP64/AMD/Flash checks. In 128 model-quality requests,
+C1/C4 remained 20/20; 64 matched full-vocabulary captures were identical to
+original FlashKDA. These are bounded smoke results, with existing distribution
+alerts retained. FLA remains the default backend. The original producer stayed
+resident and all test clients were cleaned up; node08 was not changed.
+
+See the updated companion
+[optimization report](https://github.com/tai-core/vllm-plugin-das-glm53-bw1000/blob/codex/weight-cache-static-ep/docs/ep-flashkda-long-optimization-20261025.md).
+The completed run is the final acceptance scope; no additional reverse-order
+run or final-candidate model profile was performed.
