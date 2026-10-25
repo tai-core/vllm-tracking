@@ -140,25 +140,46 @@ def _cast_sigmoid(x: torch.Tensor) -> torch.Tensor:
 def _resolve_kda_prefill_backend(
     backend: str, head_dim: int, dtype: torch.dtype, lower_bound: float | None
 ) -> str:
-    """Pick the chunked-prefill kernel: FlashKDA (fused CUDA, ~2-4x faster on
-    SM90/SM10x/SM12x for bf16, head_dim 128 and a bounded gate) or the Triton
+    """Pick FlashKDA on supported accelerators (including MUSA MP31) or the Triton
     ``chunk_kda_with_fused_gate`` path. ``backend`` comes from
     ``additional_config.kda_prefill_backend`` (auto / triton / flashkda)."""
     if backend not in ("auto", "triton", "flashkda"):
         raise ValueError(f"Unsupported KDA prefill backend: {backend}")
-    capability = current_platform.get_device_capability()
+    is_musa = current_platform.device_type == "musa"
+    if is_musa:
+        # Query the native architecture, not a compatibility capability.
+        import torch_musa  # noqa: F401
+
+        architecture_supported = torch.musa.get_device_capability() == (3, 1)
+    else:
+        capability = current_platform.get_device_capability()
+        architecture_supported = (
+            current_platform.is_cuda()
+            and capability is not None
+            and capability.major in (9, 10, 12)
+        )
     supported = (
-        current_platform.is_cuda()
-        and capability is not None
-        and capability.major in (9, 10, 12)
+        architecture_supported
         and head_dim == 128
         and dtype == torch.bfloat16
         and lower_bound is not None
+        and (not is_musa or -5.0 <= lower_bound <= 0.0)
     )
+    if is_musa and supported and backend != "triton":
+        try:
+            import flash_kda  # noqa: F401
+
+            _ = torch.ops.flash_kda.fwd
+        except (ImportError, AttributeError) as exc:
+            if backend == "flashkda":
+                raise RuntimeError(
+                    "MUSA FlashKDA is not installed; build FlashKDA for MP31."
+                ) from exc
+            supported = False
     if backend == "flashkda" and not supported:
         raise RuntimeError(
-            "FlashKDA requires CUDA SM90/SM10x/SM12x, bfloat16, head_dim=128 "
-            "and a bounded KDA gate."
+            "FlashKDA requires a supported accelerator, bfloat16, head_dim=128 "
+            "and a bounded KDA gate in [-5, 0]."
         )
     return "flashkda" if supported and backend != "triton" else "triton"
 
@@ -381,11 +402,18 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         ) = None
         self._checkpoint_exporter: FlashKDAPrefillCheckpointExporter | None = None
         if self.kda_prefill_backend == "flashkda":
-            import vllm._flashkda_C  # noqa: F401
+            if current_platform.device_type == "musa":
+                import flash_kda  # noqa: F401
+
+                flashkda_ops = torch.ops.flash_kda
+            else:
+                import vllm._flashkda_C  # noqa: F401
+
+                flashkda_ops = torch.ops._flashkda_C
 
             max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             max_seqs = vllm_config.scheduler_config.max_num_seqs
-            workspace_size = torch.ops._flashkda_C.get_workspace_size(
+            workspace_size = flashkda_ops.get_workspace_size(
                 max_tokens, self.local_num_heads, max_seqs
             )
             self._flashkda_buffer_specs = (
@@ -443,7 +471,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         if out is None:
             out = workspace_out[:, : q.shape[1]]
         # FlashKDA hardcodes dense q/k/v/g strides; beta may be row-strided.
-        torch.ops._flashkda_C.fwd(
+        flashkda_ops = (
+            torch.ops.flash_kda
+            if current_platform.device_type == "musa"
+            else torch.ops._flashkda_C
+        )
+        flashkda_ops.fwd(
             q.contiguous(),
             k.contiguous(),
             v.contiguous(),

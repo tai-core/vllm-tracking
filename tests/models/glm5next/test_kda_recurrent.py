@@ -19,7 +19,8 @@ else:
     from vllm.models.glm5next.nvidia.ops.third_party.kda import fused_recurrent_kda
 
 pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda_alike(), reason="Requires CUDA or ROCm"
+    not (current_platform.is_cuda_alike() or current_platform.device_type == "musa"),
+    reason="Requires a supported accelerator",
 )
 
 H, D = 16, 128
@@ -286,7 +287,14 @@ def test_prefill_checkpoint_resumes_suffix(monkeypatch, dim_first, num_spec, off
 
     if kda._resolve_kda_prefill_backend("auto", D, torch.bfloat16, -5) != "flashkda":
         pytest.skip("requires FlashKDA")
-    import vllm._flashkda_C  # noqa: F401
+    if current_platform.device_type == "musa":
+        import flash_kda  # noqa: F401
+
+        flashkda_ops = torch.ops.flash_kda
+    else:
+        import vllm._flashkda_C  # noqa: F401
+
+        flashkda_ops = torch.ops._flashkda_C
 
     torch.manual_seed(42)
     device = torch.device("cuda")
@@ -312,7 +320,7 @@ def test_prefill_checkpoint_resumes_suffix(monkeypatch, dim_first, num_spec, off
         (state_shape, torch.float32),
         (state_shape, torch.float32),
         (
-            (torch.ops._flashkda_C.get_workspace_size(2 * length, heads, 2),),
+            (flashkda_ops.get_workspace_size(2 * length, heads, 2),),
             torch.uint8,
         ),
         ((1, 2 * length, heads, D), torch.bfloat16),
@@ -430,3 +438,34 @@ def test_prefill_checkpoint_resumes_suffix(monkeypatch, dim_first, num_spec, off
         actual[:, : length - offset], expected[:, suffix], atol=0.003, rtol=0.03
     )
     torch.testing.assert_close(recurrent[3], expected_state, atol=0.003, rtol=0.03)
+
+
+@pytest.mark.parametrize("backend", ["auto", "flashkda", "triton"])
+def test_musa_prefill_backend_selection(backend):
+    if current_platform.device_type != "musa":
+        pytest.skip("MUSA-specific backend selection")
+    from vllm.models.glm5next.common import kda
+
+    expected = "triton" if backend == "triton" else "flashkda"
+    assert (
+        kda._resolve_kda_prefill_backend(backend, 128, torch.bfloat16, -5.0) == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "dim,dtype,bound",
+    [
+        (64, torch.bfloat16, -5.0),
+        (128, torch.float32, -5.0),
+        (128, torch.bfloat16, None),
+        (128, torch.bfloat16, -6.0),
+    ],
+)
+def test_musa_prefill_backend_rejects_unsupported(dim, dtype, bound):
+    if current_platform.device_type != "musa":
+        pytest.skip("MUSA-specific backend selection")
+    from vllm.models.glm5next.common import kda
+
+    assert kda._resolve_kda_prefill_backend("auto", dim, dtype, bound) == "triton"
+    with pytest.raises(RuntimeError, match="FlashKDA requires"):
+        kda._resolve_kda_prefill_backend("flashkda", dim, dtype, bound)
