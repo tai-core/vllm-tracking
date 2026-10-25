@@ -98,11 +98,11 @@ entries, one empty RoPE buffer, and 42 routed MoE layers per rank. Both process
 exits were zero. This result establishes loading/restart identity only; the
 separate Indexer numerical gate was failing and is not waived by this probe.
 
-## Prefill serving follow-up, 2026-10-25
+## AMD/FLA Prefill serving follow-up, 2026-10-25
 
 The companion [Plugin PR #57](https://github.com/tai-core/vllm-plugin-das-glm53-bw1000/pull/57)
 adds a separate final-token quality study using the same resident producer and
-zero-copy clients. Core's `vllm` runtime tree remains unchanged. The measured
+zero-copy clients. Core's `vllm` runtime tree was unchanged for those runs. The measured
 configuration is TP1/PCP8/EP8, eager text Prefill, with one generated token per
 request; it does not establish Decode or production P-D behavior.
 
@@ -138,4 +138,47 @@ summary is +0.95% throughput and -3.22% p95. This does not prove zero overhead:
 C1 p95 rose 3.16% in a small sample, and long-control throughput varied
 -0.71% to +0.33%. The companion [performance report](https://github.com/tai-core/vllm-plugin-das-glm53-bw1000/blob/041074ce6762d779e9577c1392e859ddf3d574a4/docs/ep-async-prefill-recheck-20261025.md)
 preserves each pair, raw-source hashes, the excluded failed harness run, and
-the measurement limits. The producer and core runtime remain unchanged.
+the measurement limits. The producer and core runtime were unchanged in that study.
+
+## Optional FlashKDA client recurrence, 2026-10-25
+
+`Glm5NextLinearAttention.prefill_core` now delegates raw beta and convolved
+head-local Q/K/V to `prefill_recurrence`. Its default implementation preserves
+the existing AMD/FLA call and applies sigmoid exactly once. Convolution, request
+state gathering/scattering, cache shapes and ownership stay in `prefill_core`.
+The companion plugin can select the maintained FlashKDA implementation with
+`VLLM_HCU_GLM_KDA_BACKEND=flashkda`; the default remains `fla`. This selector is
+for the IPC client experiment, with the existing producer kept resident.
+
+FlashKDA receives raw BF16 beta and normalizes Q/K internally. The plugin passes
+the rank's head interval, contiguous tensors and int64 sequence boundaries,
+validates the native ABI before layer initialization, and records selection
+and first actual execution on every worker. Explicit unsupported selections or
+missing extensions fail instead of falling back. FlashKDA accepts FP32 cache
+buffers but rounds recurrent state through BF16 internally.
+
+The source-pinned native study passed 92 numerical checks against an independent
+FP64 recurrence, including C1/C4, head slicing and next-chunk continuity. It
+showed faster local H8 recurrence for 2K layouts, slower single-sequence 8K, and
+slightly higher FP64 error than AMD/FLA. The 5% relative-L2 component screen is
+not a model-quality tolerance or a serving-performance claim. See the companion
+`docs/ep-flashkda-native-20261025.{md,json}` report for full measurements and
+preserved failed build/harness attempts.
+
+The matched full-model study completed 128 quality requests: both backends
+scored 20/20 under C1 and C4, with no answer flips and stable repeat/post-long
+checks. Cross-backend full-vocabulary TV reached 0.48% on 2K and 1.35% on 12K;
+all numerical screening alerts remain disclosed. This is a small constructed
+task smoke test, not general model-quality certification.
+
+A separate uninstrumented 300-request comparison measured 2K/C2 throughput
+4252.67 -> 5144.16 input tokens/s (+20.96%), with SSE TTFT p95
+1.03995 -> 0.81952 seconds (-21.20%). 2K/C4 throughput rose 5.40% and C1 rose
+16.76%, while 8K and 32767-token controls lost 5.87%-6.39% throughput. FLA
+therefore remains the default; FlashKDA is an explicit opt-in for evaluating
+short-request workloads. One FLA-then-FlashKDA pair and small long-control
+samples do not establish statistical non-inferiority or production tail bounds.
+See the companion [full report](https://github.com/tai-core/vllm-plugin-das-glm53-bw1000/blob/ea662c41a0e832ccb2c68cffb5ade1b897602c91/docs/ep-flashkda-prefill-20261025.md)
+and JSON for matching hashes, per-window results, quality limits and cleanup.
+The same resident producer survived every run; no daemon restart, checkpoint
+fallback or changes to node08 were needed.
