@@ -466,23 +466,51 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             for x in convolved.split(size, dim=-1)
         )
         initial = gather_initial_states(recurrent_state, indices, has_initial)
-        output, final = chunk_kda_with_fused_gate(
-            q=q,
-            k=k,
-            v=v,
-            raw_g=g1[:, :count],
-            beta=_cast_sigmoid(beta[:, :count].squeeze(0)).unsqueeze(0),
-            A_log=self.A_log[:, :, head_start : head_start + head_count],
-            g_bias=self.dt_bias[start:stop],
+        output, final = self.prefill_recurrence(
+            q,
+            k,
+            v,
+            g1[:, :count],
+            beta[:, :count],
+            head_start=head_start,
+            head_count=head_count,
             initial_state=initial,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
             cu_seqlens=qsl,
-            safe_gate=self.kda_safe_gate,
-            lower_bound=self.kda_lower_bound,
         )
         scatter_states(recurrent_state, final, indices)
         return output
+
+    def prefill_recurrence(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        raw_g: torch.Tensor,
+        raw_beta: torch.Tensor,
+        *,
+        head_start: int,
+        head_count: int,
+        initial_state: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run local recurrence; callers own convolution and cache gather/scatter."""
+        start = head_start * self.head_dim
+        stop = (head_start + head_count) * self.head_dim
+        return chunk_kda_with_fused_gate(
+            q=q,
+            k=k,
+            v=v,
+            raw_g=raw_g,
+            beta=_cast_sigmoid(raw_beta.squeeze(0)).unsqueeze(0),
+            A_log=self.A_log[:, :, head_start : head_start + head_count],
+            g_bias=self.dt_bias[start:stop],
+            initial_state=initial_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens,
+            safe_gate=self.kda_safe_gate,
+            lower_bound=self.kda_lower_bound,
+        )
 
     @eager_break_during_capture
     def _forward(
