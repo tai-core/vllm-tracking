@@ -207,3 +207,57 @@ See the updated companion
 [optimization report](https://github.com/tai-core/vllm-plugin-das-glm53-bw1000/blob/codex/weight-cache-static-ep/docs/ep-flashkda-long-optimization-20261025.md).
 The completed run is the final acceptance scope; no additional reverse-order
 run or final-candidate model profile was performed.
+
+## Static DeepGEMM cache restoration follow-up, 2026-10-26
+
+Plugin `1857c3f` and `72faf21` support restoring the gfx936 contiguous W6
+Channel-INT8 expert layout for validated static EP configurations. The producer
+packs once and exports a versioned CPU layout buffer through normal tensor
+entries. The consumer validates the marker, shapes, dtypes, device and scales
+before rebuilding Python runtime objects; it does not repack shared weights.
+Unsupported bias, quantization or topology fails explicitly. Core `faaf2ecd`
+adds packed-layout restoration tests; the IPC transport contract is unchanged.
+
+The focused results are 97 plugin cache tests, two oracle tests and 13 core
+tests. A real HIP one-layer probe also retained shared storage, performed no
+consumer packing and reproduced the producer output exactly, including clamp
+semantics. Its entries bound existing in-process tensors, and communication
+initialization used the existing local no-DP/EP implementation. It did **not**
+exercise CUDA IPC handles, socket transport or separate producer/consumer
+lifetimes. An earlier same-process handle attempt failed with invalid context;
+the successful local probe does not resolve that transport acceptance gap.
+
+The new DeepGEMM producer completed checkpoint loading after a daemon reload;
+the previous Triton container was stopped and retained. Run A used a real
+independent eight-rank consumer with `deep_gemm`, `zero_copy` and `fallback:false`.
+All eight workers mapped 1,418 tensors each (1,376 prior entries plus 42 layout
+markers), and the runtime recorded `DeepEPDeepGemmContiguousExperts`. This is
+full-model IPC and serving evidence, separate from the local probe above.
+
+With an 8,192-token scheduling budget, run A completed 128 measured requests,
+61 warmups and a 12/12 quality smoke. Measured requests had no errors or cache
+hits. The observed peak was 13,455.20 input tokens/s at 32,767 tokens/C8, with
+TTFT p50/p95 19.3260/19.3936s. The 8K/C8 result was 13,441.69 tokens/s with
+4.8232/4.8564s TTFT; 8K/C1 reached 12,776.13 with 0.6392/0.6412s TTFT.
+The API and owned workers were cleaned up; the new producer survived and node08
+was untouched. These are Prefill-plus-first-token results within the tested grid.
+
+The second run completed with a 16,384-token budget. The highest measured
+throughput was **15,875.24 input tokens/s** at 8K/C8, with TTFT p50/p95
+**3.8218/4.1985s**. Other B results were 14,754.55 tokens/s at 8K/C4,
+15,661.83 at 32,767/C4, 15,633.44 at 32,767/C8 and 14,078.14 at 2K/C16.
+The selected configuration uses TP1/PCP8/EP8, `deep_gemm`, FlashKDA,
+`allgather_reducescatter`, `max_num_seqs=8`, async scheduling, 5,000µs Prefill
+coalescing, 2GiB KV cache per rank, no prefix cache and zero-copy IPC without
+fallback. External concurrency16 queues behind the eight active sequence slots.
+
+Both runs completed 369 requests: 232 measured, 113 warmup and 24 quality.
+Quality scored 24/24 with no flips; measured requests had zero errors/cache hits.
+Both eight-rank clients confirmed 1,418 mapped tensors per rank and cleaned up;
+the new producer remains READY and resident, the old Triton container remains
+stopped, and node08 was unchanged. This is the peak within two small tested
+grids, not a hardware limit or Decode/production P-D claim. The benchmark uses
+a dedicated test KV receiver, and p95 is descriptive. Earlier 1.66–2.17× local
+MoE gains remain separately scoped microbenchmarks. See the companion plugin report
+`docs/ep-deepgemm-prefill-20261026.md` for this follow-up; the original
+`validate_ep_ipc.py` evidence above remains scoped to its Triton runtime.
