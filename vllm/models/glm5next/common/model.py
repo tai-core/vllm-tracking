@@ -9,13 +9,16 @@ from torch import nn
 from transformers import Glm5NextTextConfig
 
 from vllm.config import ParallelConfig, VllmConfig
+from vllm.config.kda_parallel import kda_tensor_parallel_size
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
@@ -515,6 +518,25 @@ class Glm5NextDecoderLayer(nn.Module):
                     hc_mult=self.n,
                 )
 
+    def _run_attention(
+        self, hidden_states: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        if self.layer_kind != "kda" or not getattr(
+            self.self_attn, "tp_over_pcp", False
+        ):
+            return self.self_attn(hidden_states=hidden_states, positions=positions)
+        layout = get_forward_context().pcp_token_layout
+        if layout is None:
+            raise RuntimeError("KDA TP over PCP requires a PCP token layout")
+        hidden_states = layout.gather_to_global(hidden_states)
+        partial = self.self_attn(hidden_states=hidden_states, positions=positions)
+        # PCP restores local tokens; TP sums the remaining head partitions.
+        local = layout.reduce_scatter_to_local(partial)
+        # Sequence-parallel forward performs its TP reduce-scatter below.
+        if self.is_sequence_parallel and self.mhc and not self.is_mtp_layer:
+            return local
+        return tensor_model_parallel_all_reduce(local)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -533,10 +555,7 @@ class Glm5NextDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
-            attn_output = self.self_attn(
-                hidden_states=hidden_states,
-                positions=positions,
-            )
+            attn_output = self._run_attention(hidden_states, positions)
             hidden_states, residual = self.post_attention_layernorm(
                 attn_output, residual=residual
             )
@@ -585,10 +604,7 @@ class Glm5NextDecoderLayer(nn.Module):
         if self.is_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
-        x = self.self_attn(
-            hidden_states=x,
-            positions=positions,
-        )
+        x = self._run_attention(x, positions)
 
         if self.is_sequence_parallel:
             x = sp_reduce_scatter(x)
@@ -1101,9 +1117,8 @@ class Glm5NextForCausalLM(
     def get_mamba_state_shape_from_config(
         cls, vllm_config: "VllmConfig"
     ) -> tuple[tuple[int, int], tuple[int, int, int]]:
-        parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_text_config
-        tp_size = parallel_config.tensor_parallel_size
+        tp_size = kda_tensor_parallel_size(vllm_config)
         num_spec = (
             vllm_config.speculative_config.num_speculative_tokens
             if vllm_config.speculative_config

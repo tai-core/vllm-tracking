@@ -3154,8 +3154,8 @@ class TestPeerReplacement:
             {"old-req": [10, 11], "healthy-req": [12]}
         )
         self.nixl.invalid_remote_agents.add("old")
-        self.transport.check_xfer_state.side_effect = (
-            lambda h: "ERR" if h == 10 else "PROC"
+        self.transport.check_xfer_state.side_effect = lambda h: (
+            "ERR" if h == 10 else "PROC"
         )
         old_handle = self.worker.dst_xfer_side_handles["old"][0]
 
@@ -3165,8 +3165,8 @@ class TestPeerReplacement:
         self.worker.start_load_kv(self._request("old", req_id="blocked"))
         self.transport.make_prepped_xfer.assert_not_called()
 
-        self.transport.check_xfer_state.side_effect = (
-            lambda h: "DONE" if h == 11 else "PROC"
+        self.transport.check_xfer_state.side_effect = lambda h: (
+            "DONE" if h == 11 else "PROC"
         )
         result = self.worker.get_transfer_results()
         assert (
@@ -3243,8 +3243,8 @@ class TestPeerReplacement:
     def test_invalid_peer_empty_recv_is_reported_only_when_awaited(self, awaiting_kvs):
         self._fail_old_peer()
         self.worker._recving_transfers["old-req"].append(11)
-        self.transport.check_xfer_state.side_effect = (
-            lambda h: "PROC" if h == 11 else "ERR"
+        self.transport.check_xfer_state.side_effect = lambda h: (
+            "PROC" if h == 11 else "ERR"
         )
         self.worker.get_transfer_results()
         self.transport.make_prepped_xfer.reset_mock()
@@ -4216,13 +4216,24 @@ def test_transfer_mode_changes_compatibility_hash():
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize("mode", ["pull", "push"])
 @pytest.mark.parametrize(
-    "tp_size,pcp_size,dcp_size,transfer_tp_size",
-    [(1, 1, 1, 1), (4, 1, 1, 4), (4, 1, 4, 4), (1, 4, 1, 1), (1, 4, 4, 4)],
+    "tp_size,pcp_size,dcp_size,transfer_tp_size,kda_mode",
+    [
+        (1, 1, 1, 1, "tp"),
+        (4, 1, 1, 4, "tp"),
+        (4, 1, 4, 4, "tp"),
+        (1, 4, 1, 1, "tp"),
+        (1, 4, 4, 4, "tp"),
+        (1, 8, 1, 8, "tp_pcp"),
+        (2, 4, 1, 8, "tp_pcp"),
+        (8, 1, 1, 8, "tp_pcp"),
+    ],
 )
 def test_scheduler_advertises_transfer_topology(
-    mode, tp_size, pcp_size, dcp_size, transfer_tp_size
+    mode, tp_size, pcp_size, dcp_size, transfer_tp_size, kda_mode, tmp_path
 ):
     """The consumer must address every distinct producer KV shard."""
+    from transformers import OPTConfig
+
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
         NixlPullConnectorScheduler,
     )
@@ -4230,7 +4241,10 @@ def test_scheduler_advertises_transfer_topology(
         NixlPushConnectorScheduler,
     )
 
-    config = create_vllm_config(kv_role="kv_producer")
+    model_dir = tmp_path / "model"
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(model_dir)
+    config = create_vllm_config(model=str(model_dir), kv_role="kv_producer")
+    config.additional_config = {"kda_parallel_mode": kda_mode}
     config.parallel_config.tensor_parallel_size = tp_size
     config.parallel_config.prefill_context_parallel_size = pcp_size
     config.parallel_config.decode_context_parallel_size = dcp_size
@@ -4672,3 +4686,45 @@ def test_explicit_kv_role_no_deprecation_warning(default_vllm_config, dist_init)
             mock_logger.warning_once.assert_not_called(),
             (f"kv_role={role!r} should not emit deprecation warning"),
         )
+
+
+@pytest.mark.parametrize("rank", range(8))
+def test_kda_pcp_exposes_each_agent_and_preserves_real_completion(rank):
+    connector = object.__new__(NixlConnector)
+    connector.kv_transfer_config = SimpleNamespace(kv_role="kv_producer")
+    completed = KVConnectorTransferResults(finished_sending={"request"})
+    metadata = object()
+    connector.connector_worker = SimpleNamespace(
+        pcp_rank=rank,
+        pcp_dcp_sharded=False,
+        pcp_kda_sharded=True,
+        transfer_tp_rank=rank,
+        xfer_handshake_metadata=metadata,
+        get_transfer_results=lambda: completed,
+    )
+    assert connector.get_transfer_worker_rank() == rank
+    assert connector.get_handshake_metadata() is metadata
+    assert connector.get_transfer_results(set()).finished_sending == {"request"}
+
+
+@pytest.mark.parametrize("rank", range(8))
+def test_kda_pcp_maps_mla_and_state_to_same_peer(rank):
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+        compute_tp_mapping,
+    )
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    topology = TransferTopology(
+        tp_rank=rank,
+        tp_size=8,
+        block_size=16,
+        engine_id="D",
+        is_mla=True,
+        is_mamba=True,
+        total_num_kv_heads=1,
+        attn_backends=[],
+    )
+    plan = compute_tp_mapping(topology, 8, (MLAAttentionSpec, MambaSpec))
+    assert plan.all_source_ranks == (rank,)
+    assert plan.source_ranks_per_group == ((rank,), (rank,))
+    assert plan.local_consumers == 1

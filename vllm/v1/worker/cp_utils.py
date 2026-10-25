@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config.kda_parallel import kda_tp_over_pcp
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import split_decodes_prefills_and_extends
@@ -31,7 +32,17 @@ def check_attention_cp_compatibility(
         for layer_name, layer in layers.items():
             check_pcp = target_layer_names is None or layer_name in target_layer_names
             get_attn_backend = getattr(layer, "get_attn_backend", None)
-            if pcp_size > 1 and check_pcp and get_attn_backend is not None:
+            # KDA receives global tokens and uses head TP on the PCP group.
+            # Its backend itself never sees a context-partitioned sequence.
+            uses_global_kda = getattr(layer, "tp_over_pcp", False) and kda_tp_over_pcp(
+                vllm_config
+            )
+            if (
+                pcp_size > 1
+                and check_pcp
+                and get_attn_backend is not None
+                and not uses_global_kda
+            ):
                 backend = get_attn_backend()
                 assert backend.supports_pcp(), (
                     "PCP requires attention backend support, "

@@ -85,6 +85,7 @@ def test_add_request_seeds_state_idx_in_mamba_blocks() -> None:
 
 def test_padded_prompt_tail_builds_as_spec_decode(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     """A one-token prompt tail over prior state, padded with K placeholder
     drafts (e.g. a P/D decode-node arrival), must reach the GDN builder as a
@@ -139,7 +140,13 @@ def test_padded_prompt_tail_builds_as_spec_decode(
     ]
     assert mamba_metadata.is_prefilling.tolist() == [False, False, True]
 
-    builder = _create_gdn_builder(num_speculative_tokens=k)
+    from transformers import Qwen3_5Config
+
+    model_dir = tmp_path / "qwen-config"
+    Qwen3_5Config(architectures=["Qwen3_5ForConditionalGeneration"]).save_pretrained(
+        model_dir
+    )
+    builder = _create_gdn_builder(num_speculative_tokens=k, model_name=str(model_dir))
     common = create_common_attn_metadata(
         BatchSpec(seq_lens=seq_lens, query_lens=query_lens), BLOCK_SIZE, DEVICE
     ).replace(**mamba_metadata.get_extra_common_attn_kwargs(0, 3))
@@ -424,3 +431,41 @@ def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias(
     assert state._mamba_state_idx_gpu.tolist() == expected_state_indices
     expected_accepted = [9, 1, 9, 2, 9]
     assert state.num_accepted_tokens_gpu.tolist() == expected_accepted
+
+
+def test_pcp_builds_attention_locally_and_recurrent_metadata_globally(monkeypatch):
+    """The two PCP rows of a request must not become two recurrent updates."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    state = object.__new__(MambaHybridModelState)
+    local_batch, global_batch = object(), object()
+    local_tables, global_tables = (object(),), (object(),)
+    local_slots, global_slots = object(), object()
+    attention = SimpleNamespace(
+        kv_cache_spec=object(), backend=SimpleNamespace(get_name=lambda: "MLA")
+    )
+    tail = SimpleNamespace(
+        kv_cache_spec=object(), backend=SimpleNamespace(get_name=lambda: "KPOOL_TAIL")
+    )
+    recurrent = SimpleNamespace(kv_cache_spec=Mock(spec=MambaSpec))
+    groups = [[attention, tail], [recurrent]]
+    local_builder = Mock(return_value={"mla": "local"})
+    global_builder = Mock(return_value={"kda": "global"})
+    monkeypatch.setattr(mamba_hybrid.DefaultModelState, "prepare_attn", local_builder)
+    monkeypatch.setattr(state, "prepare_attn", global_builder)
+    result = state.prepare_attn_with_pcp(
+        local_batch,
+        CUDAGraphMode.NONE,
+        local_tables,
+        local_slots,
+        groups,
+        Mock(),
+        global_attn_inputs=(global_batch, global_tables, global_slots),
+    )
+    assert result == {"mla": "local", "kda": "global"}
+    assert local_builder.call_args.args[0] is local_batch
+    assert local_builder.call_args.args[2] is local_tables
+    assert local_builder.call_args.args[4] == [[attention], []]
+    assert global_builder.call_args.args[0] is global_batch
+    assert global_builder.call_args.args[2] is global_tables
+    assert global_builder.call_args.args[4] == [[tail], [recurrent]]

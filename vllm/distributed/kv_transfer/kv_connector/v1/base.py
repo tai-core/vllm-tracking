@@ -446,6 +446,10 @@ class KVConnectorBase_V1(ABC):
         """
         return None
 
+    def get_transfer_worker_rank(self) -> int | None:
+        """Override the TP component of this worker's handshake key."""
+        return None
+
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
         """Get the KVConnector handshake metadata for this connector.
         This metadata is used for out-of-band connector handshake

@@ -710,10 +710,24 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        tp_rank: int | None = None,
+        tp_size: int | None = None,
     ):
         self.output_sizes = output_sizes
-        self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
-        self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
+        self.tp_size = (
+            1
+            if disable_tp
+            else tp_size
+            if tp_size is not None
+            else get_tensor_model_parallel_world_size()
+        )
+        self.tp_rank = (
+            0
+            if disable_tp
+            else tp_rank
+            if tp_rank is not None
+            else get_tensor_model_parallel_rank()
+        )
 
         assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
         super().__init__(
@@ -727,6 +741,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             prefix=prefix,
             return_bias=return_bias,
             disable_tp=disable_tp,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
     def validate_shard_id(self, shard_id: Any) -> TypeIs[int | tuple[int, ...] | None]:
@@ -1674,10 +1690,24 @@ class RowParallelLinear(LinearBase):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        tp_rank: int | None = None,
+        tp_size: int | None = None,
     ):
         # Divide the weight matrix along the first dimension.
-        self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
-        self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+        self.tp_rank = (
+            0
+            if disable_tp
+            else tp_rank
+            if tp_rank is not None
+            else get_tensor_model_parallel_rank()
+        )
+        self.tp_size = (
+            1
+            if disable_tp
+            else tp_size
+            if tp_size is not None
+            else get_tensor_model_parallel_world_size()
+        )
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
@@ -1692,6 +1722,8 @@ class RowParallelLinear(LinearBase):
             prefix,
             return_bias=return_bias,
             disable_tp=disable_tp,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
         self.input_is_parallel = input_is_parallel

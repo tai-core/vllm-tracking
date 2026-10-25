@@ -132,9 +132,7 @@ def _musa_deepseek_v4_mtp_sparse_prefill_reserve_bytes(
     model_config = vllm_config.model_config
     scheduler_config = vllm_config.scheduler_config
     cache_config = vllm_config.cache_config
-    num_layers = model_config.get_num_layers(
-        vllm_config.parallel_config
-    )
+    num_layers = model_config.get_num_layers(vllm_config.parallel_config)
     sparse_layers = sum(
         1
         for layer_idx in range(num_layers)
@@ -154,10 +152,7 @@ def _musa_deepseek_v4_mtp_sparse_prefill_reserve_bytes(
     m = n + window_size + max_tokens
     head_dim = getattr(config, "kv_lora_rank", 512)
 
-    per_layer_bytes = (
-        max_tokens * combined_topk * 4
-        + max_tokens * m * head_dim * 2
-    )
+    per_layer_bytes = max_tokens * combined_topk * 4 + max_tokens * m * head_dim * 2
     return int(per_layer_bytes * sparse_layers * cache_config.gpu_memory_utilization)
 
 
@@ -894,6 +889,9 @@ class Worker(WorkerBase):
             tp_rank += (
                 get_pcp_group().rank_in_group * parallel_config.tensor_parallel_size
             )
+        transfer_rank = connector.get_transfer_worker_rank()
+        if transfer_rank is not None:
+            tp_rank = transfer_rank
         return {(pp_rank, tp_rank): metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:

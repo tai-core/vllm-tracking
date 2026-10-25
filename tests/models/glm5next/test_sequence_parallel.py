@@ -112,3 +112,74 @@ def test_dense_layer_mlp_follows_the_sequence_parallel_layout(
         _assert_runs_locally_on_shard(layer.mlp)
     else:
         assert layer.mlp.down_proj.tp_size == TP_SIZE
+
+
+@pytest.mark.parametrize("rank", range(8))
+def test_kda_explicit_linear_shards_ignore_global_tp1(
+    monkeypatch,
+    default_vllm_config,
+    rank,
+):
+    """KDA's weights must shard even though MLA's process-wide TP is one."""
+    for module in (linear, parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+    merged = linear.MergedColumnParallelLinear(
+        4,
+        [16, 24],
+        bias=False,
+        tp_rank=rank,
+        tp_size=8,
+    )
+    q = torch.arange(16 * 4, dtype=torch.float32).reshape(16, 4)
+    v = torch.arange(24 * 4, dtype=torch.float32).reshape(24, 4) + 1000
+    merged.weight_loader(merged.weight, q, 0)
+    merged.weight_loader(merged.weight, v, 1)
+    torch.testing.assert_close(
+        merged.weight,
+        torch.cat([q.chunk(8)[rank], v.chunk(8)[rank]]),
+    )
+    row = linear.RowParallelLinear(
+        16,
+        4,
+        bias=False,
+        reduce_results=False,
+        tp_rank=rank,
+        tp_size=8,
+    )
+    weight = torch.arange(64, dtype=torch.float32).reshape(4, 16)
+    row.weight_loader(row.weight, weight)
+    torch.testing.assert_close(row.weight, weight.chunk(8, dim=1)[rank])
+    assert row.weight.tp_rank == merged.weight.tp_rank == rank
+    assert row.weight.tp_size == merged.weight.tp_size == 8
+
+
+@pytest.mark.parametrize("rank", range(8))
+def test_kda_merged_projection_keeps_gate_shards_replicated(
+    monkeypatch,
+    default_vllm_config,
+    rank,
+):
+    from vllm.models.glm5next.common.kda import _Glm5NextMergedColumnParallelLinear
+
+    for module in (linear, parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+    layer = _Glm5NextMergedColumnParallelLinear(
+        4,
+        [16, 4, 4],
+        replicated_shard_ids=(1, 2),
+        tp_size=8,
+        tp_rank=rank,
+        bias=False,
+    )
+    weights = [
+        torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4) + 100 * i
+        for i, rows in enumerate([16, 4, 4])
+    ]
+    expected = torch.cat([weights[0].chunk(8)[rank], *weights[1:]])
+    for loader in (layer.weight_loader, layer.weight_loader_v2):
+        for shard, weight in enumerate(weights):
+            loader(layer.weight, weight, shard)
+        torch.testing.assert_close(layer.weight, expected)
+        assert layer.tp_rank == layer.weight.tp_rank == rank

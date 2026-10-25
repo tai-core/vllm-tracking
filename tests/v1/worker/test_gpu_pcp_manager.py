@@ -750,3 +750,126 @@ def test_parallel_config_manages_decode_sharding(
     )
 
     assert parallel_config.pcp_shard_decode_requests is expected
+
+
+@pytest.mark.parametrize("dcp_size", [1, 8])
+@pytest.mark.parametrize("lengths", [[1], [3, 1, 35], [16, 17, 127]])
+def test_kda_layout_roundtrip_and_partial_reduction(monkeypatch, dcp_size, lengths):
+    """Replicas and padding must not drop outputs or add extra head partials."""
+    monkeypatch.setattr(pcp_manager_module, "async_tensor_h2d", _copy_to_cpu)
+    size = 8
+    lengths = np.asarray(lengths, dtype=np.int32)
+    starts = np.concatenate(([0], np.cumsum(lengths))).astype(np.int32)
+    is_prefilling = lengths > 1
+    managers = []
+    for rank in range(size):
+        manager = PCPManager(
+            size,
+            rank,
+            torch.device("cpu"),
+            shard_decode_requests=dcp_size == 1,
+            dcp_world_size=dcp_size,
+        )
+        manager._build_batch_layout(
+            lengths,
+            np.zeros_like(lengths),
+            is_prefilling,
+            starts,
+        )
+        managers.append(manager)
+    layout = managers[0].token_layout
+    total = int(starts[-1])
+    reference = torch.arange(total * 3, dtype=torch.float32).reshape(total, 3)
+    expanded = reference[layout.expand_idx].clone()
+    expanded[~layout.valid_mask] = float("nan")
+    local_inputs = expanded.chunk(size)
+    partials = [reference * (rank + 1) for rank in range(size)]
+    expected = reference * sum(range(1, size + 1))
+
+    class Group:
+        def __init__(self, rank):
+            self.rank = rank
+
+        def all_gather(self, value, dim):
+            torch.testing.assert_close(value, local_inputs[self.rank], equal_nan=True)
+            return torch.cat(local_inputs)
+
+        def reduce_scatter(self, value, dim):
+            contributions = [
+                part[layout.expand_idx].masked_fill(~layout.valid_mask[:, None], 0)
+                for part in partials
+            ]
+            torch.testing.assert_close(value, contributions[self.rank])
+            return sum(contributions).chunk(size)[self.rank]
+
+    for rank, manager in enumerate(managers):
+        monkeypatch.setattr(
+            pcp_manager_module, "get_pcp_group", lambda rank=rank: Group(rank)
+        )
+        torch.testing.assert_close(
+            manager.token_layout.gather_to_global(local_inputs[rank]),
+            reference,
+        )
+        output = manager.token_layout.reduce_scatter_to_local(partials[rank])
+        target = (
+            expected[layout.expand_idx]
+            .masked_fill(
+                ~layout.valid_mask[:, None],
+                0,
+            )
+            .chunk(size)[rank]
+        )
+        torch.testing.assert_close(output, target)
+
+
+def test_kda_profile_layout_reduces_heads_without_multiplying_tokens(monkeypatch):
+    # Memory profiling runs before PCPManager exists, with replicated dummy rows.
+    layout = pcp_manager_module.PCPTokenLayout.replicated(
+        torch.tensor([False, False, True]), 8
+    )
+    hidden = torch.tensor([[1.0], [2.0], [0.0]])
+    partial = torch.tensor([[3.0], [4.0], [float("nan")]])
+
+    class Group:
+        def all_gather(self, value, dim):
+            return value.repeat(8, 1)
+
+        def reduce_scatter(self, value, dim):
+            expected = torch.tensor([[3.0], [4.0], [0.0]]).repeat(8, 1)
+            torch.testing.assert_close(value, expected)
+            return sum(value.chunk(8))
+
+    monkeypatch.setattr(pcp_manager_module, "get_pcp_group", lambda: Group())
+    torch.testing.assert_close(layout.gather_to_global(hidden), hidden)
+    torch.testing.assert_close(
+        layout.reduce_scatter_to_local(partial),
+        torch.tensor([[24.0], [32.0], [0.0]]),
+    )
+
+
+@pytest.mark.parametrize("device_type", ["cpu", "cuda", "musa"])
+def test_gathered_slots_preserve_multiple_group_strides(device_type):
+    if device_type == "musa":
+        pytest.importorskip("torch_musa")
+    if device_type != "cpu":
+        accelerator = getattr(torch, device_type, None)
+        if accelerator is None or not accelerator.is_available():
+            pytest.skip(f"{device_type} is unavailable")
+    device = torch.device(device_type)
+    manager = PCPManager(8, 0, device, shard_decode_requests=True)
+    manager._padded_gather_idx = torch.tensor(
+        [0, 4, 1, 3, 2, 0, 0, 0], device=device
+    )
+    manager._gathered_kv_write_mask = torch.tensor(
+        [True] * 5 + [False] * 3, device=device
+    )
+    storage = torch.full((3, 128), -99, dtype=torch.int64, device=device)
+    manager._gathered_kv_slot_mappings = storage
+    source = torch.arange(3 * 32, device=device).reshape(3, 32)[:, :5]
+    result = manager._convert_to_gathered_slot_mappings(source)
+    expected = source.cpu()[:, [0, 4, 1, 3, 2, 0, 0, 0]]
+    expected[:, 5:] = PAD_SLOT_ID
+    torch.testing.assert_close(result.cpu(), expected)
+    assert result.data_ptr() == storage.data_ptr()
+    assert result.stride() == storage.stride()
+    assert bool((storage[:, 8:] == -99).all())

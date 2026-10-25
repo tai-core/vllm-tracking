@@ -77,3 +77,29 @@ def test_skip_gate_rank_invariant_with_divergent_local_context(
     assert max(local_maxes) > 0
     # The batch still has context globally, so no rank may skip.
     assert not should_skip_dcp_context_attention(context_kv_lens)
+
+
+@pytest.mark.parametrize("adapted", [False, True])
+def test_cp_backend_check_only_exempts_adapted_kda(monkeypatch, adapted):
+    from vllm.v1.worker import cp_utils
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=8,
+            tensor_parallel_size=1,
+            decode_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        additional_config={"kda_parallel_mode": "tp_pcp"},
+        speculative_config=None,
+    )
+    backend = SimpleNamespace(supports_pcp=lambda: False, get_name=lambda: "GDN_ATTN")
+    layer = SimpleNamespace(tp_over_pcp=adapted, get_attn_backend=lambda: backend)
+    monkeypatch.setattr(
+        cp_utils, "get_layers_from_vllm_config", lambda *args: {"kda": layer}
+    )
+    if adapted:
+        cp_utils.check_attention_cp_compatibility(config)
+    else:
+        with pytest.raises(AssertionError, match="does not support PCP"):
+            cp_utils.check_attention_cp_compatibility(config)

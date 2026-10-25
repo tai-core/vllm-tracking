@@ -255,6 +255,7 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
             self.kv_transfer_config.kv_role == "kv_producer"
             and self.connector_worker.pcp_rank > 0
             and not self.connector_worker.pcp_dcp_sharded
+            and not getattr(self.connector_worker, "pcp_kda_sharded", False)
         ):
             results.finished_sending.clear()
         return results
@@ -322,6 +323,10 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_scheduler is not None:
             self.connector_scheduler.shutdown()
 
+    def get_transfer_worker_rank(self) -> int | None:
+        assert self.connector_worker is not None
+        return self.connector_worker.transfer_tp_rank
+
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
         """Get the KVConnector handshake metadata for this connector.
         This metadata is used for out-of-band connector handshake
@@ -337,6 +342,7 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
             self.kv_transfer_config.kv_role == "kv_producer"
             and self.connector_worker.pcp_rank > 0
             and not self.connector_worker.pcp_dcp_sharded
+            and not getattr(self.connector_worker, "pcp_kda_sharded", False)
         ):
             return None
         return self.connector_worker.xfer_handshake_metadata

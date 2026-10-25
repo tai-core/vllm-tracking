@@ -35,6 +35,7 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.compilation.wrapper import compile_model_with_stock_torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.config.kda_parallel import kda_tp_over_pcp
 from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
@@ -80,7 +81,6 @@ from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import (
     create_speculative_target_watermarker,
-    speculative_target_watermark_key,
 )
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
@@ -318,6 +318,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
 
+        self.kda_tp_over_pcp = kda_tp_over_pcp(vllm_config)
+        if self.kda_tp_over_pcp:
+            if self.model_config.hf_text_config.model_type != "glm5_next_text":
+                raise ValueError(
+                    "KDA TP over PCP is implemented for GLM-5.3-Flash only"
+                )
+            if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+                raise ValueError("KDA TP over PCP currently requires eager execution")
+            if (
+                vllm_config.parallel_config.enable_dbo
+                or vllm_config.parallel_config.ubatch_size
+            ):
+                raise ValueError("KDA TP over PCP does not yet support microbatching")
         self.pcp_manager: pcp.PCPManager | None = None
 
         # Pooling models.
@@ -1848,6 +1861,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
 
+        global_attn_inputs = None
         cudagraph_stats = None
         if not dummy_run:
             # Common case.
@@ -1863,9 +1877,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
             # boundary reset is visible to the attention metadata.
+            state_batch, state_tables = input_batch, block_tables
+            if self.kda_tp_over_pcp:
+                assert self.pcp_manager is not None
+                global_attn_inputs = self.pcp_manager.get_global_attn_inputs()
+                state_batch, state_tables, _ = global_attn_inputs
             self.model_state.preprocess_state(
-                input_batch,
-                block_tables,
+                state_batch,
+                state_tables,
                 self.kv_cache_config,
                 self.req_states.num_computed_tokens.gpu,
             )
@@ -1884,7 +1903,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # PIECEWISE only pads execution tokens, not logical requests.
             # Preserve the scheduler shape for MTP's reused DP agreement.
             preserve_dummy_shape = batch_desc.cg_mode == CUDAGraphMode.PIECEWISE
-            dummy_num_tokens = num_toks if preserve_dummy_shape else batch_desc.num_tokens
+            dummy_num_tokens = (
+                num_toks if preserve_dummy_shape else batch_desc.num_tokens
+            )
             input_batch = InputBatch.make_dummy(
                 dummy_num_reqs,
                 dummy_num_tokens,
@@ -1971,7 +1992,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                     for groups in attn_groups
                 ]
-            attn_metadata = self.model_state.prepare_attn(
+            prepare_metadata = self.model_state.prepare_attn
+            metadata_kwargs = {}
+            if global_attn_inputs is not None:
+                prepare_metadata = self.model_state.prepare_attn_with_pcp
+                metadata_kwargs["global_attn_inputs"] = global_attn_inputs
+            attn_metadata = prepare_metadata(
                 input_batch,
                 batch_desc.cg_mode,
                 block_tables,
@@ -1982,6 +2008,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # from the zeroed dummy block tables instead of retaining state
                 # indices from the previous real batch.
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+                **metadata_kwargs,
             )
 
         input_ids = input_batch.input_ids
@@ -2071,6 +2098,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_active_loras=batch_desc.num_active_loras,
             )
 
+            pcp_token_layout = None
+            if self.kda_tp_over_pcp:
+                if self.pcp_manager is not None:
+                    pcp_token_layout = self.pcp_manager.token_layout
+                else:
+                    assert is_profile, "PCP manager is required outside profiling"
+                    pcp_token_layout = pcp.PCPTokenLayout.replicated(
+                        input_batch.is_padding,
+                        self.parallel_config.prefill_context_parallel_size,
+                    )
+
             with set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -2083,6 +2121,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                pcp_token_layout=pcp_token_layout,
             ):
                 self.kv_connector.pre_forward(scheduler_output, input_batch)
                 if ubatch_state is not None:

@@ -22,6 +22,7 @@ import regex as re
 import torch
 import zmq
 
+from vllm.config.kda_parallel import kda_tp_over_pcp
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     EngineId,
@@ -666,10 +667,18 @@ class NixlBaseConnectorWorker:
 
         # TP1 PCP+DCP owns distinct KV shards; replicated PCP uses rank zero.
         self.pcp_dcp_sharded = self.pcp_size > 1 and self.dcp_size > 1
-        self.transfer_tp_size = (
-            self.pcp_size if self.pcp_dcp_sharded else self.world_size
-        )
-        self.transfer_tp_rank = self.pcp_rank if self.pcp_dcp_sharded else self.tp_rank
+        self.pcp_kda_sharded = kda_tp_over_pcp(vllm_config)
+        if self.pcp_kda_sharded:
+            self.transfer_tp_size = self.world_size * self.pcp_size
+            # Model TP selects a contiguous head range; PCP subdivides it.
+            # Publish head order, not physical (PCP-major) device order.
+            self.transfer_tp_rank = self.tp_rank * self.pcp_size + self.pcp_rank
+        elif self.pcp_dcp_sharded:
+            self.transfer_tp_size = self.pcp_size
+            self.transfer_tp_rank = self.pcp_rank
+        else:
+            self.transfer_tp_size = self.world_size
+            self.transfer_tp_rank = self.tp_rank
 
         # MLA is either fully replicated or fully sharded across transfer ranks.
         self.dcp_rank = self.transfer_tp_rank % self.dcp_size

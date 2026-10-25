@@ -10,6 +10,7 @@ import msgspec
 import zmq
 
 from vllm import envs
+from vllm.config.kda_parallel import kda_tensor_parallel_size
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     EngineId,
@@ -69,6 +70,7 @@ class NixlBaseConnectorScheduler:
         self.transfer_tp_size = max(
             parallel_config.tensor_parallel_size,
             parallel_config.decode_context_parallel_size,
+            kda_tensor_parallel_size(vllm_config),
         )
         self.block_size = vllm_config.cache_config.block_size
         self.engine_id: EngineId = engine_id

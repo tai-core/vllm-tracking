@@ -39,3 +39,35 @@ def test_kda_recurrent_state_dtype_follows_ssm_cache_dtype(ssm_dtype, expected):
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     layer.model_config, layer.cache_config = model_config, cache_config
     assert layer.get_state_dtype() == want
+
+
+@pytest.mark.parametrize("tp,pcp", [(1, 8), (8, 1)])
+def test_kda_config_and_layer_agree_on_head_sharded_state(tp, pcp):
+    from vllm.config.kda_parallel import kda_tensor_parallel_size
+
+    config = SimpleNamespace(
+        additional_config={"kda_parallel_mode": "tp_pcp"},
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp,
+            prefill_context_parallel_size=pcp,
+            decode_context_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                linear_num_heads=64,
+                linear_head_dim=128,
+                linear_conv_kernel_dim=4,
+            )
+        ),
+        speculative_config=None,
+    )
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    layer.tp_size = kda_tensor_parallel_size(config)
+    layer.num_heads, layer.head_dim, layer.conv_size, layer.num_spec = 64, 128, 4, 0
+    expected = layer.get_state_shape()
+    assert expected[1] == (8, 128, 128)
+    assert Glm5NextForCausalLM.get_mamba_state_shape_from_config(config) == expected
+    assert (
+        Glm5NextForConditionalGeneration.get_mamba_state_shape_from_config(config)
+        == expected
+    )

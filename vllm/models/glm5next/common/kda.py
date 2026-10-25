@@ -10,6 +10,7 @@ from transformers import Glm5NextTextConfig
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config.kda_parallel import kda_tp_over_pcp
 from vllm.distributed import divide
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import (
@@ -49,6 +50,8 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
+from .parallel import get_kda_parallel_spec
+
 if current_platform.is_rocm():
     from vllm.models.glm5next.amd.ops.third_party.kda import (
         chunk_kda_with_fused_gate,
@@ -83,7 +86,7 @@ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
         output_sizes = output_sizes.copy()
         for sid in self.replicated_shard_ids:
             output_sizes[sid] *= tp_size
-        super().__init__(input_size, output_sizes, **kwargs)
+        super().__init__(input_size, output_sizes, tp_size=tp_size, **kwargs)
 
     def weight_loader(
         self,
@@ -215,6 +218,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         finally:
             vllm_config.quant_config = saved_quant_config
 
+        self.kda_parallel = get_kda_parallel_spec(vllm_config)
+        self.tp_size = self.kda_parallel.size
+        self.tp_rank = self.kda_parallel.rank
+        self.tp_over_pcp = kda_tp_over_pcp(vllm_config)
         self.head_dim = config.linear_head_dim
         self.num_heads = config.linear_num_heads
         self.conv_size = config.linear_conv_kernel_dim
@@ -248,6 +255,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             ],
             replicated_shard_ids=(4, 5),
             tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
             bias=False,
             quant_config=self.quant_config,
             prefix=f"{prefix}.in_proj_qkvbfg_a",
@@ -259,12 +267,17 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             bias=False,
             quant_config=self.quant_config,
             prefix=f"{prefix}.f_b_proj",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
         self.dt_bias = nn.Parameter(
             torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32)
         )
 
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": sharded_weight_loader(0, tp_rank=self.tp_rank)},
+        )
 
         self.q_conv1d = ColumnParallelLinear(
             input_size=self.conv_size,
@@ -272,6 +285,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             bias=False,
             params_dtype=torch.float32,
             prefix=f"{prefix}.q_conv1d",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
         self.k_conv1d = ColumnParallelLinear(
             input_size=self.conv_size,
@@ -279,6 +294,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             bias=False,
             params_dtype=torch.float32,
             prefix=f"{prefix}.k_conv1d",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
         self.v_conv1d = ColumnParallelLinear(
             input_size=self.conv_size,
@@ -286,6 +303,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             bias=False,
             params_dtype=torch.float32,
             prefix=f"{prefix}.v_conv1d",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
         # unsqueeze to fit conv1d weights shape into the linear weights shape.
         # Can't do this in `weight_loader` since it already exists in
@@ -301,7 +320,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         self.A_log = nn.Parameter(
             torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
         )
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(2)})
+        set_weight_attrs(
+            self.A_log,
+            {"weight_loader": sharded_weight_loader(2, tp_rank=self.tp_rank)},
+        )
 
         self.g_b_proj = ColumnParallelLinear(
             self.head_dim,
@@ -309,6 +331,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             bias=False,
             quant_config=self.quant_config,
             prefix=f"{prefix}.g_b_proj",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
         self.o_proj = RowParallelLinear(
@@ -316,7 +340,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             self.hidden_size,
             bias=False,
             quant_config=self.quant_config,
+            reduce_results=not self.tp_over_pcp,
             prefix=f"{prefix}.o_proj",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
         compilation_config = get_current_vllm_config().compilation_config
@@ -328,7 +355,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         def _a_log_weight_loader(param, loaded_weight):
             if loaded_weight.dim() == 1:
                 loaded_weight = loaded_weight.view([1, 1, -1, 1])
-            return sharded_weight_loader(2)(param, loaded_weight)
+            return sharded_weight_loader(2, tp_rank=self.tp_rank)(param, loaded_weight)
 
         self.A_log.weight_loader = _a_log_weight_loader
 

@@ -198,10 +198,66 @@ def sparse_attn_indexer_kpool(
     else:
         assert q_scale is None, "q_scale must be None when use_fp4_cache=False"
 
+    layout = get_forward_context().pcp_token_layout
+    if layout is not None:
+        # Cache replicas need complete pools in request order, while Q/scoring
+        # stay on the local PCP rows. Tail metadata uses the global batch.
+        assert dcp_world_size == 1 and index_kpool > 1
+        assert gate_score is not None and compress_ape is not None
+        assert positions is not None and tail_prefix is not None
+        assert tail_kv_cache is not None and not skip_k_cache_insert
+        global_k = layout.gather_to_global(k)
+        global_gate = layout.gather_to_global(gate_score)
+        global_positions = layout.gather_to_global(positions)
+        global_slots = slot_mapping[layout.restore_idx]
+        tail_meta = attn_metadata[_resolve_layer_name(tail_prefix)]
+        global_decodes = tail_meta.num_decode_tokens
+        assert global_decodes == tail_meta.num_decodes, (
+            "K-pool PCP cache writes currently require one token per decode request"
+        )
+        if global_decodes:
+            dec = slice(0, global_decodes)
+            kpool_ops.kpool_decode_update_and_maybe_write_cache_batched(
+                kv_cache,
+                tail_kv_cache,
+                tail_meta.slot_mapping[dec, None],
+                global_k[dec, None, :],
+                global_gate[dec, None, :],
+                compress_ape,
+                global_slots[dec, None],
+                global_positions[dec, None].to(torch.int32),
+                index_kpool,
+                head_dim,
+                round_scale=(scale_fmt is not None),
+            )
+        pre = slice(global_decodes, layout.global_num_tokens)
+        _kpool_compress_insert(
+            global_k[pre],
+            global_gate[pre],
+            compress_ape,
+            kv_cache,
+            global_slots[pre],
+            index_kpool,
+            head_dim,
+            round_scale=(scale_fmt is not None),
+        )
+        kpool_ops.kpool_seed_tail_cache(
+            tail_kv_cache,
+            global_k[pre],
+            global_gate[pre],
+            tail_meta.slot_mapping[pre],
+            index_kpool,
+            head_dim,
+        )
+        skip_k_cache_insert = True
+
     # During speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens. Truncate k to avoid
     # out-of-bounds reads in the kernel.
-    num_tokens = slot_mapping.shape[0]
+    num_tokens = (
+        attn_metadata_narrowed.num_decode_tokens
+        + attn_metadata_narrowed.num_prefill_tokens
+    )
     if k is not None:
         k = k[:num_tokens]
 

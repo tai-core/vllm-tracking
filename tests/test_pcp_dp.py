@@ -127,9 +127,10 @@ def test_ag_rs_dispatch_and_combine_use_dp_pcp_sizes(monkeypatch, enable_ep):
 
 
 @pytest.mark.parametrize("slots", [[3, 4], [3, 4, -1, -1, -1, -1]])
-def test_decode_cache_write_ignores_dp_padding(slots):
+@pytest.mark.parametrize("rope_dim", [0, 1])
+def test_decode_cache_write_ignores_dp_padding(slots, rope_dim):
     kv = torch.arange(12).reshape(6, 2)
-    pe = torch.arange(6).reshape(6, 1, 1)
+    pe = torch.arange(6 * rope_dim).reshape(6, 1, rope_dim)
     slots = torch.tensor(slots)
     cache_kv, cache_pe, cache_slots = maybe_gather_mla_latent_cache_inputs(
         kv, pe, slots, num_decode_tokens=2, use_pcp=True
@@ -139,7 +140,8 @@ def test_decode_cache_write_ignores_dp_padding(slots):
     torch.testing.assert_close(cache_slots, slots[:2])
 
 
-def test_expanded_slot_mapping_keeps_pcp_prefill_padding(monkeypatch):
+@pytest.mark.parametrize("rope_dim", [0, 1])
+def test_expanded_slot_mapping_keeps_pcp_prefill_padding(monkeypatch, rope_dim):
     calls = []
 
     def all_gather(tensor, dim):
@@ -151,11 +153,12 @@ def test_expanded_slot_mapping_keeps_pcp_prefill_padding(monkeypatch):
         lambda: SimpleNamespace(world_size=2, all_gather=all_gather),
     )
     kv = torch.zeros(3, 2)  # Two decodes followed by one PCP padding row.
-    pe = torch.zeros(3, 1, 1)
+    pe = torch.zeros(3, 1, rope_dim)
     slots = torch.tensor([3, 4, 8, 3, 4, -1])
-    cache_kv, _, cache_slots = maybe_gather_mla_latent_cache_inputs(
+    cache_kv, cache_pe, cache_slots = maybe_gather_mla_latent_cache_inputs(
         kv, pe, slots, num_decode_tokens=2, use_pcp=True
     )
     assert calls == [1, 1]
     assert cache_kv.shape == (4, 2)
+    assert cache_pe.shape == (4, 1, rope_dim)
     assert cache_slots.tolist() == [3, 4, 8, -1]

@@ -35,6 +35,41 @@ class RankSegment:
         return self.global_batch_slice.stop - self.global_batch_slice.start
 
 
+@dataclass(frozen=True)
+class PCPTokenLayout:
+    global_num_tokens: int
+    local_padded_num_tokens: int
+    restore_idx: torch.Tensor
+    expand_idx: torch.Tensor
+    valid_mask: torch.Tensor
+
+    @classmethod
+    def replicated(cls, is_padding: torch.Tensor, world_size: int) -> "PCPTokenLayout":
+        num_tokens = is_padding.numel()
+        indices = torch.arange(num_tokens, dtype=torch.int64, device=is_padding.device)
+        return cls(
+            global_num_tokens=num_tokens,
+            local_padded_num_tokens=num_tokens,
+            restore_idx=indices,
+            expand_idx=indices.repeat(world_size),
+            valid_mask=(~is_padding).repeat(world_size),
+        )
+
+    def gather_to_global(self, hidden: torch.Tensor) -> torch.Tensor:
+        if hidden.shape[0] != self.local_padded_num_tokens:
+            raise ValueError("PCP input does not match the scheduled local layout")
+        gathered = get_pcp_group().all_gather(hidden, dim=0)
+        return gathered[self.restore_idx]
+
+    def reduce_scatter_to_local(self, partial: torch.Tensor) -> torch.Tensor:
+        if partial.shape[0] != self.global_num_tokens:
+            raise ValueError("KDA output does not match the scheduled global layout")
+        expanded = partial[self.expand_idx]
+        mask = self.valid_mask.reshape((-1,) + (1,) * (partial.ndim - 1))
+        expanded = expanded.masked_fill(~mask, 0)
+        return get_pcp_group().reduce_scatter(expanded, dim=0)
+
+
 class PCPManager:
     """MRV2 PC batch manager.
 
@@ -70,6 +105,7 @@ class PCPManager:
         self._local_gather_idx: torch.Tensor | None = None
         self.draft_prefill_batch: InputBatch | None = None
         self._block_tables = block_tables
+        self.token_layout: PCPTokenLayout | None = None
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
@@ -346,6 +382,7 @@ class PCPManager:
         num_expanded_tokens = padded_num_tokens * self.pcp_world_size
         padded_gather_idx = np.zeros(num_expanded_tokens, dtype=np.int64)
         gathered_kv_write_mask = np.zeros(num_expanded_tokens, dtype=np.bool_)
+        valid_mask = np.zeros(num_expanded_tokens, dtype=np.bool_)
         for rank, segments in enumerate(segments_by_rank):
             expanded_rank_offset = rank * padded_num_tokens
             for segment in segments:
@@ -358,6 +395,7 @@ class PCPManager:
                     segment.global_batch_slice.stop,
                     dtype=np.int64,
                 )
+                valid_mask[padded_gathered_slice] = True
                 # Replicated rows contain identical KV, so rank 0 is the
                 # canonical writer. A sharded decode has exactly one owner and
                 # therefore needs no de-duplication here.
@@ -386,6 +424,13 @@ class PCPManager:
         )
         self._gathered_kv_write_mask = async_tensor_h2d(
             gathered_kv_write_mask, device=self.device
+        )
+        self.token_layout = PCPTokenLayout(
+            global_num_tokens=int(query_start_loc_np[-1]),
+            local_padded_num_tokens=padded_num_tokens,
+            restore_idx=self._hidden_restore_idx,
+            expand_idx=self._padded_gather_idx,
+            valid_mask=async_tensor_h2d(valid_mask, device=self.device),
         )
         return segments_by_rank, per_rank_num_tokens
 
@@ -688,6 +733,9 @@ class PCPManager:
         input_buffers = self.input_buffers
         num_reqs = input_batch.num_reqs_after_padding
         num_tokens = input_batch.num_tokens_after_padding
+        self.token_layout = PCPTokenLayout.replicated(
+            input_batch.is_padding, self.pcp_world_size
+        )
         input_batch = replace(
             input_batch,
             input_ids=input_buffers.input_ids[:num_tokens].copy_(input_batch.input_ids),
@@ -723,6 +771,18 @@ class PCPManager:
         slot_mappings = self.prepare_slot_mappings()
         return block_tables, slot_mappings
 
+    def get_global_attn_inputs(
+        self,
+    ) -> tuple[InputBatch, tuple[torch.Tensor, ...], torch.Tensor]:
+        """Keep recurrent state rows separate from PCP's duplicate request rows."""
+        assert self._block_tables is not None
+        assert self._global_batch_slot_mappings is not None
+        batch = self.global_batch
+        tables = self._block_tables.gather_block_tables(
+            batch.idx_mapping, batch.num_reqs_after_padding
+        )
+        return batch, tables, self._global_batch_slot_mappings[:, : batch.num_tokens]
+
     def prepare_slot_mappings(self) -> torch.Tensor:
         assert self._block_tables is not None
         assert self._global_batch_slot_mappings is not None
@@ -756,15 +816,16 @@ class PCPManager:
         gathered_kv_slot_mappings = self._gathered_kv_slot_mappings[
             :, :num_expanded_tokens
         ]
-        torch.index_select(
-            global_batch_slot_mappings,
-            1,
-            padded_gather_idx,
-            out=gathered_kv_slot_mappings,
+        # The persistent destination is a non-contiguous view when the batch
+        # is smaller than capacity. Some device backends ignore its row stride
+        # in index_select(out=...). Gather into a contiguous temporary and let
+        # the masked write preserve the persistent buffer's layout and address.
+        selected_slot_mappings = torch.index_select(
+            global_batch_slot_mappings, 1, padded_gather_idx
         )
         torch.where(
             self._gathered_kv_write_mask.unsqueeze(0),
-            gathered_kv_slot_mappings,
+            selected_slot_mappings,
             self._pad_slot_id,
             out=gathered_kv_slot_mappings,
         )

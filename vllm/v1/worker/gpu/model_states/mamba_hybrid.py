@@ -227,6 +227,52 @@ class MambaHybridModelState(DefaultModelState):
             input_batch.idx_mapping,
         )
 
+    def prepare_attn_with_pcp(
+        self,
+        input_batch: InputBatch,
+        cudagraph_mode: CUDAGraphMode,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        *,
+        global_attn_inputs: tuple[InputBatch, tuple[torch.Tensor, ...], torch.Tensor],
+        for_capture: bool = False,
+    ) -> dict[str, Any]:
+        def needs_global_tokens(group: AttentionGroup) -> bool:
+            return isinstance(group.kv_cache_spec, MambaSpec) or (
+                group.backend.get_name() == "KPOOL_TAIL"
+            )
+
+        local_groups = [
+            [g for g in groups if not needs_global_tokens(g)] for groups in attn_groups
+        ]
+        recurrent_groups = [
+            [g for g in groups if needs_global_tokens(g)] for groups in attn_groups
+        ]
+        metadata = super().prepare_attn(
+            input_batch,
+            cudagraph_mode,
+            block_tables,
+            slot_mappings,
+            local_groups,
+            kv_cache_config,
+            for_capture=for_capture,
+        )
+        global_batch, global_tables, global_slots = global_attn_inputs
+        metadata.update(
+            self.prepare_attn(
+                global_batch,
+                cudagraph_mode,
+                global_tables,
+                global_slots,
+                recurrent_groups,
+                kv_cache_config,
+                for_capture=for_capture,
+            )
+        )
+        return metadata
+
     def prepare_attn(
         self,
         input_batch: InputBatch,

@@ -514,6 +514,16 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             # restore kv_connector_worker_meta
             connector_output.kv_connector_worker_meta = multi_connector_worker_meta
 
+    def get_transfer_worker_rank(self) -> int | None:
+        ranks = {
+            rank
+            for connector in self._connectors
+            if (rank := connector.get_transfer_worker_rank()) is not None
+        }
+        if len(ranks) > 1:
+            raise ValueError("MultiConnector children disagree on transfer worker rank")
+        return next(iter(ranks), None)
+
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
         """Get the KVConnector handshake metadata from sub-connectors.
         Returns the first non-None metadata from sub-connectors.

@@ -85,6 +85,11 @@ inline __device__ uint32_t h0_h0(uint16_t a) {
 }
 
 inline __device__ float half_to_float(uint16_t h) {
+#ifdef USE_MUSA
+  // CUDA inline PTX is disabled by the MUSA source translator. Use an
+  // intrinsic so FP8 dequantization receives the actual half value.
+  return __half2float(__ushort_as_half(h));
+#else
   float f;
 #ifndef USE_ROCM
   asm volatile("cvt.f32.f16 %0, %1;\n" : "=f"(f) : "h"(h));
@@ -92,6 +97,7 @@ inline __device__ float half_to_float(uint16_t h) {
   asm volatile("v_cvt_f32_f16 %0, %1;" : "=v"(f) : "v"(h));
 #endif
   return f;
+#endif
 }
 
 inline __device__ float2 half2_to_float2(uint32_t v) {

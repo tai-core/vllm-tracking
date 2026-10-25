@@ -149,10 +149,11 @@ GDN_BUILD_TEST_CASES = {
 def _create_gdn_builder(
     num_speculative_tokens: int = 0,
     full_cuda_graph: bool = False,
+    model_name: str = "Qwen/Qwen3.5-0.8B",
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(
-        model_name="Qwen/Qwen3.5-0.8B",
+        model_name=model_name,
         block_size=BLOCK_SIZE,
     )
     vllm_config.compilation_config.cudagraph_mode = (
