@@ -403,6 +403,13 @@ class Glm5NextDecoderLayer(nn.Module):
                 skip_rope=config.mla_use_nope,
             )
 
+        self._kda_pcp_collectives = None
+        if self.layer_kind == "kda" and getattr(self.self_attn, "tp_over_pcp", False):
+            from .parallel import get_kda_pcp_collectives
+            self._kda_pcp_collectives = get_kda_pcp_collectives(
+                vllm_config, self.hidden_size
+            )
+
         # MTP layers sit past the base model's hidden layers (layer_idx >=
         # num_hidden_layers), so they're outside mlp_layer_types; default them
         # to the last base layer's MLP type (sparse/MoE for these checkpoints).
@@ -528,10 +535,19 @@ class Glm5NextDecoderLayer(nn.Module):
         layout = get_forward_context().pcp_token_layout
         if layout is None:
             raise RuntimeError("KDA TP over PCP requires a PCP token layout")
-        hidden_states = layout.gather_to_global(hidden_states)
+        collectives = getattr(self, "_kda_pcp_collectives", None)
+        hidden_states = (
+            layout.gather_to_global(hidden_states)
+            if collectives is None
+            else collectives.gather(hidden_states.contiguous(), layout)
+        )
         partial = self.self_attn(hidden_states=hidden_states, positions=positions)
         # PCP restores local tokens; TP sums the remaining head partitions.
-        local = layout.reduce_scatter_to_local(partial)
+        local = (
+            layout.reduce_scatter_to_local(partial)
+            if collectives is None
+            else collectives.reduce_scatter(partial.contiguous(), layout)
+        )
         # Sequence-parallel forward performs its TP reduce-scatter below.
         if self.is_sequence_parallel and self.mhc and not self.is_mtp_layer:
             return local

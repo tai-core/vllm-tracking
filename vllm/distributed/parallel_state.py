@@ -1393,6 +1393,10 @@ class GroupCoordinator:
         return self.device_communicator.recv(size, dtype, src)
 
     def destroy(self):
+        pcp_collectives = getattr(self, "_kda_pcp_collectives", None)
+        if pcp_collectives is not None:
+            pcp_collectives.close()
+            del self._kda_pcp_collectives
         # Device communicators can own collective workspaces whose teardown
         # uses these process groups (for example FlashInfer PCIe IPC barriers).
         # Release them before destroying the groups they depend on.

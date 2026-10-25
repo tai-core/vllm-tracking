@@ -108,3 +108,16 @@ def test_kda_output_reduces_tp_once(monkeypatch, sequence_parallel, mhc, is_mtp)
     deferred = sequence_parallel and mhc and not is_mtp
     torch.testing.assert_close(out, x * (12 if deferred else 24))
     assert calls == ([] if deferred else ["tp"])
+
+
+@pytest.mark.parametrize("backend,eager,pcp", [
+    ("mccl", True, 8), ("auto", False, 8), ("auto", True, 2),
+])
+def test_mapped_collective_fallback(monkeypatch, backend, eager, pcp):
+    from vllm.models.glm5next.common.parallel import get_kda_pcp_collectives
+    from vllm.platforms import current_platform
+    monkeypatch.setattr(current_platform, "is_musa", lambda: True)
+    cfg = config(pcp=pcp)
+    cfg.additional_config["kda_pcp_collective"] = backend
+    cfg.model_config = SimpleNamespace(enforce_eager=eager)
+    assert get_kda_pcp_collectives(cfg, 4096) is None
