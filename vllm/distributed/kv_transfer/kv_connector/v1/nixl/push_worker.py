@@ -28,7 +28,9 @@ PUSH_REG send or a deferred push WRITE has been queued. When a request's
 lease expires (the base worker reports it via ``done_sending``) or the WRITE completes,
 ``get_finished`` enqueues an eviction onto ``_evict_finished_inbox`` so
 the writer drops any leftover ``_push_finished_blocks`` /
-``_pending_d_registrations`` and stops self-polling.
+``_pending_d_registrations`` and stops fast self-polling. When cancellation
+is enabled, an otherwise idle writer still polls every 100ms because a NIXL
+notification does not signal the Python wake event.
 """
 
 import queue
@@ -75,6 +77,11 @@ logger = init_logger(__name__)
 # main thread (start_load_kv / get_finished). Smaller -> lower latency
 # while active, slightly more CPU.
 _PUSH_WRITER_POLL_INTERVAL_MS = 1.0
+_PUSH_CANCEL = b"PUSH_CANCEL_V1:"
+_PUSH_CANCEL_ACK = b"PUSH_CANCEL_ACK_V1:"
+# Tombstones cannot be aged out: an old handshake/registration may arrive later.
+# At the cap, refuse new cancellation ACKs rather than permit unsafe reuse.
+_MAX_CANCEL_TOMBSTONES = 65536
 
 
 class NixlPushConnectorWorker(NixlBaseConnectorWorker):
@@ -133,6 +140,174 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         self._push_writer_stop = threading.Event()
         self._push_writer_thread: threading.Thread | None = None
+        self._init_push_cancellation(vllm_config)
+
+    def _init_push_cancellation(self, vllm_config):
+        self._push_cancel_enabled = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "enable_push_cancellation", False
+            )
+        )
+        self._cancel_send_inbox = queue.Queue()
+        self._cancelled_recv_inbox = queue.Queue()
+        self._cancelled_pushes = set()
+        self._cancel_waiters = {}
+        self._cancel_receives = {}
+        self._push_write_requests = defaultdict(set)
+        # A failed WRITE is not proof that DMA stopped. Never ACK such requests.
+        self._cancel_unsafe_requests = set()
+
+    def _drain_cancellations(self):
+        if not self._push_cancel_enabled:
+            return
+        while True:
+            try:
+                rid, reg = self._cancel_send_inbox.get_nowait()
+            except queue.Empty:
+                break
+            self._cancel_receives.setdefault(rid, [reg, set(), set(), 0.0])
+            logger.info(
+                "Push cancellation queued: %s peer=%s", rid, reg["remote_engine_id"]
+            )
+        now = time.monotonic()
+        for rid, state in list(self._cancel_receives.items()):
+            reg, targets, acks, last_attempt = state
+            if now - last_attempt < 1.0:
+                continue
+            state[3] = now
+            # Registration already initiates this handshake. A failed or pending
+            # handshake cannot justify freeing receive memory.
+            with self._handshake_lock:
+                agents = dict(self._remote_agents.get(reg["remote_engine_id"]) or {})
+            if not agents:
+                continue
+            expected = max(1, reg["remote_tp_size"] // self.world_size) * reg.get(
+                "remote_pp_size", 1
+            )
+            if len(agents) != expected:
+                continue
+            names = set(agents.values())
+            if targets and targets != names:
+                logger.error("Push cancel peer changed for %s; retaining blocks", rid)
+                continue
+            if not targets:
+                logger.info("Push cancellation targets: %s %s", rid, names)
+            targets.update(names)
+            for agent in targets - acks:
+                try:
+                    self.nixl_wrapper.send_notif(
+                        agent, notif_msg=_PUSH_CANCEL + msgspec.msgpack.encode(reg)
+                    )
+                except Exception:
+                    logger.exception("Could not send push cancellation for %s", rid)
+
+    def _handle_cancel_notif(self, notif):
+        if not self._push_cancel_enabled:
+            return
+        reg = msgspec.msgpack.decode(notif[len(_PUSH_CANCEL) :])
+        if (
+            not isinstance(reg, dict)
+            or not isinstance(reg.get("request_id"), str)
+            or not isinstance(reg.get("decode_engine_id"), str)
+            or reg.get("remote_engine_id") != self.engine_id
+        ):
+            logger.warning("Invalid push cancellation; ignoring")
+            return
+        key = (reg["decode_engine_id"], reg["request_id"])
+        if key not in self._cancelled_pushes:
+            if len(self._cancelled_pushes) >= _MAX_CANCEL_TOMBSTONES:
+                logger.error("Push cancellation tombstone limit reached; no ACK")
+                return
+            # Writer-thread fence precedes ACK. Both new registrations and late
+            # handshake callbacks check this tombstone before submitting WRITE.
+            self._cancelled_pushes.add(key)
+            logger.info("Push cancellation fenced: %s", key)
+        pending = self._pending_d_registrations.get(reg["request_id"])
+        if pending is not None and pending.get("decode_engine_id") == key[0]:
+            self._pending_d_registrations.pop(reg["request_id"], None)
+        self._cancel_waiters[key] = reg
+
+    def _ack_safe_cancellations(self):
+        if not self._push_cancel_enabled:
+            return
+        for key, reg in list(self._cancel_waiters.items()):
+            with self._sending_transfers_lock:
+                rids = self._push_write_requests.get(key, ())
+                safe = True
+                for rid in rids:
+                    if rid in self._cancel_unsafe_requests:
+                        safe = False
+                        break
+                    for handle in self._sending_transfers.get(rid, ()):
+                        try:
+                            status = self.nixl_wrapper.check_xfer_state(handle)
+                        except Exception:
+                            status = "ERROR"
+                        if status != "DONE":
+                            safe = False
+                            if status != "PROC":
+                                self._cancel_unsafe_requests.add(rid)
+                if not safe:
+                    continue
+            # P also writes to D on later requests, so establish full metadata.
+            # A notif-only handshake here would poison the cached P->D handshake.
+            # Never invalidate handles/descriptors to manufacture a terminal status.
+            fut = self._ensure_handshake(
+                reg["decode_engine_id"],
+                reg["decode_host"],
+                reg["decode_port"],
+                reg["decode_tp_size"],
+            )
+            if fut is not None:
+                continue
+            with self._handshake_lock:
+                agents = dict(self._remote_agents.get(reg["decode_engine_id"]) or {})
+            if len(agents) != max(1, reg["decode_tp_size"] // self.world_size):
+                continue
+            payload = _PUSH_CANCEL_ACK + msgspec.msgpack.encode(
+                {
+                    "request_id": reg["request_id"],
+                    "producer_engine_id": self.engine_id,
+                }
+            )
+            try:
+                for agent in agents.values():
+                    self.nixl_wrapper.send_notif(agent, notif_msg=payload)
+            except Exception:
+                logger.exception("Could not ACK push cancellation for %s", key)
+                continue
+            logger.info("Push cancellation ACK sent: %s", key)
+            del self._cancel_waiters[key]
+
+    def _handle_cancel_ack(self, sender, notif):
+        if not self._push_cancel_enabled:
+            return
+        ack = msgspec.msgpack.decode(notif[len(_PUSH_CANCEL_ACK) :])
+        if not isinstance(ack, dict):
+            return
+        rid = ack.get("request_id")
+        state = self._cancel_receives.get(rid)
+        if state is None:
+            return
+        reg, targets, acks, _ = state
+
+        # NIXL add_remote_agent returns bytes, but get_new_notifs uses str keys.
+        # Preserve the registered handle while comparing canonical identities.
+        def identity(name: str | bytes) -> bytes:
+            return name.encode("utf-8") if isinstance(name, str) else name
+
+        sender = {identity(agent): agent for agent in targets}.get(identity(sender))
+        if (
+            not targets
+            or sender not in targets
+            or ack.get("producer_engine_id") != reg["remote_engine_id"]
+        ):
+            return
+        logger.info("Push cancellation ACK received: %s from %s", rid, sender)
+        acks.add(sender)
+        if acks == targets:
+            del self._cancel_receives[rid]
+            self._cancelled_recv_inbox.put(rid)
 
     # --- Lifecycle ----------------------------------------------------- #
 
@@ -196,6 +371,12 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             )
             self._recving_metadata[req_id] = meta
 
+        if self._push_cancel_enabled:
+            for req_id, reg in metadata.push_cancellations.items():
+                self._cancel_send_inbox.put((req_id, reg))
+            if metadata.push_cancellations:
+                self._push_writer_wake.set()
+
         # --- D-side: registrations to send to P via NIXL ---
         if metadata.push_registrations:
             for req_id, reg_data in metadata.push_registrations.items():
@@ -235,6 +416,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         while not self._push_writer_stop.is_set():
             try:
+                self._drain_cancellations()
                 # 1. D registrations to send.
                 while True:
                     try:
@@ -274,24 +456,43 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                         break
                     self._push_finished_blocks.pop(rid, None)
                     self._pending_d_registrations.pop(rid, None)
+                    with self._sending_transfers_lock:
+                        safe = (
+                            not self._sending_transfers.get(rid)
+                            and rid not in self._cancel_unsafe_requests
+                        )
+                    if safe:
+                        for key in list(self._push_write_requests):
+                            self._push_write_requests[key].discard(rid)
+                            if not self._push_write_requests[key]:
+                                del self._push_write_requests[key]
 
                 # 4. NIXL notifs: route PUSH_REG; forward the rest.
-                for notifs in self.nixl_wrapper.get_new_notifs().values():
+                for sender, notifs in self.nixl_wrapper.get_new_notifs().items():
                     for notif in notifs:
-                        if notif.startswith(PUSH_REG_NOTIF_PREFIX):
+                        if notif.startswith(_PUSH_CANCEL):
+                            self._handle_cancel_notif(notif)
+                        elif notif.startswith(_PUSH_CANCEL_ACK):
+                            self._handle_cancel_ack(sender, notif)
+                        elif notif.startswith(PUSH_REG_NOTIF_PREFIX):
                             self._handle_push_reg_notif(notif)
                         else:
                             self._pending_completion_notifs.put(notif)
+                self._ack_safe_cancellations()
             except Exception:
                 logger.exception("nixl-push-writer error; continuing")
 
-            # Self-poll only while there is no other wake source: P-side
-            # finished blocks waiting for a D PUSH_REG match. All other
-            # progress is event-driven (see module docstring).
-            if self._push_finished_blocks:
+            # NIXL notifications do not signal the Python wake event. A producer
+            # must keep polling cancellations after its last send lease expires.
+            if self._cancel_receives or self._cancel_waiters:
+                self._push_writer_wake.wait(timeout=0.1)
+                self._push_writer_wake.clear()
+            elif self._push_finished_blocks:
                 self._push_writer_stop.wait(timeout=sleep_s)
             else:
-                self._push_writer_wake.wait()
+                self._push_writer_wake.wait(
+                    timeout=0.1 if self._push_cancel_enabled else None
+                )
                 self._push_writer_wake.clear()
 
     def _handle_push_reg_notif(self, notif: bytes) -> None:
@@ -305,6 +506,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             logger.warning("PUSH_REG notif missing request_id; dropping")
             return
 
+        if (reg_data.get("decode_engine_id"), rid) in self._cancelled_pushes:
+            return
         match = self._pop_matching_finished_blocks(rid)
         if match is not None:
             fin_id, blocks = match
@@ -443,6 +646,11 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         the handshake resolves -- so the writer thread never blocks on the
         network (mirrors ``_send_registration_to_p``).
         """
+        key = (registration_data["decode_engine_id"], registration_data["request_id"])
+        if key in self._cancelled_pushes:
+            return
+        if self._push_cancel_enabled:
+            self._push_write_requests[key].add(request_id)
         if not local_block_ids:
             logger.warning("No local blocks to push for request %s", request_id)
             return
@@ -738,6 +946,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             # via the lease / watchdog.
             with self._sending_transfers_lock:
                 self._send_failures.add(request_id)
+                self._cancel_unsafe_requests.add(request_id)
             if not self._handle_failed_transfer(request_id, handle):
                 return handle
             return None
@@ -813,6 +1022,19 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # notifs, late PUSH_REGs) even if it had been parked.
         self._push_writer_wake.set()
 
+        while True:
+            try:
+                rid = self._cancelled_recv_inbox.get_nowait()
+            except queue.Empty:
+                break
+            logger.info(
+                "Push cancellation confirmed: %s receiving=%s",
+                rid,
+                rid in self._recving_metadata,
+            )
+            if rid in self._recving_metadata:
+                # Every producer has fenced this receive and confirmed no DMA.
+                self._failed_recv_reqs.put(rid)
         results = super().get_transfer_results()
         done_sending = results.finished_sending
 
@@ -824,6 +1046,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             )
             # Remember failures until the final sibling WRITE completes.
             self._send_failures.update(failed_pushing)
+            self._cancel_unsafe_requests.update(failed_pushing)
             successful = {
                 req_id
                 for req_id in done_pushing - self._send_failures

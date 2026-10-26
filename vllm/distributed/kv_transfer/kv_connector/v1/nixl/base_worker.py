@@ -1108,6 +1108,7 @@ class NixlBaseConnectorWorker:
                     ) from e
 
                 self._validate_remote_parallel_config(metadata)
+                self._validate_remote_push_cancellation(metadata)
 
                 # Ensure engine id matches.
                 if metadata.engine_id != expected_engine_id:
@@ -1264,6 +1265,15 @@ class NixlBaseConnectorWorker:
             exc_info=error is not None,
             stacklevel=2,
         )
+
+    def _validate_remote_push_cancellation(self, metadata: NixlAgentMetadata):
+        if self._TRANSFER_MODE == "push" and (
+            getattr(self, "_push_cancel_enabled", False) != metadata.push_cancel_enabled
+        ):
+            raise RuntimeError(
+                "Push cancellation requires matching patched P and D workers; "
+                "enable_push_cancellation must be enabled on both sides."
+            )
 
     def _ensure_handshake(
         self,
@@ -1803,6 +1813,7 @@ class NixlBaseConnectorWorker:
             pcp_size=self.pcp_size,
             region_members=self.region_members,
             packed_member_layouts=packed_member_layouts,
+            push_cancel_enabled=getattr(self, "_push_cancel_enabled", False),
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None

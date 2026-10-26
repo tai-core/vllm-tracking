@@ -613,6 +613,16 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def take_failed_requests(self) -> set[str]:
+        """Drain scheduler-side failures of asynchronous KV receives.
+
+        This terminates affected requests even with a recompute failure policy.
+        It does NOT certify that remote writes have stopped: receiving blocks
+        remain held until the worker reports transfer completion. Never use
+        this signal as permission to reuse or recompute into those blocks.
+        """
+        return set()
+
     def request_finished(
         self,
         request: "Request",

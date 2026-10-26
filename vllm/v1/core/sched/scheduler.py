@@ -2305,6 +2305,22 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_mismatch_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             error_req_ids.update(failed_kv_load_req_ids)
+        if self.connector is not None:
+            # Timeout is not transfer completion. Fail the HTTP request but
+            # preserve finish_requests' delayed-free protection against DMA.
+            # A completion arriving in this output wins the timeout race.
+            completed_recvs = self.finished_recving_kv_req_ids | set(
+                (kv_connector_output.finished_recving or ())
+                if kv_connector_output is not None
+                else ()
+            )
+            error_req_ids.update(
+                req_id
+                for req_id in self.connector.take_failed_requests()
+                if req_id not in completed_recvs
+                and (request := self.requests.get(req_id)) is not None
+                and request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            )
         if self.ec_connector is not None:
             # An encoder input the connector can no longer obtain. Failing is
             # retryable: re-issuing the request re-runs the encode.

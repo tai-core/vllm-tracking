@@ -80,6 +80,7 @@ class NixlAgentMetadata:
     region_members: list[list[str]] = field(default_factory=list)
     # Packed member -> (byte offset in its region's block, bytes per page).
     packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
+    push_cancel_enabled: bool = False
 
 
 @dataclass
@@ -281,6 +282,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # Push mode (D side): registration data the D worker should send to
         # P workers via NIXL notification on this step.
         self.push_registrations: dict[ReqId, dict[str, Any]] = {}
+        self.push_cancellations: dict[ReqId, dict[str, Any]] = {}
         # Push mode (P side): newly finished request blocks to be matched
         # against pending D registrations on the P worker.
         self.push_finished_blocks: dict[ReqId, BlockIds] = {}

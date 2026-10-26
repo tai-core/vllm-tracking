@@ -7578,3 +7578,78 @@ def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
     # Deferring this step alone would ask for 6. The PP wait to 7 stands.
     assert "read" not in scheduler.schedule().num_scheduled_tokens
     assert read.next_decode_eligible_step == 7
+
+
+@pytest.mark.parametrize("recompute", [True, False])
+@pytest.mark.parametrize("completion", ["none", "same-step", "previous-step"])
+def test_remote_kv_timeout_fails_request_without_reusing_dma_blocks(
+    recompute,
+    completion,
+):
+    """A timeout ends the client request but cannot certify DMA completion."""
+    from tests.v1.kv_connector.unit.utils import create_model_runner_output
+
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=32, is_async=True),
+        block_size=16,
+    )
+    scheduler.recompute_kv_load_failures = recompute
+    [req] = create_requests(num_requests=1, num_tokens=64, req_ids=["timeout"])
+    scheduler.add_request(req)
+    scheduled = scheduler.schedule()
+    assert req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    free_before = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+    if completion == "previous-step":
+        scheduler.update_from_output(
+            scheduled, create_model_runner_output([], finished_recving={req.request_id})
+        )
+    result = create_model_runner_output(
+        [],
+        finished_recving={req.request_id} if completion == "same-step" else None,
+    )
+    with patch.object(
+        scheduler.connector, "take_failed_requests", return_value={req.request_id}
+    ):
+        outputs = scheduler.update_from_output(scheduled, result)
+
+    if completion != "none":
+        assert not req.is_finished()
+        assert req.request_id in scheduler.finished_recving_kv_req_ids
+        assert not any(out.outputs for out in outputs.values())
+        return
+
+    assert req.status == RequestStatus.FINISHED_ERROR
+    assert outputs[req.client_index].outputs[0].finish_reason == FinishReason.ERROR
+    assert req not in scheduler.deferred_waiting
+    assert req not in scheduler.kv_holding_waiting
+    assert req.request_id in scheduler.requests  # quarantined, not reusable
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free_before
+
+    # A real late completion releases the quarantine exactly once.
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        create_model_runner_output([], finished_recving={req.request_id}),
+    )
+    assert req.request_id not in scheduler.requests
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() > free_before
+
+
+def test_remote_kv_timeout_after_client_abort_does_not_emit_second_output():
+    from tests.v1.kv_connector.unit.utils import create_model_runner_output
+
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=32, is_async=True)
+    )
+    [req] = create_requests(num_requests=1, num_tokens=64, req_ids=["cancelled"])
+    scheduler.add_request(req)
+    scheduled = scheduler.schedule()
+    scheduler.finish_requests(req.request_id, RequestStatus.FINISHED_ABORTED)
+    with patch.object(
+        scheduler.connector, "take_failed_requests", return_value={req.request_id}
+    ):
+        outputs = scheduler.update_from_output(
+            scheduled, create_model_runner_output([])
+        )
+    assert req.status == RequestStatus.FINISHED_ABORTED
+    assert req.request_id in scheduler.requests
+    assert not any(out.outputs for out in outputs.values())

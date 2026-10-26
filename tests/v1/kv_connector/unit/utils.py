@@ -640,6 +640,11 @@ def make_nixl_push_scheduler(
     # Push-specific state.
     sched._push_pending_registrations = {}
     sched._push_registration_deadlines = {}
+    sched._push_failed_requests = set()
+    sched._push_recv_registrations = {}
+    sched._push_cancellations = {}
+    sched._push_cancelling_receives = set()
+    sched._push_cancel_enabled = False
     sched._finished_request_blocks = {}
     sched._newly_finished_push_blocks = {}
     sched._push_registration_timeout = (

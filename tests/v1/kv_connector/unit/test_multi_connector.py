@@ -1277,3 +1277,14 @@ def test_multi_connector_mixed_hma_disables_hybrid_kv_cache(monkeypatch):
             assert mc._all_support_hma is False
         finally:
             llm.llm_engine.engine_core.shutdown()
+
+
+def test_take_failed_requests_drains_all_children():
+    """Scheduler timeout signals must survive an offload/NIXL composition."""
+    connector = object.__new__(MultiConnector)
+    first, second = MagicMock(), MagicMock()
+    first.take_failed_requests.side_effect = [{"a", "shared"}, set()]
+    second.take_failed_requests.side_effect = [{"b", "shared"}, set()]
+    connector._connectors = [first, second]
+    assert connector.take_failed_requests() == {"a", "b", "shared"}
+    assert connector.take_failed_requests() == set()

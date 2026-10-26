@@ -291,6 +291,26 @@ class TestPushScheduler:
         assert "req-p-x" not in sched._finished_request_blocks
         assert "req-d-x" not in sched._push_registration_deadlines
 
+    def test_watchdog_keeps_polling_after_registration_is_sent(self):
+        """Draining the outbound registration must not disable its watchdog."""
+        sched = make_nixl_push_scheduler()
+        _stub_sw_clipping(sched)
+        req = _make_request(request_id="pending-recv")
+        sched.update_state_after_alloc(req, _BlocksMock(([7, 8],)), 32)
+        with patch.object(
+            sched.__class__.__mro__[1],
+            "build_connector_meta",
+            return_value=NixlConnectorMetadata(),
+        ):
+            sched.build_connector_meta(MagicMock())
+        assert not sched._push_pending_registrations
+        assert sched.has_pending_push_work()
+        assert sched.take_failed_requests() == set()
+        sched.update_connector_output(
+            KVConnectorOutput(finished_recving={req.request_id})
+        )
+        assert not sched.has_pending_push_work()
+
     def test_registration_watchdog_expires(self, caplog):
         """Stale D registrations whose deadline has passed are dropped at
         ``build_connector_meta`` time."""
@@ -325,6 +345,10 @@ class TestPushScheduler:
         assert d_req.request_id not in sched._push_registration_deadlines
         assert d_req.request_id not in sched._push_pending_registrations
         assert d_req.request_id not in meta.push_registrations
+        assert sched.has_pending_push_work()
+        assert sched.take_failed_requests() == {d_req.request_id}
+        assert sched.take_failed_requests() == set()
+        assert not sched.has_pending_push_work()
 
 
 # ----------------------------------------------------------------- #
@@ -339,6 +363,9 @@ class _StubWriterWorker(NixlPushConnectorWorker):
     @classmethod
     def fresh(cls) -> _StubWriterWorker:
         w = object.__new__(cls)
+        config = MagicMock()
+        config.kv_transfer_config.get_from_extra_config.return_value = False
+        w._init_push_cancellation(config)
 
         # Push-specific state managed by NixlPushConnectorWorker.
         from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
@@ -2159,3 +2186,254 @@ def test_layer_handshake_rejects_unsupported_geometry(
     assert not worker.kv_caches_base_addr
     with pytest.raises(KeyError):
         worker.transfer_topo.get_engine_info(metadata.engine_id)
+
+
+class TestPushCancellation:
+    @staticmethod
+    def worker():
+        w = _StubWriterWorker.fresh()
+        w._push_cancel_enabled = True
+        w.engine_id = "prefill-engine"
+        w.nixl_wrapper = MagicMock()
+        w._ensure_handshake = MagicMock(return_value=None)
+        w._remote_agents = {"decode-engine": {(0, 0): "decoder-agent"}}
+        return w
+
+    @staticmethod
+    def registration():
+        return dict(
+            request_id="cancelled-d",
+            decode_engine_id="decode-engine",
+            decode_host="localhost",
+            decode_port=1234,
+            decode_tp_size=1,
+            remote_engine_id="prefill-engine",
+            remote_tp_size=2,
+            remote_pp_size=1,
+            local_block_ids=([1],),
+        )
+
+    @staticmethod
+    def cancel(w, reg):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
+            _PUSH_CANCEL,
+        )
+
+        w._handle_cancel_notif(_PUSH_CANCEL + msgspec.msgpack.encode(reg))
+
+    def test_cancel_before_registration_fences_late_push(self):
+        w = self.worker()
+        reg = self.registration()
+        self.cancel(w, reg)
+        w._ack_safe_cancellations()
+        w.nixl_wrapper.send_notif.assert_called_once()
+        w._handle_push_reg_notif(PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(reg))
+        assert not w._pending_d_registrations
+        # Also guard the deferred-handshake callback's entry point.
+        w._ensure_handshake.reset_mock()
+        NixlPushConnectorWorker._do_start_push_kv(w, "p", ([1],), reg)
+        w._ensure_handshake.assert_not_called()
+        assert not w._push_write_requests
+
+    @pytest.mark.parametrize("failed", [False, True])
+    def test_no_ack_while_dma_active_or_error_is_unresolved(self, failed):
+        w = self.worker()
+        reg = self.registration()
+        key = (reg["decode_engine_id"], reg["request_id"])
+        w._push_write_requests[key].add("p")
+        if failed:
+            w._cancel_unsafe_requests.add("p")
+        else:
+            w._sending_transfers["p"] = [123]
+            w.nixl_wrapper.check_xfer_state.return_value = "PROC"
+        self.cancel(w, reg)
+        w._ack_safe_cancellations()
+        w.nixl_wrapper.send_notif.assert_not_called()
+        if not failed:
+            # Only a genuinely completed transfer may disappear here.
+            w._sending_transfers.pop("p")
+            w._ack_safe_cancellations()
+            w.nixl_wrapper.send_notif.assert_called_once()
+
+    def test_consumer_requires_all_distinct_expected_producers(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
+            _PUSH_CANCEL_ACK,
+        )
+
+        w = self.worker()
+        reg = self.registration()
+        rid = reg["request_id"]
+        w._remote_agents = {"prefill-engine": {(0, 0): "p0", (1, 0): "p1"}}
+        w._cancel_send_inbox.put((rid, reg))
+        w._drain_cancellations()
+        ack = _PUSH_CANCEL_ACK + msgspec.msgpack.encode(
+            {
+                "request_id": rid,
+                "producer_engine_id": "prefill-engine",
+            }
+        )
+        w._handle_cancel_ack("unknown", ack)
+        w._handle_cancel_ack("p0", ack)
+        w._handle_cancel_ack("p0", ack)
+        assert w._cancelled_recv_inbox.empty()
+        w._handle_cancel_ack("p1", ack)
+        assert w._cancelled_recv_inbox.get_nowait() == rid
+        w._handle_cancel_ack("p1", ack)
+        assert w._cancelled_recv_inbox.empty()
+
+    def test_partial_peer_discovery_does_not_allow_ack(self):
+        w = self.worker()
+        reg = self.registration()
+        w._remote_agents = {"prefill-engine": {(0, 0): "p0"}}
+        w._cancel_send_inbox.put((reg["request_id"], reg))
+        w._drain_cancellations()
+        w.nixl_wrapper.send_notif.assert_not_called()
+        assert not w._cancel_receives[reg["request_id"]][1]
+
+    def test_tombstone_capacity_fails_closed(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import push_worker
+
+        w = self.worker()
+        with patch.object(push_worker, "_MAX_CANCEL_TOMBSTONES", 0):
+            self.cancel(w, self.registration())
+        w._ack_safe_cancellations()
+        w.nixl_wrapper.send_notif.assert_not_called()
+
+    def test_disabled_protocol_does_not_ack(self):
+        w = self.worker()
+        w._push_cancel_enabled = False
+        self.cancel(w, self.registration())
+        assert not w._cancelled_pushes
+        w._ack_safe_cancellations()
+        w.nixl_wrapper.send_notif.assert_not_called()
+
+    def test_scheduler_cancel_reaches_worker_and_waits_for_confirmation(self):
+        from vllm.v1.request import RequestStatus
+
+        sched = make_nixl_push_scheduler()
+        sched._push_cancel_enabled = True
+        _stub_sw_clipping(sched)
+        req = _make_request(request_id="cancelled")
+        sched.update_state_after_alloc(req, _BlocksMock(([7, 8],)), 32)
+        req.status = RequestStatus.FINISHED_ABORTED
+        sched.request_finished(req, ([7, 8],))
+        with patch.object(
+            sched.__class__.__mro__[1],
+            "build_connector_meta",
+            return_value=NixlConnectorMetadata(),
+        ):
+            meta = sched.build_connector_meta(MagicMock())
+        assert req.request_id in meta.push_cancellations
+        assert sched.has_pending_push_work()
+        sched.update_connector_output(
+            KVConnectorOutput(finished_recving={req.request_id})
+        )
+        assert not sched.has_pending_push_work()
+
+    def test_done_handle_can_be_acknowledged_without_releasing_handle(self):
+        w = self.worker()
+        reg = self.registration()
+        key = (reg["decode_engine_id"], reg["request_id"])
+        w._push_write_requests[key].add("p")
+        w._sending_transfers["p"] = [123]
+        w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+        self.cancel(w, reg)
+        w._ack_safe_cancellations()
+        w.nixl_wrapper.send_notif.assert_called_once()
+        w.nixl_wrapper.release_xfer_handle.assert_not_called()
+        assert w._sending_transfers["p"] == [123]
+
+    def test_error_status_stays_unsafe_even_when_handle_disappears(self):
+        w = self.worker()
+        reg = self.registration()
+        key = (reg["decode_engine_id"], reg["request_id"])
+        w._push_write_requests[key].add("p")
+        w._sending_transfers["p"] = [123]
+        w.nixl_wrapper.check_xfer_state.return_value = "ERR"
+        self.cancel(w, reg)
+        w._ack_safe_cancellations()
+        w._sending_transfers.clear()
+        w._ack_safe_cancellations()
+        w.nixl_wrapper.send_notif.assert_not_called()
+        assert "p" in w._cancel_unsafe_requests
+
+    def test_cancel_does_not_establish_notification_only_producer_handshake(self):
+        w = self.worker()
+        self.cancel(w, self.registration())
+        w._ack_safe_cancellations()
+        assert not w._ensure_handshake.call_args.kwargs.get("notif_agents_only", False)
+
+    @pytest.mark.parametrize(
+        "local,remote", [(False, False), (True, True), (True, False), (False, True)]
+    )
+    def test_mixed_cancellation_capabilities_rejected_even_without_hash_check(
+        self, local, remote
+    ):
+        w = self.worker()
+        w._push_cancel_enabled = local
+        metadata = MagicMock()
+        metadata.push_cancel_enabled = remote
+        if local == remote:
+            w._validate_remote_push_cancellation(metadata)
+        else:
+            with pytest.raises(RuntimeError, match="matching patched P and D"):
+                w._validate_remote_push_cancellation(metadata)
+
+
+@pytest.mark.parametrize("registered", ["producer-agent", b"producer-agent"])
+@pytest.mark.parametrize("sender", ["producer-agent", b"producer-agent"])
+def test_push_cancel_ack_matches_native_nixl_agent_identity(registered, sender):
+    """Native NIXL mixes bytes registration handles and string notif senders."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
+        _PUSH_CANCEL_ACK,
+    )
+
+    worker = TestPushCancellation.worker()
+    reg = TestPushCancellation.registration()
+    rid = reg["request_id"]
+    worker._cancel_receives[rid] = [reg, {registered}, set(), 0.0]
+    ack = _PUSH_CANCEL_ACK + msgspec.msgpack.encode(
+        {"request_id": rid, "producer_engine_id": reg["remote_engine_id"]}
+    )
+    worker._handle_cancel_ack("unregistered-producer", ack)
+    assert worker._cancelled_recv_inbox.empty()
+    worker._handle_cancel_ack(sender, ack)
+    assert worker._cancelled_recv_inbox.get_nowait() == rid
+    assert rid not in worker._cancel_receives
+
+
+def test_idle_push_writer_receives_cancellation_without_engine_wakeup():
+    """A producer with expired leases must still receive a later D cancellation."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
+        _PUSH_CANCEL,
+    )
+
+    worker = TestPushCancellation.worker()
+    notifications = queue.Queue()
+    first_poll = threading.Event()
+    acknowledged = threading.Event()
+
+    def poll():
+        first_poll.set()
+        try:
+            return notifications.get_nowait()
+        except queue.Empty:
+            return {}
+
+    worker.nixl_wrapper.get_new_notifs.side_effect = poll
+    worker.nixl_wrapper.send_notif.side_effect = lambda *a, **k: acknowledged.set()
+    thread = threading.Thread(target=worker._push_writer_loop, daemon=True)
+    thread.start()
+    try:
+        assert first_poll.wait(timeout=2)
+        reg = TestPushCancellation.registration()
+        notifications.put(
+            {"decoder-agent": [_PUSH_CANCEL + msgspec.msgpack.encode(reg)]}
+        )
+        # No engine request or explicit wake event: only a network notification.
+        assert acknowledged.wait(timeout=2), "idle producer did not ACK cancellation"
+        assert (reg["decode_engine_id"], reg["request_id"]) in worker._cancelled_pushes
+    finally:
+        worker._push_writer_stop.set()
+        worker._push_writer_wake.set()
+        thread.join(timeout=2)

@@ -618,6 +618,12 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def has_pending_block_frees(self) -> bool:
         return any(c.has_pending_block_frees() for c in self._connectors)
 
+    def take_failed_requests(self) -> set[str]:
+        failed = set()
+        for connector in self._connectors:
+            failed.update(connector.take_failed_requests())
+        return failed
+
     def has_pending_push_work(self) -> bool:
         return any(c.has_pending_push_work() for c in self._connectors)
 

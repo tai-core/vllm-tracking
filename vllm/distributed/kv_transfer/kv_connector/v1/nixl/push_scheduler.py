@@ -82,6 +82,16 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # to detect "registered but never fulfilled" failures (e.g. the P
         # node disappeared after registration). Keyed by D request_id.
         self._push_registration_deadlines: dict[ReqId, float] = {}
+        self._push_failed_requests: set[ReqId] = set()
+        self._push_recv_registrations: dict[ReqId, dict[str, Any]] = {}
+        self._push_cancellations: dict[ReqId, dict[str, Any]] = {}
+        self._push_cancelling_receives: set[ReqId] = set()
+        assert vllm_config.kv_transfer_config is not None
+        self._push_cancel_enabled = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "enable_push_cancellation", False
+            )
+        )
 
         # P-side: block IDs for finished requests, kept for the lease and
         # used to drive ``has_pending_push_work``.
@@ -187,6 +197,10 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             "remote_tp_size": params["tp_size"],
             "remote_pp_size": params.get("pp_size", 1),
         }
+        if self._push_cancel_enabled:
+            self._push_recv_registrations[request.request_id] = dict(
+                self._push_pending_registrations[request.request_id]
+            )
         self._push_registration_deadlines[request.request_id] = (
             time.perf_counter() + self._push_registration_timeout
         )
@@ -225,6 +239,7 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
 
         is_p_node = bool(params.get("do_remote_decode"))
 
+        self._cancel_receive(request.request_id)
         self._stop_heartbeat(request.request_id)
         # Drop any pending registration deadline; the request either
         # completed or was cancelled.
@@ -300,11 +315,9 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, NixlConnectorMetadata)
 
-        # Watchdog: any D-side registration whose deadline has passed without
-        # a corresponding push completion is treated as failed and cleaned up.
-        # The corresponding request is already tracked via _reqs_need_recv;
-        # the engine layer will eventually time it out via the lease, but we
-        # at least drop the stale registration so we don't keep retrying.
+        # A missing completion fails the request, not the transfer. The
+        # scheduler must keep its receiving blocks until WRITE completion;
+        # neither this deadline nor P's renewable lease proves DMA has stopped.
         now = time.perf_counter()
         # Deadlines are inserted in non-decreasing order (monotonic clock +
         # constant timeout, armed once per request), and dict insertion order
@@ -319,9 +332,13 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             self._push_registration_deadlines.pop(rid, None)
             # Avoid resending a registration that already timed out.
             self._push_pending_registrations.pop(rid, None)
+            self._cancel_receive(rid)
+            self._stop_heartbeat(rid)
+            self._push_failed_requests.add(rid)
             logger.warning(
                 "NixlPushConnector: registration for request %s timed out "
-                "after %.1fs without a push completion",
+                "after %.1fs without a push completion; failing request "
+                "and retaining receive blocks until transfer completion",
                 rid,
                 self._push_registration_timeout,
             )
@@ -337,14 +354,35 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             meta.push_finished_blocks = dict(self._newly_finished_push_blocks)
             self._newly_finished_push_blocks.clear()
 
+        if self._push_cancellations:
+            meta.push_cancellations = self._push_cancellations
+            self._push_cancellations = {}
         return meta
+
+    def _cancel_receive(self, req_id: ReqId) -> None:
+        if (reg := self._push_recv_registrations.pop(req_id, None)) is not None:
+            logger.info("Push cancellation scheduled: %s", req_id)
+            self._push_cancellations[req_id] = reg
+            self._push_cancelling_receives.add(req_id)
+
+    def take_failed_requests(self) -> set[str]:
+        failed, self._push_failed_requests = self._push_failed_requests, set()
+        return failed
 
     def has_pending_push_work(self) -> bool:
         # Keep the engine main loop alive while we have:
         # - finished P blocks awaiting WRITE completion, or
         # - pending D registrations the worker has not yet shipped, or
-        # - newly finished blocks not yet shipped to P workers.
-        return bool(self._finished_request_blocks or self._push_pending_registrations)
+        # - newly finished blocks not yet shipped to P workers, or
+        # - D watchdogs / failures still needing an engine step.
+        return bool(
+            self._finished_request_blocks
+            or self._push_pending_registrations
+            or self._push_registration_deadlines
+            or self._push_failed_requests
+            or self._push_cancellations
+            or self._push_cancelling_receives
+        )
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Clean up finished request blocks after push completes."""
@@ -355,3 +393,5 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # watchdog so we don't trip an expiration on a fulfilled request.
         for req_id in connector_output.finished_recving or ():
             self._push_registration_deadlines.pop(req_id, None)
+            self._push_recv_registrations.pop(req_id, None)
+            self._push_cancelling_receives.discard(req_id)

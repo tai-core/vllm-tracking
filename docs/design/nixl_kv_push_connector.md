@@ -273,11 +273,10 @@ Two per-request timers are armed on the scheduler:
   If a registered request does not see a push completion within
   ``push_registration_timeout`` seconds (defaults to
   ``decoder_kv_blocks_ttl``), ``build_connector_meta`` drops the stale
-  registration and the pending entry, logs a warning, and stops trying
-  to resend the registration. The corresponding request remains tracked
-  in ``_reqs_need_recv``; it is the engine's request-level abort path
-  (or the user / proxy timing out the HTTP call) that ultimately fails
-  the request.
+  registration and the pending entry, stops heartbeats, and reports a
+  request failure via ``take_failed_requests``. The engine ends the
+  request without waiting for the HTTP client to disconnect. Receiving
+  blocks remain held until the worker reports transfer completion.
 * **P-side block lease** — same ``_kv_lease_duration`` used by pull
   mode. ``request_finished`` sets the expiration in ``_reqs_need_send``
   and ``update_connector_output(finished_sending=...)`` clears it on
@@ -330,3 +329,41 @@ existing NIXL connector:
 
 Behavior on the engine main thread is otherwise unchanged. The writer
 thread is event-driven and idle when there is no push work.
+
+### Registration timeout and receive-block safety
+
+A registration watchdog expiration is a request failure, not proof of transfer
+completion. The push scheduler reports it through `take_failed_requests()` and
+stops its heartbeat. The engine terminates the waiting request with an error,
+even when the configured KV-load failure policy normally permits recomputation.
+A receive completion reported in the same engine output takes precedence over
+the timeout.
+
+The engine retains the receiving blocks using its existing delayed-free path.
+Only worker-reported completion releases them. Neither elapsed wall time nor the
+producer's renewable lease guarantees that a remote WRITE has stopped. If a peer
+never reports completion, those blocks remain held; this request-timeout handling
+does not implement a safe remote-cancellation protocol or repair that leak.
+
+### Opt-in cancellation acknowledgement prototype
+
+`enable_push_cancellation` defaults to false and must match on both P and D.
+The handshake rejects mixed capabilities even when compatibility hashing is
+otherwise disabled. With this option, request timeout or abort queues a
+`PUSH_CANCEL_V1` notification. Each producer installs a persistent request fence,
+rejects late registrations and handshake callbacks, and acknowledges only after
+all known WRITEs have reached `DONE`. An error or unknown transfer state is not
+accepted as proof that DMA has stopped. The consumer requires acknowledgements
+from every mapped producer agent before reporting receive completion/failure to
+the scheduler's existing delayed-free path.
+
+Agent identity validation accommodates NIXL's bytes-valued registration handles
+and string-valued notification senders. Unknown senders and incorrect producer
+engine IDs remain rejected. An enabled worker polls notifications at most every
+100ms while otherwise idle: NIXL notifications cannot wake its Python Event,
+and a producer may receive cancellation after its last send lease has expired.
+
+Cancellation fences do not expire during the worker lifetime. Once the 65,536
+entry limit is reached, new cancellations are not acknowledged. Unreachable
+peers and uncertain WRITEs also retain blocks; this prototype deliberately does
+not manufacture completion or forcibly deregister memory to recover capacity.
