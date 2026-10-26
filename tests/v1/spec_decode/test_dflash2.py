@@ -459,3 +459,35 @@ def test_context_kv_uses_quantized_projection_fallback(monkeypatch):
     torch.testing.assert_close(actual_k, expected_k)
     torch.testing.assert_close(actual_v, expected_v)
     assert [projection.calls for projection in projections] == [1, 1]
+
+
+def test_draft_masks_padding_before_codebook_lookup():
+    ids = torch.tensor([[1, 2], [2, 3], [2**62, 2**62], [2**62, 2**62]])
+    seen = []
+
+    def score_candidates(candidate_ids, unary_logits, hidden_states):
+        codebook = torch.arange(4)
+        seen.append(codebook[candidate_ids])
+        return torch.zeros(2, 2, 2, 2)
+
+    speculator = SimpleNamespace(
+        _run_model=lambda *args: torch.zeros(6, 4),
+        sample_indices=torch.arange(4),
+        num_speculative_steps=2,
+        top_k=2,
+        model=SimpleNamespace(
+            compute_candidates=lambda hidden: (ids, torch.zeros(4, 2))
+        ),
+        sample_idx_mapping=torch.tensor([0, 0, -1, -1]),
+        _score_candidates=score_candidates,
+        candidate_sampler=SimpleNamespace(sample=lambda *args, **kwargs: None),
+        sample_pos=torch.zeros(4),
+        temperature=None,
+        seeds=None,
+        draft_tokens=None,
+        draft_logits=None,
+        use_fp64_gumbel=False,
+        enable_adaptive_verification=False,
+    )
+    DFlash2Speculator._generate_draft(speculator, 2, 6, None, None, None)
+    assert seen[0].tolist() == [[[1, 2], [2, 3]], [[0, 0], [0, 0]]]

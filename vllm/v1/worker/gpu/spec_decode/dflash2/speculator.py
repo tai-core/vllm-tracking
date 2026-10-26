@@ -230,6 +230,18 @@ class DFlash2Speculator(DFlashSpeculator):
             num_reqs, self.num_speculative_steps, self.top_k
         )
         unary_logits = unary_logits.view_as(candidate_ids)
+        # MUDNN TopK (3.4.0.0) can return index 255 for width-128 NaN/-inf
+        # rows; the subsequent gather can yield garbage candidate IDs. Observed
+        # during MUSA graph warmup. Mask invalid rows before codebook lookup,
+        # since the sampler masks them only later. Valid candidates are unchanged.
+        # This guards padded codebook reads, not the earlier gather or TopK bug.
+        valid_rows = (
+            self.sample_idx_mapping[:num_sample].view(
+                num_reqs, self.num_speculative_steps, 1
+            )
+            >= 0
+        )
+        candidate_ids = candidate_ids.masked_fill(~valid_rows, 0)
         scores = self._score_candidates(candidate_ids, unary_logits, hidden_states)
         self.candidate_sampler.sample(
             candidate_ids,
