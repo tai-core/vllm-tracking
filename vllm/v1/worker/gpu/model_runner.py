@@ -66,9 +66,9 @@ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheSpec,
-    KpoolTailSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -172,7 +172,6 @@ from vllm.v1.worker.workspace import use_workspace_lane
 logger = init_logger(__name__)
 
 
-
 def spec_uses_generic_token_slot_mapping(layer_spec: KVCacheSpec) -> bool:
     """Whether the generic per-token slot-mapping kernel may run for a
     cache group whose layers are described by ``layer_spec``.
@@ -188,7 +187,6 @@ def spec_uses_generic_token_slot_mapping(layer_spec: KVCacheSpec) -> bool:
     and slot ids become PAD_SLOT_ID).
     """
     return not isinstance(layer_spec, (CircularBufferSpec, KpoolTailSpec))
-
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1555,6 +1553,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
+            self.kv_connector.start_pre_state_load(scheduler_output)
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -1620,6 +1619,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
             # boundary reset is visible to the attention metadata.
+            self.kv_connector.wait_for_pre_state_load()
             self.model_state.preprocess_state(
                 input_batch,
                 block_tables,

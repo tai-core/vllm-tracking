@@ -29,6 +29,12 @@ if TYPE_CHECKING:
 class KVConnector:
     """KVConnector interface used by GPUModelRunner."""
 
+    def start_pre_state_load(self, scheduler_output: "SchedulerOutput") -> None:
+        pass
+
+    def wait_for_pre_state_load(self) -> None:
+        pass
+
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
         pass
 
@@ -55,10 +61,26 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
 
         self._pending_load_start = False
+        self._early_load_started = False
         self._disabled = False
 
+    def start_pre_state_load(self, scheduler_output: "SchedulerOutput") -> None:
+        if (
+            not self._disabled
+            and not self._early_load_started
+            and scheduler_output.has_sync_kv_loads
+            and scheduler_output.total_num_scheduled_tokens > 0
+            and self.kv_connector.requires_pre_state_load
+        ):
+            self.pre_forward(scheduler_output)
+            self._early_load_started = True
+
+    def wait_for_pre_state_load(self) -> None:
+        if not self._disabled and self._early_load_started:
+            self.kv_connector.wait_for_pre_state_load()
+
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
-        if self._disabled:
+        if self._disabled or self._early_load_started:
             return
 
         kv_connector_metadata = scheduler_output.kv_connector_metadata
@@ -105,6 +127,7 @@ class ActiveKVConnector(KVConnector):
             self.kv_connector.build_connector_worker_meta()
         )
         self.kv_connector.clear_connector_metadata()
+        self._early_load_started = False
         return output
 
     def no_forward(self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:

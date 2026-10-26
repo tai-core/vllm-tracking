@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -17,6 +18,96 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+
+@pytest.mark.parametrize(
+    ("dummy_run", "num_tokens", "wait_fails"),
+    [(False, 1, False), (False, 1, True), (False, 0, False), (True, 1, False)],
+)
+def test_execute_model_waits_for_restore_before_recurrent_state_read(
+    monkeypatch, dummy_run, num_tokens, wait_fails
+):
+    events = []
+
+    class BoundaryReached(Exception):
+        pass
+
+    def dispatch(*args, **kwargs):
+        if dummy_run:
+            raise BoundaryReached("dummy dispatch")
+        return SimpleNamespace(num_tokens=num_tokens), None
+
+    def wait_for_load():
+        events.append("wait_load")
+        if wait_fails:
+            raise RuntimeError("restore failed")
+
+    def read_state(*args):
+        events.append("read_state")
+        raise BoundaryReached("state read")
+
+    empty_output = object()
+    connector = SimpleNamespace(
+        start_pre_state_load=lambda output: events.append("submit_load"),
+        wait_for_pre_state_load=wait_for_load,
+        no_forward=Mock(return_value=empty_output),
+    )
+    runner = SimpleNamespace(
+        update_pp_decode_requests=Mock(),
+        finish_requests=Mock(),
+        free_states=Mock(),
+        add_requests=Mock(),
+        update_requests=Mock(),
+        block_tables=SimpleNamespace(
+            apply_staged_writes=lambda: events.append("table_writes")
+        ),
+        kv_connector=connector,
+        _merge_ec_connector_no_forward=lambda output, empty: empty,
+        gather_batch_req_state=lambda output, dummy: (
+            SimpleNamespace(num_tokens=num_tokens),
+            1,
+        ),
+        pcp_manager=None,
+        lora_config=None,
+        is_encoder_decoder=False,
+        cudagraph_manager=None,
+        dp_size=1,
+        dp_rank=0,
+        prepare_inputs=lambda *args: events.append("prepare_inputs"),
+        prepare_attn=lambda batch: (events.append("prepare_attn"), None),
+        model_state=SimpleNamespace(preprocess_state=read_state),
+        kv_cache_config=object(),
+        req_states=SimpleNamespace(num_computed_tokens=SimpleNamespace(gpu=None)),
+    )
+    output = SimpleNamespace(
+        total_num_scheduled_tokens=num_tokens,
+        num_scheduled_tokens={"restore": num_tokens} if num_tokens else {},
+    )
+    monkeypatch.setattr(model_runner_module, "dispatch_cg_and_sync_dp", dispatch)
+
+    if num_tokens == 0:
+        assert GPUModelRunner.execute_model(runner, output) is empty_output
+        assert events == ["table_writes", "submit_load"]
+        connector.no_forward.assert_called_once_with(output)
+    elif dummy_run:
+        with pytest.raises(BoundaryReached, match="dummy dispatch"):
+            GPUModelRunner.execute_model(runner, output, dummy_run=True)
+        assert events == []
+    else:
+        error, message = (
+            (RuntimeError, "restore failed")
+            if wait_fails
+            else (BoundaryReached, "state read")
+        )
+        with pytest.raises(error, match=message):
+            GPUModelRunner.execute_model(runner, output)
+        assert events == [
+            "table_writes",
+            "submit_load",
+            "prepare_inputs",
+            "prepare_attn",
+            "wait_load",
+        ] + ([] if wait_fails else ["read_state"])
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
