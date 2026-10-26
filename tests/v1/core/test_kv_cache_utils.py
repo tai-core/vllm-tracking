@@ -2198,6 +2198,62 @@ def test_generate_scheduler_kv_cache_config():
     )
 
 
+def test_scheduler_preserves_mixed_mla_indexer_layouts_for_connector():
+    mla = MLAAttentionSpec(
+        block_size=8704,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        state_content_bytes=656,
+        cache_dtype_str="fp8_ds_mla",
+    )
+    indexer = MLAAttentionSpec(
+        block_size=8704,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=4,
+        storage_block_size=256,
+    )
+    full_spec = UniformTypeKVCacheSpecs(
+        block_size=8704, kv_cache_specs={"mla": mla, "indexer": indexer}
+    )
+    mamba = new_mamba_spec(
+        block_size=8704, mamba_cache_mode="align", num_speculative_blocks=0
+    )
+    tail = KpoolTailSpec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=4,
+    )
+    worker = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["mla", "indexer"], full_spec),
+            KVCacheGroupSpec(["kda"], mamba),
+            KVCacheGroupSpec(["tail"], tail),
+        ],
+    )
+
+    scheduler = generate_scheduler_kv_cache_config([worker])
+
+    # Planner geometry still uses its representative, while the connector
+    # retains the distinct byte layouts and compressed Indexer token span.
+    assert scheduler.kv_cache_groups[0].kv_cache_spec == mla
+    retained = scheduler.kv_cache_groups[0].kv_cache_spec_for_connector
+    assert isinstance(retained, UniformTypeKVCacheSpecs)
+    assert retained.kv_cache_specs == {"mla": mla, "indexer": indexer}
+    assert retained is not full_spec
+    for group, expected in zip(scheduler.kv_cache_groups[1:], (mamba, tail)):
+        assert group.kv_cache_spec == expected
+        assert group.kv_cache_spec_for_connector is None
+    assert worker.kv_cache_groups[0].kv_cache_spec is full_spec
+    assert all(g.kv_cache_spec_for_connector is None for g in worker.kv_cache_groups)
+
+
 def _glm5_like_kv_cache_spec(
     mamba_spec_factory=new_mamba_spec,
 ) -> tuple[dict[str, KVCacheSpec], list[str]]:

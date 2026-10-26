@@ -6,7 +6,7 @@ from __future__ import annotations
 import copy
 from collections import Counter
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from fractions import Fraction
 from functools import cached_property
@@ -1238,6 +1238,10 @@ class KVCacheGroupSpec:
     is_eagle_group: bool = False
     # Whether this group is part of the externally transferable KV state.
     enable_kv_transfer: bool = True
+    # Preserve per-layer transfer layouts when the scheduler uses one spec.
+    kv_cache_spec_for_connector: KVCacheSpec | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclass
