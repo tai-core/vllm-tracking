@@ -469,3 +469,109 @@ def test_musa_prefill_backend_rejects_unsupported(dim, dtype, bound):
     assert kda._resolve_kda_prefill_backend("auto", dim, dtype, bound) == "triton"
     with pytest.raises(RuntimeError, match="FlashKDA requires"):
         kda._resolve_kda_prefill_backend("flashkda", dim, dtype, bound)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_recoverssm_preserves_checkpoint_and_commits_only_accepted_prefix(state_dtype):
+    """Compare verify and recovery with an independent recurrence over many rounds."""
+    from types import SimpleNamespace
+
+    from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+        KDARecoverSSMCommitContext,
+        kda_recoverssm_verify,
+    )
+
+    torch.manual_seed(23)
+    device = torch.device(current_platform.device_type)
+    n, length = 3, 4
+    slots = torch.tensor([3, 1, 2], device=device, dtype=torch.int32)
+    offsets = torch.arange(0, n * length + 1, length, device=device, dtype=torch.int32)
+    state = torch.randn(n + 1, H, D, D, device=device, dtype=state_dtype) * 0.1
+    conv = torch.randn(
+        n + 1, 3 * H * D, 3 + length - 1, device=device, dtype=torch.bfloat16
+    )
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+
+    if not is_conv_state_dim_first():
+        conv = conv.transpose(-1, -2).contiguous()
+    correction = torch.empty(n + 1, H, length, D, device=device)
+    kg = torch.empty(n + 1, H, length, 2 * D, device=device, dtype=torch.float32)
+    a_log = torch.randn(1, 1, H, 1, device=device) * 0.5
+    bias = torch.randn(H * D, device=device) * 0.1
+    # Commit needs cached factors, not access to the model's gate parameters.
+    layer = SimpleNamespace(kv_cache=(conv, state, correction, kg))
+    context = KDARecoverSSMCommitContext.create(
+        [layer], spec_query_len=length, max_num_reqs=n
+    )
+    mapping = torch.tensor([2, 0, 1], device=device, dtype=torch.int32)
+    for step in range(5):
+        inputs, _ = make_inputs(n, length, device)
+        before = state.clone()
+        out = kda_recoverssm_verify(
+            q=inputs["q"],
+            k=inputs["k"],
+            v=inputs["v"],
+            raw_g=inputs["g"],
+            raw_beta=inputs["beta"],
+            A_log=a_log.view(-1),
+            dt_bias=bias,
+            lower_bound=LOWER_BOUND,
+            checkpoint_state=state,
+            query_start_loc=offsets,
+            state_indices=slots,
+            spec_query_len=length,
+            correction_cache=correction,
+            kg_cache=kg,
+        )
+        torch.testing.assert_close(state, before, rtol=0, atol=0)
+        native_slots = torch.arange(
+            1, n * length + 1, device=device, dtype=torch.int32
+        ).view(n, length)
+        native_state = before.new_zeros(n * length + 1, H, D, D)
+        native_state[native_slots.long()] = before[slots.long(), None]
+        native_inputs = dict(
+            inputs,
+            ssm_state_indices=native_slots,
+            num_accepted_tokens=torch.ones(n, device=device, dtype=torch.int32),
+            a_log=a_log.view(-1),
+            g_bias=bias,
+        )
+        native_out = run_kernel(native_inputs, native_state)
+        torch.testing.assert_close(out, native_out, rtol=0, atol=0)
+        accepted = torch.tensor(
+            [step % (length + 1), 1, length], device=device, dtype=torch.int32
+        )
+        context.commit(accepted, slots, offsets, request_indices=mapping)
+        for seq, slot in enumerate(slots.cpu().tolist()):
+            s = before[slot].float()
+            expected = s.clone()
+            count = accepted[mapping[seq]].item()
+            native_expected = (
+                native_state[native_slots[seq, count - 1]] if count else before[slot]
+            )
+            torch.testing.assert_close(state[slot], native_expected, rtol=0, atol=0)
+            for t in range(length):
+                tok = slice(seq * length + t, seq * length + t + 1)
+                ref, s = naive_recurrent_kda(
+                    inputs["q"][0, tok],
+                    inputs["k"][0, tok],
+                    inputs["v"][0, tok],
+                    inputs["g"][0, tok],
+                    inputs["beta"][0, tok],
+                    a_log.view(-1),
+                    bias.view(H, D),
+                    s,
+                )
+                torch.testing.assert_close(
+                    out[0, tok].float(), ref, rtol=1e-2, atol=1e-3
+                )
+                if t + 1 == count:
+                    expected = s.clone()
+            torch.testing.assert_close(
+                state[slot].float(),
+                expected,
+                rtol=1e-2 if state_dtype == torch.bfloat16 else 1e-4,
+                atol=2e-3 if state_dtype == torch.bfloat16 else 1e-6,
+            )
+        torch.testing.assert_close(state[0], before[0], rtol=0, atol=0)

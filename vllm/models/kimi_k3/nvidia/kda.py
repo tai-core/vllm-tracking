@@ -556,9 +556,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             self.cache_config.mamba_ssm_cache_dtype,
         )
         if self.cache_config.use_kda_recoverssm:
-            return MambaStateDtypeCalculator.append_kda_recoverssm_record(
-                base_dtypes, self.model_config.dtype
-            )
+            return MambaStateDtypeCalculator.append_kda_recoverssm_record(base_dtypes)
         return base_dtypes
 
     def get_state_shape(

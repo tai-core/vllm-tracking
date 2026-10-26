@@ -150,12 +150,10 @@ class MambaStateDtypeCalculator:
 
     @classmethod
     def append_kda_recoverssm_record(
-        cls,
-        base_dtypes: tuple[torch.dtype, ...],
-        model_dtype: ModelDType | torch.dtype,
+        cls, base_dtypes: tuple[torch.dtype, ...]
     ) -> tuple[torch.dtype, ...]:
-        activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
-        return (*base_dtypes, torch.float32, activation_dtype)
+        """Store the actual fp32 factors used by the verify recurrence."""
+        return (*base_dtypes, torch.float32, torch.float32)
 
 
 class MambaStateShapeCalculator:

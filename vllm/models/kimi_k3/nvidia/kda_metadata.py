@@ -533,7 +533,9 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                 )
                 # Stable partitioning preserves request-local token order in
                 # both subgroup tensors.
-                index = torch.argsort(spec_token_masks, stable=True)
+                # MUSA/MUDNN does not support stable argsort on bool tensors.
+                # Integer 0/1 keys preserve the same stable partition.
+                index = torch.argsort(spec_token_masks.to(torch.int32), stable=True)
                 num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
                 non_spec_token_indx = index[:num_non_spec_tokens]
                 spec_token_indx = index[num_non_spec_tokens:]

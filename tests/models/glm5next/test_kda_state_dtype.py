@@ -19,15 +19,20 @@ from vllm.models.glm5next.common.model import (
     ("ssm_dtype", "expected"),
     [("auto", torch.float32), ("float32", torch.float32), ("bfloat16", torch.bfloat16)],
 )
-def test_kda_recurrent_state_dtype_follows_ssm_cache_dtype(ssm_dtype, expected):
+@pytest.mark.parametrize("recover", [False, True])
+def test_kda_recurrent_state_dtype_follows_ssm_cache_dtype(
+    ssm_dtype, expected, recover
+):
     model_config = SimpleNamespace(dtype=torch.bfloat16)
     cache_config = SimpleNamespace(
         mamba_cache_dtype="auto",
         mamba_ssm_cache_dtype=ssm_dtype,
-        use_kda_recoverssm=False,
+        use_kda_recoverssm=recover,
     )
     vllm_config = SimpleNamespace(model_config=model_config, cache_config=cache_config)
     want = (torch.bfloat16, expected)
+    if recover:
+        want += (torch.float32, torch.float32)
 
     assert Glm5NextForCausalLM.get_mamba_state_dtype_from_config(vllm_config) == want
     assert (
@@ -42,7 +47,8 @@ def test_kda_recurrent_state_dtype_follows_ssm_cache_dtype(ssm_dtype, expected):
 
 
 @pytest.mark.parametrize("tp,pcp", [(1, 8), (8, 1)])
-def test_kda_config_and_layer_agree_on_head_sharded_state(tp, pcp):
+@pytest.mark.parametrize("recover", [False, True])
+def test_kda_config_and_layer_agree_on_head_sharded_state(tp, pcp, recover):
     from vllm.config.kda_parallel import kda_tensor_parallel_size
 
     config = SimpleNamespace(
@@ -59,13 +65,17 @@ def test_kda_config_and_layer_agree_on_head_sharded_state(tp, pcp):
                 linear_conv_kernel_dim=4,
             )
         ),
-        speculative_config=None,
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        cache_config=SimpleNamespace(use_kda_recoverssm=recover),
     )
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     layer.tp_size = kda_tensor_parallel_size(config)
-    layer.num_heads, layer.head_dim, layer.conv_size, layer.num_spec = 64, 128, 4, 0
+    layer.num_heads, layer.head_dim, layer.conv_size, layer.num_spec = 64, 128, 4, 3
+    layer.cache_config = config.cache_config
     expected = layer.get_state_shape()
     assert expected[1] == (8, 128, 128)
+    if recover:
+        assert expected[2:] == ((8, 4, 128), (8, 4, 256))
     assert Glm5NextForCausalLM.get_mamba_state_shape_from_config(config) == expected
     assert (
         Glm5NextForConditionalGeneration.get_mamba_state_shape_from_config(config)

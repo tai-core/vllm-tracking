@@ -138,7 +138,7 @@ def test_kda_recoverssm_config_state_layout():
         torch.bfloat16,
         torch.float32,
         torch.float32,
-        torch.bfloat16,
+        torch.float32,
     )
     assert KimiLinearForCausalLM.get_mamba_state_shape_from_config(vllm_config)[2:] == (
         (4, 3, 32),
@@ -812,7 +812,7 @@ def test_kda_recoverssm_verify_and_group_commit(
             num_heads,
             query_len,
             2 * dim,
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
             device=DEVICE,
         )
         layer = SimpleNamespace(

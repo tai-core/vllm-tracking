@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi-K3 RecoverSSM speculative verify and accepted-state recovery."""
+"""KDA verification records and accepted-state recovery."""
 
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -23,7 +23,7 @@ def _kda_gate(
 ):
     gate_input = raw_g + dt_bias
     if USE_LOWER_BOUND:
-        return lower_bound * tl.sigmoid(A * gate_input)
+        return lower_bound / (1.0 + tl.exp(-(A * gate_input)))
     softplus_gate = tl.where(
         gate_input > 20.0,
         gate_input,
@@ -44,7 +44,7 @@ def _kda_recurrent_step(
     lower_bound,
     USE_LOWER_BOUND: tl.constexpr,
 ):
-    normalized_k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
+    normalized_k = k / tl.sqrt(tl.sum(k * k) + 1e-6)
     gate = _kda_gate(
         raw_g,
         dt_bias,
@@ -53,10 +53,16 @@ def _kda_recurrent_step(
         USE_LOWER_BOUND,
     )
 
-    state *= tl.exp(gate)[None, :]
+    decay = tl.exp(gate)
+    state *= decay[None, :]
     correction = v - tl.sum(state * normalized_k[None, :], axis=1)
     correction *= tl.sigmoid(raw_beta)
-    return state + correction[:, None] * normalized_k[None, :], correction
+    return (
+        state + correction[:, None] * normalized_k[None, :],
+        correction,
+        normalized_k,
+        decay,
+    )
 
 
 @triton.jit
@@ -140,40 +146,46 @@ def _kda_recoverssm_verify_kernel(
     state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
     A = tl.exp(tl.load(A_log_ptr + pid_h).to(tl.float32))
 
-    for token_offset in tl.static_range(SPEC_QUERY_LEN):
+    p_q = q_ptr + bos * stride_q_token + pid_h * K + offs_k
+    p_k = k_ptr + bos * stride_k_token + pid_h * K + offs_k
+    p_v = v_ptr + bos * stride_v_token + pid_h * V + offs_v
+    p_g = raw_g_ptr + bos * stride_g_token + pid_h * K + offs_k
+    p_beta = raw_beta_ptr + bos * stride_beta_token + pid_h
+    for token_offset in range(query_len):
         token_valid = token_offset < query_len
         token = bos + token_offset
         q = tl.load(
-            q_ptr + token * stride_q_token + pid_h * K + offs_k,
+            p_q,
             mask=token_valid & mask_k,
             other=0.0,
         ).to(tl.float32)
         k = tl.load(
-            k_ptr + token * stride_k_token + pid_h * K + offs_k,
+            p_k,
             mask=token_valid & mask_k,
             other=0.0,
         ).to(tl.float32)
         v = tl.load(
-            v_ptr + token * stride_v_token + pid_h * V + offs_v,
+            p_v,
             mask=token_valid & mask_v,
             other=0.0,
         ).to(tl.float32)
         raw_g = tl.load(
-            raw_g_ptr + token * stride_g_token + pid_h * K + offs_k,
+            p_g,
             mask=token_valid & mask_k,
             other=0.0,
         ).to(tl.float32)
         raw_beta = tl.load(
-            raw_beta_ptr + token * stride_beta_token + pid_h,
+            p_beta,
             mask=token_valid,
             other=0.0,
         ).to(tl.float32)
 
-        q *= tl.rsqrt(tl.sum(q * q) + 1e-6) * (K**-0.5)
+        q = q / tl.sqrt(tl.sum(q * q) + 1e-6)
+        q = q * (K**-0.5)
         dt_bias = tl.load(dt_bias_ptr + pid_h * K + offs_k, mask=mask_k, other=0.0).to(
             tl.float32
         )
-        updated_state, correction = _kda_recurrent_step(
+        updated_state, correction, normalized_k, decay = _kda_recurrent_step(
             state,
             k,
             v,
@@ -184,7 +196,7 @@ def _kda_recoverssm_verify_kernel(
             lower_bound,
             USE_LOWER_BOUND,
         )
-        state = tl.where(token_valid, updated_state, state)
+        state = updated_state
 
         out = tl.sum(state * q[None, :], axis=1)
         tl.store(
@@ -213,14 +225,20 @@ def _kda_recoverssm_verify_kernel(
             )
             tl.store(
                 kg_ptr + offs_k * stride_kg_dim,
-                k,
+                normalized_k,
                 mask=token_valid & mask_k,
             )
             tl.store(
                 kg_ptr + (K + offs_k) * stride_kg_dim,
-                raw_g,
+                decay,
                 mask=token_valid & mask_k,
             )
+
+        p_q += stride_q_token
+        p_k += stride_k_token
+        p_v += stride_v_token
+        p_g += stride_g_token
+        p_beta += stride_beta_token
 
 
 @triton.heuristics(
@@ -407,14 +425,11 @@ def _commit_kda_state_kernel(
     kg_cache_ref_ptr,
     kg_cache_base_addrs_ptr,
     kg_cache_block_strides_ptr,
-    A_log_ptr,
-    dt_bias_ptr,
     state_indices_ptr,
     commit_lens_ptr,
     final_state_indices_ptr,
     boundary_state_indices_ptr,
     boundary_recovery_lens_ptr,
-    lower_bound,
     null_block_id,
     stride_state_head,
     stride_state_v,
@@ -425,18 +440,12 @@ def _commit_kda_state_kernel(
     stride_kg_cache_head,
     stride_kg_cache_pos,
     stride_kg_cache_dim,
-    stride_A_layer,
-    stride_A_head,
-    stride_dt_bias_layer,
-    stride_dt_bias_head,
-    stride_dt_bias_dim,
     stride_state_indices,
     K: tl.constexpr,
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
     NUM_HEADS: tl.constexpr,
-    USE_LOWER_BOUND: tl.constexpr,
     ALIGN_MODE: tl.constexpr,
 ):
     pid_v = tl.program_id(0)
@@ -496,32 +505,14 @@ def _commit_kda_state_kernel(
         + offs_k[None, :] * stride_state_k
     )
     initial_state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
-    A = tl.exp(
-        tl.load(A_log_ptr + pid_l * stride_A_layer + pid_h * stride_A_head).to(
-            tl.float32
-        )
-    )
-
-    dt_bias = tl.load(
-        dt_bias_ptr
-        + pid_l * stride_dt_bias_layer
-        + pid_h * stride_dt_bias_head
-        + offs_k * stride_dt_bias_dim,
-        mask=mask_k,
-        other=0.0,
-    ).to(tl.float32)
-    final_decay = tl.full([BK], 1.0, tl.float32)
-    final_correction = tl.zeros([BV, BK], tl.float32)
-    boundary_decay = tl.full([BK], 1.0, tl.float32)
-    boundary_correction = tl.zeros([BV, BK], tl.float32)
-
-    for reverse_offset in range(commit_len):
-        token_offset = commit_len - reverse_offset - 1
+    state = initial_state
+    boundary_state = initial_state
+    for token_offset in range(commit_len):
         correction_ptr = (
             correction_cache_ptr + token_offset * stride_correction_cache_pos
         )
         kg_ptr = kg_cache_ptr + token_offset * stride_kg_cache_pos
-        k = tl.load(
+        normalized_k = tl.load(
             kg_ptr + offs_k * stride_kg_cache_dim,
             mask=mask_k,
             other=0.0,
@@ -531,33 +522,19 @@ def _commit_kda_state_kernel(
             mask=mask_v,
             other=0.0,
         ).to(tl.float32)
-        raw_g = tl.load(
+        decay = tl.load(
             kg_ptr + (K + offs_k) * stride_kg_cache_dim,
             mask=mask_k,
             other=0.0,
         ).to(tl.float32)
-        normalized_k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
-        gate = _kda_gate(
-            raw_g,
-            dt_bias,
-            A,
-            lower_bound,
-            USE_LOWER_BOUND,
-        )
-        update = correction[:, None] * normalized_k[None, :]
-        decay = tl.exp(gate)
-        final_correction += update * final_decay[None, :]
-        final_decay *= decay
+        # Preserve the verify operation order using its exact fp32 factors.
+        state *= decay[None, :]
+        state += correction[:, None] * normalized_k[None, :]
         if ALIGN_MODE:
-            before_boundary = token_offset < boundary_recovery_len
-            boundary_correction += tl.where(
-                before_boundary,
-                update * boundary_decay[None, :],
-                0.0,
+            boundary_state = tl.where(
+                token_offset + 1 == boundary_recovery_len, state, boundary_state
             )
-            boundary_decay *= tl.where(before_boundary, decay, 1.0)
 
-    state = initial_state * final_decay[None, :] + final_correction
     if ALIGN_MODE:
         boundary_ptrs = (
             state_ptr
@@ -566,7 +543,6 @@ def _commit_kda_state_kernel(
             + offs_v[:, None] * stride_state_v
             + offs_k[None, :] * stride_state_k
         )
-        boundary_state = initial_state * boundary_decay[None, :] + boundary_correction
         tl.store(
             boundary_ptrs,
             boundary_state,
@@ -600,7 +576,9 @@ def kda_recoverssm_verify(
     spec_query_len: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Verify a KDA speculative window without modifying its checkpoint."""
+    """Verify without modifying the checkpoint; record fp32 corrections,
+    normalized keys, and multiplicative decay factors.
+    """
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("KDA RecoverSSM q must have shape [1, tokens, heads, dim]")
     _, total_tokens, num_heads, key_dim = q.shape
@@ -637,8 +615,8 @@ def kda_recoverssm_verify(
         )
     if correction_cache.dtype != torch.float32:
         raise ValueError("KDA RecoverSSM correction buffer must use float32")
-    if kg_cache.dtype != k.dtype:
-        raise ValueError("KDA RecoverSSM key/gate buffer must match activation dtype")
+    if kg_cache.dtype != torch.float32:
+        raise ValueError("KDA RecoverSSM key/gate buffer has incompatible dtype")
     if A_log.shape != (num_heads,) or dt_bias.numel() != num_heads * key_dim:
         raise ValueError("KDA RecoverSSM gate parameters are incompatible")
     if not A_log.is_contiguous() or not dt_bias.is_contiguous():
@@ -679,7 +657,7 @@ def kda_recoverssm_verify(
         return out
 
     block_k = triton.next_power_of_2(key_dim)
-    block_v = min(triton.next_power_of_2(value_dim), 32)
+    block_v = min(triton.next_power_of_2(value_dim), 8)
     grid = (triton.cdiv(value_dim, block_v), batch, num_heads)
     _kda_recoverssm_verify_kernel[grid](
         q,
@@ -723,8 +701,8 @@ def kda_recoverssm_verify(
         BV=block_v,
         SPEC_QUERY_LEN=spec_query_len,
         USE_LOWER_BOUND=lower_bound is not None,
-        num_warps=4,
-        num_stages=2,
+        num_warps=1,
+        num_stages=3,
     )
     return out
 
@@ -750,9 +728,6 @@ class KDARecoverSSMCommitContext:
     final_state_indices: torch.Tensor
     boundary_state_indices: torch.Tensor
     boundary_recovery_lens: torch.Tensor
-    A_log: torch.Tensor
-    dt_bias: torch.Tensor
-    lower_bound: float | None
     spec_query_len: int
 
     @classmethod
@@ -777,15 +752,6 @@ class KDARecoverSSMCommitContext:
         checkpoints = [layer.kv_cache[1] for layer in layers]
         correction_caches = [layer.kv_cache[2] for layer in layers]
         kg_caches = [layer.kv_cache[3] for layer in layers]
-        A_log = [layer.A_log for layer in layers]
-        dt_bias = [
-            layer.dt_bias.view(layer.local_num_heads, layer.head_dim)
-            for layer in layers
-        ]
-        lower_bounds = {layer.gate_lower_bound for layer in layers}
-        if len(lower_bounds) != 1:
-            raise ValueError("KDA RecoverSSM layers need matching gate bounds")
-
         state_ref = checkpoints[0]
         if state_ref.ndim != 4:
             raise ValueError("KDA RecoverSSM checkpoint must be four-dimensional")
@@ -823,18 +789,13 @@ class KDARecoverSSMCommitContext:
         for kg_cache in kg_caches:
             if (
                 kg_cache.shape != expected_kg_shape
-                or kg_cache.dtype != kg_ref.dtype
+                or kg_cache.dtype != torch.float32
                 or kg_cache.device != state_ref.device
                 or kg_cache.stride()[1:] != kg_ref.stride()[1:]
             ):
                 raise ValueError(
                     f"KDA RecoverSSM key/gate buffers need shape {expected_kg_shape}"
                 )
-        if any(param.shape != (num_heads,) for param in A_log):
-            raise ValueError("KDA RecoverSSM A_log shape is incompatible")
-        if any(param.shape != (num_heads, key_dim) for param in dt_bias):
-            raise ValueError("KDA RecoverSSM dt_bias shape is incompatible")
-
         conv_ref = conv_states[0]
         if conv_ref.ndim != 3:
             raise ValueError("KDA RecoverSSM conv state must be three-dimensional")
@@ -901,9 +862,6 @@ class KDARecoverSSMCommitContext:
             boundary_recovery_lens=torch.empty(
                 max_num_reqs, dtype=torch.int32, device=device
             ),
-            A_log=torch.stack(tuple(A_log)).contiguous(),
-            dt_bias=torch.stack(tuple(dt_bias)).contiguous(),
-            lower_bound=lower_bounds.pop(),
             spec_query_len=spec_query_len,
         )
 
@@ -1029,14 +987,11 @@ class KDARecoverSSMCommitContext:
             self.kg_caches[0],
             self.kg_cache_base_addrs,
             self.kg_cache_block_strides,
-            self.A_log,
-            self.dt_bias,
             state_indices,
             self.commit_lens,
             self.final_state_indices,
             self.boundary_state_indices,
             self.boundary_recovery_lens,
-            self.lower_bound or 0.0,
             NULL_BLOCK_ID,
             state_ref.stride(1),
             state_ref.stride(2),
@@ -1047,18 +1002,12 @@ class KDARecoverSSMCommitContext:
             self.kg_caches[0].stride(1),
             self.kg_caches[0].stride(2),
             self.kg_caches[0].stride(3),
-            self.A_log.stride(0),
-            self.A_log.stride(1),
-            self.dt_bias.stride(0),
-            self.dt_bias.stride(1),
-            self.dt_bias.stride(2),
             state_indices.stride(0),
             K=key_dim,
             V=value_dim,
             BK=block_k,
             BV=block_v,
             NUM_HEADS=num_heads,
-            USE_LOWER_BOUND=self.lower_bound is not None,
             ALIGN_MODE=block_table is not None,
             num_warps=4,
             num_stages=2,

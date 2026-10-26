@@ -75,6 +75,7 @@ from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
     SupportsEagle3,
     SupportsPP,
+    SupportsReplaySSM,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -406,6 +407,7 @@ class Glm5NextDecoderLayer(nn.Module):
         self._kda_pcp_collectives = None
         if self.layer_kind == "kda" and getattr(self.self_attn, "tp_over_pcp", False):
             from .parallel import get_kda_pcp_collectives
+
             self._kda_pcp_collectives = get_kda_pcp_collectives(
                 vllm_config, self.hidden_size
             )
@@ -1077,7 +1079,13 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
 
 
 class Glm5NextForCausalLM(
-    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid, SupportsEagle3
+    nn.Module,
+    HasInnerState,
+    SupportsPP,
+    MixtureOfExperts,
+    IsHybrid,
+    SupportsEagle3,
+    SupportsReplaySSM,
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1122,17 +1130,21 @@ class Glm5NextForCausalLM(
     def get_mamba_state_dtype_from_config(
         cls,
         vllm_config: "VllmConfig",
-    ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.kda_state_dtype(
+    ) -> tuple[torch.dtype, ...]:
+        base_dtypes = MambaStateDtypeCalculator.kda_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
 
+        if vllm_config.cache_config.use_kda_recoverssm:
+            return MambaStateDtypeCalculator.append_kda_recoverssm_record(base_dtypes)
+        return base_dtypes
+
     @classmethod
     def get_mamba_state_shape_from_config(
         cls, vllm_config: "VllmConfig"
-    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+    ) -> tuple[tuple[int, ...], ...]:
         hf_config = vllm_config.model_config.hf_text_config
         tp_size = kda_tensor_parallel_size(vllm_config)
         num_spec = (
@@ -1140,13 +1152,23 @@ class Glm5NextForCausalLM(
             if vllm_config.speculative_config
             else 0
         )
-        return MambaStateShapeCalculator.kda_state_shape(
+        base_shapes = MambaStateShapeCalculator.kda_state_shape(
             tp_size,
             hf_config.linear_num_heads,
             hf_config.linear_head_dim,
             conv_kernel_size=hf_config.linear_conv_kernel_dim,
             num_spec=num_spec,
         )
+
+        if vllm_config.cache_config.use_kda_recoverssm:
+            return MambaStateShapeCalculator.append_kda_recoverssm_record(
+                base_shapes,
+                hf_config.linear_num_heads,
+                hf_config.linear_head_dim,
+                tp_size,
+                1 + num_spec,
+            )
+        return base_shapes
 
     @classmethod
     def get_mamba_state_copy_func(
@@ -1175,6 +1197,7 @@ class Glm5NextForCausalLM(
 )
 class Glm5NextForConditionalGeneration(
     Glm4vForConditionalGeneration,
+    SupportsReplaySSM,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
