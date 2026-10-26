@@ -83,6 +83,43 @@ def test_startup_plan_apply_gate(plan_env):
 
 # Memory accounting of the profiling run (Worker.determine_available_memory).
 
+
+def test_manual_kv_budget_releases_profile_cache_before_reserving_kv(monkeypatch):
+    """The explicit budget still profiles, then frees inactive allocator memory."""
+    calls = []
+    kv_bytes = 2 * GiB_bytes
+    worker = _plan_worker(kv_bytes=kv_bytes)
+    worker.model_runner = SimpleNamespace(profile_run=lambda: calls.append("profile"))
+    worker.model_config = SimpleNamespace(multimodal_config=None)
+    worker.parallel_config._api_process_count = 2
+    monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", lambda worker: None)
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator, "empty_cache", lambda: calls.append("release")
+    )
+    reservations = iter((6 * GiB_bytes, 3 * GiB_bytes))
+
+    def reserved():
+        calls.append("reserved")
+        return next(reservations)
+
+    monkeypatch.setattr(gpu_worker.torch.accelerator, "memory_reserved", reserved)
+
+    def reserve(requested_bytes, multimodal_config, api_process_count):
+        calls.append("reserve")
+        assert (requested_bytes, multimodal_config, api_process_count) == (
+            kv_bytes,
+            None,
+            2,
+        )
+        return requested_bytes
+
+    monkeypatch.setattr(gpu_worker, "reserve_mm_ipc_gpu_memory", reserve)
+
+    assert gpu_worker.Worker.determine_available_memory(worker) == kv_bytes
+    assert calls == ["profile", "reserved", "release", "reserved", "reserve"]
+    assert worker.cache_config.kv_cache_memory_bytes == kv_bytes
+
+
 # The fallback reads only the sign of the measured drop and this process's torch
 # reservation; free memory is only logged, so no amount here is a device size.
 ANY_FREE_MEMORY = 8 * GiB_bytes

@@ -528,6 +528,18 @@ class Worker(WorkerBase):
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+            # Match memory_profiling's cleanup before KV allocation/export so
+            # cached profile temporaries do not starve external NCCL buffers.
+            reserved_before = torch.accelerator.memory_reserved()
+            torch.accelerator.empty_cache()
+            reserved_after = torch.accelerator.memory_reserved()
+            logger.info(
+                "Released %s GiB of cached profile memory before KV allocation "
+                "(%s -> %s GiB reserved).",
+                format_gib(reserved_before - reserved_after),
+                format_gib(reserved_before),
+                format_gib(reserved_after),
+            )
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
