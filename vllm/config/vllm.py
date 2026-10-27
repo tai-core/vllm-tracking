@@ -730,7 +730,11 @@ class VllmConfig:
 
         model_config = self.model_config
         is_musa = getattr(current_platform, "is_musa", None)
-        if model_config is not None and callable(is_musa) and is_musa():
+        on_musa = callable(is_musa) and is_musa()
+        # MUSA: a config that needs a V2-only feature (DSpark, PCP, ...) keeps
+        # the V2 default instead of failing V1 validation.
+        needs_v2 = on_musa and bool(self._get_v1_model_runner_unsupported_features())
+        if model_config is not None and on_musa and not needs_v2:
             architectures = getattr(model_config, "architectures", ())
             if any(arch in MUSA_DEFAULT_MRV1_ARCHITECTURES for arch in architectures):
                 logger.warning_once(
