@@ -246,6 +246,10 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        # Aborted requests may still own both inbound and outbound transfers.
+        # Neither completion alone permits returning their KV pages.
+        self.pending_kv_recv_frees: set[str] = set()
+        self.pending_kv_send_frees: set[str] = set()
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -2719,6 +2723,8 @@ class Scheduler(SchedulerInterface):
                 delay_free_blocks = (
                     request.request_id not in self.finished_recving_kv_req_ids
                 )
+                if delay_free_blocks:
+                    self.pending_kv_recv_frees.add(request.request_id)
                 self.finished_recving_kv_req_ids.discard(request.request_id)
                 self.failed_recving_kv_req_ids.discard(request.request_id)
 
@@ -2737,6 +2743,8 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         self._set_kv_fetch_stage(request, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        if connector_delay_free_blocks:
+            self.pending_kv_send_frees.add(request.request_id)
 
         # EC Connector: mirror the KV hook. The contract requires firing
         # before the encoder cache is freed so the connector can inspect
@@ -2762,6 +2770,8 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self._free_request_blocks(request)
+        self.pending_kv_recv_frees.discard(request.request_id)
+        self.pending_kv_send_frees.discard(request.request_id)
         del self.requests[request.request_id]
 
     @property
@@ -3244,11 +3254,15 @@ class Scheduler(SchedulerInterface):
                 self._set_kv_fetch_stage(req, KV_FETCH_COMPLETED_WAITING)
             else:
                 assert RequestStatus.is_finished(req.status)
-                self._free_blocks(self.requests[req_id])
+                self.pending_kv_recv_frees.discard(req_id)
+                if req_id not in self.pending_kv_send_frees:
+                    self._free_blocks(req)
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests
-            self._free_blocks(self.requests[req_id])
+            self.pending_kv_send_frees.discard(req_id)
+            if req_id not in self.pending_kv_recv_frees:
+                self._free_blocks(self.requests[req_id])
 
     def _update_requests_with_invalid_blocks(
         self,

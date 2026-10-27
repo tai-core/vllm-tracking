@@ -2278,6 +2278,13 @@ class DPEngineCoreProc(EngineCoreProc):
                     (-1, EngineCoreOutputs(start_wave=self.current_wave))
                 )
 
+        # The coordinator wakes the other ranks but excludes the ADD recipient.
+        # Keep this rank in the wave even if ADD is immediately followed by an
+        # abort before its first step; otherwise its peers wait in a dummy
+        # collective while this rank blocks on the input queue.
+        if self.has_coordinator and self.scheduler.pause_state == PauseState.UNPAUSED:
+            self.engines_running = True
+
     def resume_scheduler(self):
         if self.pending_pause or (self.engines_running and self.ignore_start_dp_wave):
             raise RuntimeError(
