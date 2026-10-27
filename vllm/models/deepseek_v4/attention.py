@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 
 from vllm.config import (
     CacheConfig,
+    CUDAGraphMode,
     VllmConfig,
     get_current_vllm_config,
 )
@@ -67,6 +68,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     get_kv_quant_mode,
 )
+from vllm_musa.optimization_contract import deepseek_v4_prefill_score_deepgemm_enabled
 
 logger = init_logger(__name__)
 
@@ -87,6 +89,115 @@ def _fill_short_context_topk_indices(
         output + row * TOP_K + offsets,
         tl.where(offsets < num_compressed, offsets, -1),
         mask=offsets < TOP_K,
+    )
+
+
+# MUSA: the DeepSeek-V4 attention helpers below branch on the active platform.
+
+
+# MUSA: overlapping prefill or mixed steps on the aux streams can stall the
+# compute queue until the GPU run timeout fires, so overlap only in FULL decode
+# graphs. The V2 model runner captures them under CUDAGraphMode.NONE.
+def _musa_deepseek_v4_aux_overlap() -> bool:
+    mode = get_forward_context().cudagraph_runtime_mode
+    return mode == CUDAGraphMode.FULL or (
+        mode == CUDAGraphMode.NONE and torch.cuda.is_current_stream_capturing()
+    )
+
+
+def _musa_deepseek_v4_use_score_fp32_deepgemm(
+    a: torch.Tensor,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> bool:
+    is_musa = (
+        current_platform.is_musa()
+        or getattr(torch.version, "musa", None) is not None
+        or getattr(a.device, "type", None) == "musa"
+        or getattr(weight.device, "type", None) == "musa"
+    )
+    return (
+        is_musa
+        and a.ndim == 2
+        and weight.ndim == 2
+        and a.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and out_dtype == torch.float32
+        and (
+            a.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+            # Above the multi-stream threshold the input projections run
+            # serially; score GEMMs there use DeepGEMM, not a SIMT fp32 sgemm.
+            or (
+                deepseek_v4_prefill_score_deepgemm_enabled()
+                and a.shape[0] > envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+            )
+        )
+    )
+
+
+def _musa_deepseek_v4_linear_out_dtype(
+    a: torch.Tensor,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    if _musa_deepseek_v4_use_score_fp32_deepgemm(a, weight, out_dtype):
+        try:
+            import deep_gemm
+        except ImportError:
+            from mate import deep_gemm
+
+        output = torch.empty(
+            (a.shape[0], weight.shape[0]),
+            dtype=out_dtype,
+            device=a.device,
+        )
+        deep_gemm.bf16_gemm_nt(a, weight, output)
+        return output
+    if (
+        current_platform.is_musa()
+        or getattr(torch.version, "musa", None) is not None
+        or a.device.type == "musa"
+        or weight.device.type == "musa"
+    ):
+        return F.linear(a.to(out_dtype), weight.to(out_dtype))
+    return torch.mm(a, weight.T, out_dtype=out_dtype)
+
+
+def _musa_deepseek_v4_is_musa_tensor(tensor: torch.Tensor) -> bool:
+    return (
+        current_platform.is_musa()
+        or getattr(torch.version, "musa", None) is not None
+        or getattr(tensor.device, "type", None) == "musa"
+    )
+
+
+def _musa_deepseek_v4_qnorm_rope_kv_insert(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    padded_heads: int,
+    eps: float,
+    block_size: int,
+) -> torch.Tensor:
+    from vllm_musa import _custom_ops as _musa_custom_ops
+
+    active_slot_mapping = slot_mapping
+    if slot_mapping.shape[0] > q.shape[0]:
+        active_slot_mapping = slot_mapping[: q.shape[0]].contiguous()
+
+    return _musa_custom_ops.deepseek_v4_qnorm_rope_kv_insert(
+        q,
+        kv,
+        kv_cache,
+        active_slot_mapping,
+        positions.contiguous(),
+        cos_sin_cache,
+        eps,
+        block_size,
+        padded_heads,
     )
 
 
@@ -544,7 +655,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         qr_scale: torch.Tensor | None,
         kv_score: torch.Tensor,
         indexer_kv_score: torch.Tensor,
-        indexer_weights: torch.Tensor,
+        indexer_weights: torch.Tensor | None,
         positions: torch.Tensor,
         o_padded: "torch.Tensor | QuantizedActivation",
     ) -> None:
@@ -573,7 +684,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         qr_scale: torch.Tensor | None,
         kv_score: torch.Tensor,
         indexer_kv_score: torch.Tensor,
-        indexer_weights: torch.Tensor,
+        indexer_weights: torch.Tensor | None,
         positions: torch.Tensor,
         o_padded: "torch.Tensor | QuantizedActivation",
     ) -> None:
@@ -584,7 +695,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         attn_metadata = get_forward_context().attn_metadata
         indexer = self.indexer
         compressor = self.compressor
-        aux_streams = self.aux_stream_list
+        aux_streams = self.aux_stream_list if _musa_deepseek_v4_aux_overlap() else None
 
         def project_query_and_cache_kv() -> torch.Tensor:
             q = self._wq_b_proj(qr, qr_scale).view(
@@ -601,6 +712,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # indexer.
         if indexer is not None:
             assert compressor is not None
+            assert indexer_kv_score is not None
+            assert indexer_weights is not None
             q, (indexer_inputs, _) = execute_in_parallel(
                 project_query_and_cache_kv,
                 [
@@ -617,8 +730,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 ],
                 self.ln_events[0],
                 [self.ln_events[1], self.ln_events[2]],
-                [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
+                [aux_streams[0], aux_streams[1]]
+                if aux_streams is not None
+                else None,
                 enable=aux_streams is not None,
+                use_stream_waits=current_platform.is_musa(),
             )
             index_q, index_q_scale, index_weights_out = indexer_inputs
         elif compressor is not None:
@@ -629,6 +745,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.ln_events[0],
                 self.ln_events[1],
                 aux_stream,
+                use_stream_waits=current_platform.is_musa(),
             )
         else:
             q = project_query_and_cache_kv()
@@ -692,10 +809,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
-                return torch.mm(
+                return _musa_deepseek_v4_linear_out_dtype(
                     hidden_states,
-                    compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
+                    compressor.fused_wkv_wgate.weight,
+                    torch.float32,
                 )
 
             aux_fns[0] = compressor_kv_score
@@ -709,10 +826,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
-                return torch.mm(
+                return _musa_deepseek_v4_linear_out_dtype(
                     hidden_states,
-                    indexer.compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
+                    indexer.compressor.fused_wkv_wgate.weight,
+                    torch.float32,
                 )
 
             aux_fns[1] = indexer_weights_proj
@@ -724,8 +841,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.ln_events[0],
             self.ln_events[1:4],
             aux_streams,
-            enable=hidden_states.shape[0]
-            <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+            enable=(
+                hidden_states.shape[0]
+                <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+                and _musa_deepseek_v4_aux_overlap()
+            ),
+            use_stream_waits=current_platform.is_musa(),
         )
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
@@ -788,6 +909,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         assert positions.dtype == torch.int64
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         cache_dtype = swa_kv_cache.dtype
+
+        if _musa_deepseek_v4_is_musa_tensor(q):
+            return _musa_deepseek_v4_qnorm_rope_kv_insert(
+                q,
+                kv,
+                swa_kv_cache,
+                swa_metadata.slot_mapping,
+                positions.to(torch.int64),
+                self.rotary_emb.cos_sin_cache,
+                self.padded_heads,
+                self.eps,
+                swa_metadata.block_size,
+            )
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
         if cache_dtype == torch.uint8:
@@ -1030,6 +1164,22 @@ class DeepseekV4Indexer(nn.Module):
             use_fp4_cache=self.use_fp4_kv,
         )
 
+        use_musa_native_indexer = False
+        use_musa_materialized_prefill = False
+        if current_platform.is_musa():
+            from vllm_musa.optimization_contract import (
+                OptimizationFeature,
+                resolve_optimization_contract,
+            )
+
+            optimization_contract = resolve_optimization_contract(vllm_config)
+            use_musa_native_indexer = optimization_contract.prefers(
+                OptimizationFeature.DEEPSEEK_V4_NATIVE_SPARSE_INDEXER
+            )
+            use_musa_materialized_prefill = optimization_contract.prefers(
+                OptimizationFeature.DEEPSEEK_V4_MATERIALIZED_PREFILL_INDEXER
+            )
+
         self.indexer_op = SparseAttnIndexer(
             self.k_cache,
             self.quant_block_size,
@@ -1042,6 +1192,8 @@ class DeepseekV4Indexer(nn.Module):
             skip_k_cache_insert=True,
             use_fp4_cache=self.use_fp4_kv,
             compress_ratio=self.compress_ratio,
+            use_musa_native_indexer=use_musa_native_indexer,
+            use_musa_materialized_prefill=use_musa_materialized_prefill,
         )
 
         # None on ROCm — maybe_execute_in_parallel falls back to sequential.
@@ -1122,12 +1274,14 @@ class DeepseekV4Indexer(nn.Module):
         if not skip_compressor:
             # compressor returns None and writes K to the indexer KV cache; the
             # join orders that write before indexer_op (skip_k_cache_insert=True).
+            aux_stream = self.aux_stream if _musa_deepseek_v4_aux_overlap() else None
             (q_quant, weights), _ = maybe_execute_in_parallel(
                 wq_b_and_q_quant,
                 lambda: compressor(compressed_kv_score, positions, rotary_emb),
                 self.ln_events[0],
                 self.ln_events[1],
-                self.aux_stream,
+                aux_stream,
+                use_stream_waits=current_platform.is_musa(),
             )
         else:
             q_quant, weights = wq_b_and_q_quant()
