@@ -3867,6 +3867,31 @@ def test_is_full_attention_spec_unwraps_uniform_type_specs():
     assert not is_full_attention_spec(wrap())
 
 
+@pytest.mark.parametrize(
+    "cache_dtype,explicit_bytes,expected",
+    [
+        ("fp8_ds_mla", None, 656),
+        ("fp8_ds_mla", 132, 132),
+        ("fp8_ds_mla", 584, 584),
+        ("fp8", None, 512),
+        (None, None, 512),
+    ],
+)
+def test_mla_packed_state_size_is_shared_by_config_and_runtime(
+    cache_dtype, explicit_bytes, expected
+):
+    spec = MLAAttentionSpec(
+        block_size=1024,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str=cache_dtype,
+        state_content_bytes=explicit_bytes,
+    )
+    assert spec.state_content_size_bytes == expected
+    assert spec.page_size_bytes == 1024 * expected
+
+
 def test_iter_layer_specs_returns_group_members():
     common = dict(num_kv_heads=1, head_size=1, dtype=torch.float32)
     full = FullAttentionSpec(block_size=4, **common)

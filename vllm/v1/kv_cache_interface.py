@@ -559,6 +559,10 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.cache_dtype_str == "fp8_ds_mla" and self.state_content_bytes is None:
+            # DS storage: 512 FP8 latent bytes, four FP32 scales, 64 BF16 RoPE.
+            # Config-time page sizing and runtime views must use this same row.
+            object.__setattr__(self, "state_content_bytes", 512 + 4 * 4 + 64 * 2)
         _apply_alignment_padding(self)
 
     @classmethod

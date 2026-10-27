@@ -132,6 +132,40 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
     num_heads: int
     conv_size: int
 
+    @classmethod
+    def get_state_shape_from_config(
+        cls, vllm_config: "VllmConfig", *, head_shards: int = 1
+    ) -> tuple[tuple[int, ...], ...]:
+        """Size cache state before layer construction with its head ownership."""
+        config = vllm_config.model_config.hf_config
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        recover = vllm_config.cache_config.use_kda_recoverssm
+        if head_shards < 1 or config.linear_num_heads % (tp_size * head_shards):
+            raise ValueError("KDA heads must be divisible by TP * head_shards")
+        if head_shards > 1 and (recover or num_spec):
+            raise ValueError("Head-sharded KDA state supports prefill only")
+        shapes = MambaStateShapeCalculator.kda_state_shape(
+            tp_size * head_shards,
+            config.linear_num_heads,
+            config.linear_head_dim,
+            conv_kernel_size=config.linear_conv_kernel_dim,
+            num_spec=num_spec,
+        )
+        if recover:
+            return MambaStateShapeCalculator.append_kda_recoverssm_record(
+                shapes,
+                config.linear_num_heads,
+                config.linear_head_dim,
+                tp_world_size=tp_size,
+                spec_query_len=1 + num_spec,
+            )
+        return shapes
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         if self.use_recoverssm:
             from .kda_metadata import Glm5NextRecoverSSMAttentionBackend
