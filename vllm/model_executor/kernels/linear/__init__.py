@@ -699,7 +699,38 @@ def choose_scaled_mm_linear_kernel(
             scope="global",
         )
 
-    platform_kernels = possible_kernels.get(current_platform._enum, [])
+    platform_kernels = possible_kernels.get(current_platform._enum)
+    if platform_kernels is None and current_platform.is_musa():
+        if possible_kernels is _POSSIBLE_FP8_BLOCK_KERNELS:
+            from vllm_musa.model_executor.kernels.linear.scaled_mm.block_gemv import (
+                MUSAFp8BlockGemvScaledMMKernel,
+            )
+            from vllm_musa.model_executor.kernels.linear.scaled_mm.deep_gemm import (
+                MUSADeepGemmFp8BlockScaledMMKernel,
+            )
+
+            platform_kernels = [
+                MUSADeepGemmFp8BlockScaledMMKernel,
+                MUSAFp8BlockGemvScaledMMKernel,
+                TritonFp8BlockScaledMMKernel,
+            ]
+        elif possible_kernels is _POSSIBLE_FP8_KERNELS:
+            from vllm_musa.model_executor.kernels.linear.scaled_mm.torch_scaled_mm import (
+                MUSAChannelWiseTorchFP8ScaledMMLinearKernel,
+                MUSAPerTensorTorchFP8ScaledMMLinearKernel,
+            )
+
+            platform_kernels = [
+                MUSAPerTensorTorchFP8ScaledMMLinearKernel,
+                MUSAChannelWiseTorchFP8ScaledMMLinearKernel,
+            ]
+
+    if platform_kernels is None:
+        raise ValueError(
+            "Failed to find a kernel that can implement the "
+            "ScaledMM linear layer. No kernels are registered for "
+            f"platform {current_platform._enum.name}."
+        )
 
     # Apply --linear-backend filtering when set.
     platform_kernels = _resolve_backend_kernels(
