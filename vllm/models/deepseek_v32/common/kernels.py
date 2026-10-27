@@ -231,7 +231,7 @@ def _fused_norm_rope_kernel(
         return
 
     if slot_mapping_ptr is None:
-        if kv_out_ptr is None and kpe_out_ptr is None and index_k_out_ptr is None:
+        if kv_out_ptr is None and (kpe_out_ptr is None and index_k_out_ptr is None):
             return
     elif tl.load(slot_mapping_ptr + tok_idx) < 0 and (
         pid != 1 or (kv_out_ptr is None and kpe_out_ptr is None)
