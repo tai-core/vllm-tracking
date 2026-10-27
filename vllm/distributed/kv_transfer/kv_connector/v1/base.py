@@ -195,6 +195,16 @@ class KVConnectorBase_V1(ABC):
         return False
 
     @property
+    def requires_mamba_checkpoint_splits(self) -> bool:
+        """Whether prefill must stop to materialize reusable Mamba states.
+
+        Defaults to True. Read-only consumers and descriptor-only sinks may
+        opt out when they never store intermediate recurrent checkpoints.
+        Local prefix caching still requires these stops independently.
+        """
+        return True
+
+    @property
     def requires_kv_delivery(self) -> bool:
         """Whether this connector hands off KV that must be reliably delivered.
 

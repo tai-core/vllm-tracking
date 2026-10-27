@@ -82,6 +82,7 @@ def _split(
     use_eagle: bool = True,
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
+    checkpoint_splits: bool = True,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     stub = SimpleNamespace(
@@ -91,12 +92,41 @@ def _split(
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         # `prefix_match_unit` finer than the block size (#46384).
         mamba_partial_cache_hit=partial_hit,
+        requires_mamba_checkpoint_splits=checkpoint_splits,
         hash_block_size=ATTN_BLOCK_SIZE,
         mamba_has_prefill_checkpoint_blocks=(
             num_prefill_checkpoint_blocks > 0 and not use_eagle
         ),
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
+
+
+def test_read_only_consumer_keeps_mid_block_and_budget_alignment():
+    (request,) = create_requests(1, num_tokens=6000, block_size=ATTN_BLOCK_SIZE)
+    request.num_computed_tokens = 512
+    # A resumed mid-block state still stops at the next physical state boundary.
+    assert (
+        _split(
+            request, 5488, use_eagle=False, partial_hit=True, checkpoint_splits=False
+        )
+        == 1088
+    )
+    request.num_computed_tokens = 1600
+    request.shared_prefix_boundary = 3200
+    # No local/external store requires the last block, partial tail, or junction.
+    assert (
+        _split(
+            request, 4400, use_eagle=False, partial_hit=True, checkpoint_splits=False
+        )
+        == 4400
+    )
+    # A nonfinal chunk remains aligned when the available budget is smaller.
+    assert (
+        _split(
+            request, 2000, use_eagle=False, partial_hit=True, checkpoint_splits=False
+        )
+        == 1600
+    )
 
 
 @pytest.mark.parametrize(

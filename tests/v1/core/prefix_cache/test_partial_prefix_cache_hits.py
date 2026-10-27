@@ -176,6 +176,7 @@ def test_mamba_align_split_partial_tail_schedule(dcp_world_size: int):
         dcp_world_size=dcp_world_size,
         scheduler_block_size=scheduler_block_size,
         mamba_partial_cache_hit=True,
+        requires_mamba_checkpoint_splits=True,
         mamba_has_prefill_checkpoint_blocks=False,
     )
     split = Scheduler._mamba_block_aligned_split
@@ -222,6 +223,7 @@ def test_mamba_align_split_when_block_exceeds_scheduling_budget():
         use_eagle=False,
         hash_block_size=32,
         mamba_partial_cache_hit=False,
+        requires_mamba_checkpoint_splits=True,
         mamba_has_prefill_checkpoint_blocks=False,
     )
     req = make_request("0", [0] * prompt_length, 32, sha256)
@@ -261,6 +263,7 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
         use_eagle=False,
         hash_block_size=32,
         mamba_partial_cache_hit=False,
+        requires_mamba_checkpoint_splits=True,
         mamba_has_prefill_checkpoint_blocks=False,
     )
     req = make_request("0", [0] * prompt_length, 32, sha256)

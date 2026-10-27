@@ -1166,6 +1166,7 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
         use_eagle=False,
         hash_block_size=block_size,
         mamba_partial_cache_hit=False,
+        requires_mamba_checkpoint_splits=True,
         mamba_has_prefill_checkpoint_blocks=False,
     )
     req_2.shared_prefix_boundary = shared_prefix_boundary

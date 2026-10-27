@@ -20,6 +20,36 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
+@pytest.mark.parametrize("enable_apc", [False, True])
+@pytest.mark.parametrize("prefix", [8192, 17408, 24576])
+def test_align_state_resume_index_does_not_depend_on_local_prefix_cache(
+    monkeypatch, enable_apc, prefix
+):
+    from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+    def initialize(self, *args):
+        self.max_num_reqs = 1
+        self.device = torch.device("cpu")
+
+    monkeypatch.setattr(DefaultModelState, "__init__", initialize)
+    monkeypatch.setattr(DefaultModelState, "add_request", lambda *args: None)
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            mamba_cache_mode="align",
+            enable_prefix_caching=enable_apc,
+            use_kda_recoverssm=False,
+            block_size=1024,
+        )
+    )
+    state = MambaHybridModelState(
+        config, torch.nn.Identity(), None, torch.device("cpu")
+    )
+    assert state._align_mode
+    state.add_request(0, SimpleNamespace(num_computed_tokens=prefix))
+    assert state._mamba_state_idx_gpu.tolist() == [prefix // 1024 - 1]
+
+
 @pytest.mark.parametrize(
     ("dummy_run", "num_tokens", "wait_fails"),
     [(False, 1, False), (False, 1, True), (False, 0, False), (True, 1, False)],

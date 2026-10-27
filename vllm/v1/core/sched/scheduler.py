@@ -326,6 +326,11 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        self.requires_mamba_checkpoint_splits = (
+            self.cache_config.enable_prefix_caching
+            or self.connector is None
+            or self.connector.requires_mamba_checkpoint_splits
+        )
         self.mamba_has_prefill_checkpoint_blocks = (
             self.has_mamba_layers
             # TODO: support spec decoding
@@ -421,7 +426,7 @@ class Scheduler(SchedulerInterface):
         use_internal_checkpoint = (
             self.mamba_has_prefill_checkpoint_blocks and start % block_size == 0
         )
-        if use_internal_checkpoint:
+        if use_internal_checkpoint or not self.requires_mamba_checkpoint_splits:
             last_cache_position = 0
         # Invariant: slot p holds the state after exactly (p + 1) * block_size
         # tokens. State is written at chunk ends, so chunk ends must be block
@@ -440,7 +445,7 @@ class Scheduler(SchedulerInterface):
         next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = (
             request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
-            if self.mamba_partial_cache_hit
+            if self.mamba_partial_cache_hit and self.requires_mamba_checkpoint_splits
             else 0
         )
         stops = (
@@ -458,7 +463,8 @@ class Scheduler(SchedulerInterface):
             # junction's state is not separately cacheable): cache its state
             # so sibling requests sharing the prefix can reuse it.
             start + (request.shared_prefix_boundary - start) // block_size * block_size
-            if start < request.shared_prefix_boundary < end
+            if self.requires_mamba_checkpoint_splits
+            and start < request.shared_prefix_boundary < end
             else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.

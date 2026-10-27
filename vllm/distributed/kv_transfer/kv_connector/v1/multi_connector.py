@@ -214,6 +214,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         return any(c.requires_pre_state_load for c in self._connectors)
 
     @property
+    def requires_mamba_checkpoint_splits(self) -> bool:
+        return any(c.requires_mamba_checkpoint_splits for c in self._connectors)
+
+    @property
     def requires_kv_delivery(self) -> bool:
         return any(c.requires_kv_delivery for c in self._connectors)
 

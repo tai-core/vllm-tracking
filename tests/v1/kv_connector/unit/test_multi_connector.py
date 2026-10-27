@@ -202,6 +202,16 @@ def test_base_pre_state_load_is_opt_in_and_requires_wait_implementation():
         KVConnectorBase_V1.wait_for_pre_state_load(mc)
 
 
+@pytest.mark.parametrize("children", [(False, False), (True, False), (False, True)])
+def test_checkpoint_splits_are_required_if_any_child_stores_states(children):
+    connector = MultiConnector.__new__(MultiConnector)
+    connector._connectors = [MagicMock(spec_set=KVConnectorBase_V1) for _ in children]
+    for child, required in zip(connector._connectors, children):
+        child.requires_mamba_checkpoint_splits = required
+    assert connector.requires_mamba_checkpoint_splits is any(children)
+    assert KVConnectorBase_V1.requires_mamba_checkpoint_splits.fget(connector) is True
+
+
 # Helper function to compare directories recursively
 def _compare_directories(dir1: Path, dir2: Path) -> bool:
     """Compares two directories recursively for identical content."""
