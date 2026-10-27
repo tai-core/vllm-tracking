@@ -726,7 +726,7 @@ class DeepSeekV32IndexerDecodeMetadata:
     seq_lens: torch.Tensor
     decode_lens: torch.Tensor
     requires_padding: bool
-    schedule_metadata: torch.Tensor
+    schedule_metadata: torch.Tensor | None
     global_seq_lens: torch.Tensor | None = None
     per_req_decode_lens: torch.Tensor | None = None
     decode_is_uniform: bool = True
@@ -1739,9 +1739,37 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
 
-            # DeepGEMM is required for the paged MQA logits on CUDA devices
-            schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            # XPU keeps its preallocated metadata contract. MUSA either fills
+            # valid provider metadata or records None so its exact Torch path
+            # can fall back safely.
+            schedule_metadata = (
+                None
+                if current_platform.is_musa()
+                else self.scheduler_metadata_buffer
+            )
+            if current_platform.is_musa():
+                try:
+                    from mate import deep_gemm as musa_deep_gemm
+
+                    meta_lens = seq_lens
+                    if seq_lens.dim() == 2 and seq_lens.shape[-1] == 1:
+                        meta_lens = seq_lens.squeeze(-1)
+                    metadata = musa_deep_gemm.get_paged_mqa_logits_metadata(
+                        meta_lens,
+                        self.kv_cache_spec.storage_block_size,
+                        self.num_sms,
+                    )
+                    schedule_metadata = self.scheduler_metadata_buffer[
+                        : metadata.shape[0]
+                    ]
+                    schedule_metadata[:] = metadata
+                except Exception:
+                    logger.warning_once(
+                        "MUSA sparse indexer could not prepare paged MQA "
+                        "schedule metadata; exact materialized decode will "
+                        "fall back to the Torch path."
+                    )
+            elif current_platform.is_cuda() and has_deep_gemm():
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,
