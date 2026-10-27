@@ -11,6 +11,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
     eagle_proof_margin,
+    musa_mamba_separate_pool_enabled,
     partial_hash_hits_enabled,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -124,6 +125,19 @@ class KVCacheCoordinator(ABC):
             metrics_collector=metrics_collector,
         )
 
+        self.musa_mamba_block_pools: dict[int, BlockPool] = {}
+        musa_mamba_num_blocks = kv_cache_config.musa_mamba_num_blocks
+        if musa_mamba_separate_pool_enabled() and musa_mamba_num_blocks:
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+                if isinstance(group.kv_cache_spec, MambaSpec):
+                    self.musa_mamba_block_pools[group_id] = BlockPool(
+                        num_gpu_blocks=musa_mamba_num_blocks,
+                        enable_caching=False,
+                        hash_block_size=hash_block_size,
+                        enable_kv_cache_events=False,
+                        metrics_collector=None,
+                    )
+
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
             i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
@@ -159,7 +173,7 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_in_flight_tokens=max_in_flight_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                block_pool=self.musa_mamba_block_pools.get(i, self.block_pool),
                 role=kv_cache_group.role,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
@@ -233,6 +247,8 @@ class KVCacheCoordinator(ABC):
         if self.retention_interval != 0:
             prefill_end = 0
         for i, manager in enumerate(self.single_type_managers):
+            if i in self.musa_mamba_block_pools and isinstance(manager, MambaManager):
+                continue
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
@@ -726,6 +742,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             for idx, group in enumerate(self.attention_groups):
                 if (
                     group.spec == spec
+                    and i not in self.musa_mamba_block_pools
                     and group.manager_cls is manager_cls
                     and self.single_type_managers[group.group_ids[0]].block_pool
                     is self.single_type_managers[i].block_pool

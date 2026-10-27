@@ -1551,6 +1551,90 @@ def _get_kv_cache_bytes_per_block(
     return round_up(bytes_per_block, math.lcm(*alignments))
 
 
+def musa_mamba_separate_pool_enabled() -> bool:
+    """Whether MUSA may assign Mamba groups dedicated block-id pools."""
+    try:
+        from vllm.platforms import current_platform
+    except Exception:
+        return False
+    is_musa = getattr(current_platform, "is_musa", None)
+    return callable(is_musa) and is_musa()
+
+
+def _musa_has_mamba_and_attention(kv_cache_groups) -> bool:
+    has_mamba = any(isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_groups)
+    has_attn = any(not isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_groups)
+    return has_mamba and has_attn
+
+
+def _musa_separate_pool_eligible(vllm_config, kv_cache_groups) -> bool:
+    # KV connectors can defer frees through the coordinator's shared-pool API;
+    # keep the upstream shared-pool layout until that API carries pool ownership.
+    return (
+        musa_mamba_separate_pool_enabled()
+        and vllm_config.kv_transfer_config is None
+        and _musa_has_mamba_and_attention(kv_cache_groups)
+    )
+
+
+def _musa_separated_mamba_attn_tensors(vllm_config, kv_cache_groups, available_memory):
+    """Split KV memory into a small contiguous mamba pool and the attention pool.
+
+    Mamba groups get one dedicated tensor per layer, indexed by their own
+    block-id space. The pool is sized from the MambaSpec admission bound so it
+    never binds (attention admission caps running requests at <= max_num_seqs).
+    Returns (kv_cache_tensors, attn_num_blocks, mamba_num_blocks).
+    """
+    mamba_groups = [g for g in kv_cache_groups if isinstance(g.kv_cache_spec, MambaSpec)]
+    attn_groups = [
+        g for g in kv_cache_groups if not isinstance(g.kv_cache_spec, MambaSpec)
+    ]
+    mamba_page = get_uniform_page_size([g.kv_cache_spec for g in mamba_groups])
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    # Each Mamba group gets its own non-binding BlockPool/address space.
+    # Therefore block IDs are local to a group and do not reserve another
+    # copy of every request for sibling groups. Use the same per-request
+    # bound as MambaManager (including align/all/speculative modes), then add
+    # only BlockPool's null block. The previous fixed +8 slack wasted state
+    # memory and reduced the attention pool without an admission invariant.
+    mamba_blocks_per_request = max(
+        cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+            mamba_page,
+        )
+        for group in mamba_groups
+    )
+    mamba_num_blocks = max_num_seqs * mamba_blocks_per_request + 1
+    mamba_layers = [ln for g in mamba_groups for ln in g.layer_names]
+    mamba_bytes = mamba_page * mamba_num_blocks * len(mamba_layers)
+    attn_group_size = max(len(g.layer_names) for g in attn_groups)
+    attn_page = get_uniform_page_size([g.kv_cache_spec for g in attn_groups])
+    if mamba_bytes >= available_memory:
+        raise ValueError("MUSA separate mamba pool needs more memory than available")
+    remaining = available_memory - mamba_bytes
+    attn_num_blocks = get_num_blocks(
+        vllm_config, attn_group_size, remaining, attn_page
+    )
+    kv_cache_tensors = []
+    for i in range(attn_group_size):
+        shared_by = [g.layer_names[i] for g in attn_groups if i < len(g.layer_names)]
+        kv_cache_tensors.append(
+            KVCacheTensor(size=attn_page * attn_num_blocks, layers=shared_by, layer_stride=attn_page * attn_num_blocks, block_stride=attn_page)
+        )
+    for ln in mamba_layers:
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=mamba_page * mamba_num_blocks,
+                layers=[ln],
+                layer_stride=mamba_page * mamba_num_blocks,
+                block_stride=mamba_page,
+                musa_mamba_pool=True,
+            )
+        )
+    return kv_cache_tensors, attn_num_blocks, mamba_num_blocks
+
+
+
 def validate_kv_cache_layout(
     layout: KVCacheLayout,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1619,6 +1703,21 @@ def get_kv_cache_config_from_groups(
             vllm_config, kv_cache_groups, available_memory, host_budget
         )
 
+    if _musa_separate_pool_eligible(vllm_config, kv_cache_groups):
+        kv_cache_tensors, num_blocks, musa_mamba_num_blocks = (
+            _musa_separated_mamba_attn_tensors(
+                vllm_config, kv_cache_groups, available_memory
+            )
+        )
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+            prefix_cache_retention_interval=(
+                vllm_config.cache_config.prefix_cache_retention_interval
+            ),
+            musa_mamba_num_blocks=musa_mamba_num_blocks,
+        )
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
     validate_kv_cache_layout(layout, kv_cache_groups)
     bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups, layout)
@@ -2601,6 +2700,20 @@ def get_kv_cache_configs(
         _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
         for worker_spec in kv_cache_specs
     ]
+
+    # The MUSA Mamba pool has a fixed cost outside the attention block pool.
+    # Replanning each TP rank from a common block count can therefore produce
+    # different final counts when their profiled free memory differs. For
+    # identical cache groups, plan from the smallest rank budget instead.
+    if (
+        projected_groups_per_worker
+        and all(
+            groups == projected_groups_per_worker[0]
+            for groups in projected_groups_per_worker[1:]
+        )
+        and _musa_separate_pool_eligible(vllm_config, projected_groups_per_worker[0])
+    ):
+        available_memory = [min(available_memory)] * len(available_memory)
 
     # If `num_gpu_blocks_override` is set, the cache size that will actually
     # be allocated is decoupled from the profiled `available_memory`:
