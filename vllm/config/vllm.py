@@ -2840,7 +2840,8 @@ class VllmConfig:
         if self.model_config is None:
             return self
         mamba_block_size_is_set = (
-            self.cache_config.mamba_block_size is not None
+            self.cache_config.user_specified_mamba_block_size
+            and self.cache_config.mamba_block_size is not None
             and self.cache_config.mamba_block_size != self.model_config.max_model_len
         )
         if mamba_block_size_is_set and not self.cache_config.enable_prefix_caching:

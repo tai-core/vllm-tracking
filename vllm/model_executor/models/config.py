@@ -619,7 +619,13 @@ class MambaModelConfig(VerifyAndUpdateConfig):
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
 
-        if cache_config.enable_prefix_caching:
+        # External caches can restore aligned recurrent state without local APC.
+        # Keep an explicitly selected align mode, but do not enable it implicitly.
+        if cache_config.enable_prefix_caching or (
+            cache_config.mamba_cache_mode == "align"
+            and vllm_config.kv_transfer_config is not None
+            and vllm_config.kv_transfer_config.is_kv_transfer_instance
+        ):
             if cache_config.mamba_cache_mode == "none":
                 cache_config.mamba_cache_mode = "align"
                 logger.info(
