@@ -132,7 +132,7 @@ class KVCacheCoordinator(ABC):
                 if isinstance(group.kv_cache_spec, MambaSpec):
                     self.musa_mamba_block_pools[group_id] = BlockPool(
                         num_gpu_blocks=musa_mamba_num_blocks,
-                        enable_caching=False,
+                        enable_caching=enable_caching,
                         hash_block_size=hash_block_size,
                         enable_kv_cache_events=False,
                         metrics_collector=None,
@@ -184,6 +184,9 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+        for manager in self.single_type_managers:
+            if isinstance(manager, MambaManager):
+                manager._dedicated_pool = manager.block_pool is not self.block_pool
         # Match Mamba checkpoints to Eagle's attention replay boundary.
         if use_eagle:
             for manager in self.single_type_managers:
@@ -382,7 +385,12 @@ class KVCacheCoordinator(ABC):
             self.scheduler_block_size,
             use_eagle=bool(self.eagle_group_ids),
         )
-        for group_id, manager in enumerate(self.single_type_managers):
+        # Cache the Mamba checkpoint before an attention hit can use it as a
+        # replay boundary. The group order need not put Mamba first.
+        for group_id, manager in sorted(
+            enumerate(self.single_type_managers),
+            key=lambda item: not isinstance(item[1], MambaManager),
+        ):
             if not manager.enable_caching:
                 continue
             manager.cache_blocks(

@@ -6318,3 +6318,60 @@ def test_get_unhashed_block_ids_all_groups():
     )
 
     assert blocks.get_unhashed_block_ids_all_groups() == [[1, 4], []]
+
+
+def test_musa_dedicated_mamba_pool_keeps_prefix_cache(monkeypatch):
+    """Attention hits can reuse a checkpoint from a separate Mamba pool."""
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    monkeypatch.setattr(
+        "vllm.v1.core.kv_cache_coordinator.musa_mamba_separate_pool_enabled",
+        lambda: True,
+    )
+    block_size = 16
+    kv_cache_config = _make_hybrid_kv_cache_config(
+        block_size, 20, ["full", "mamba_align"]
+    )
+    kv_cache_config.musa_mamba_num_blocks = 12
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=1024,
+        hash_block_size=block_size,
+        use_eagle=False,
+    )
+    mamba_manager = next(
+        m for m in manager.coordinator.single_type_managers
+        if isinstance(m, MambaManager)
+    )
+    assert mamba_manager.block_pool is not manager.block_pool
+    assert mamba_manager.enable_caching
+    assert mamba_manager._dedicated_pool
+    null_ref_count = mamba_manager.block_pool.null_block.ref_cnt
+
+    # Process the first 48 tokens of a 49-token prompt as one step, leaving
+    # the Mamba checkpoint aligned with the attention block boundary.
+    first_tokens = [1] * 16 + [2] * 16 + [3] * 16 + [4]
+    first = make_request("mamba-first", first_tokens, block_size, sha256)
+    blocks, computed, _ = manager.get_computed_blocks(first)
+    assert computed == 0
+    assert (
+        manager.allocate_slots(first, 3 * block_size, computed, blocks)
+        is not None
+    )
+    manager.cache_blocks(first, 3 * block_size)
+    manager.new_step_starts()
+
+    second_tokens = first_tokens + [5]
+    second = make_request("mamba-second", second_tokens, block_size, sha256)
+    cached_blocks, computed, _ = manager.get_computed_blocks(second)
+    assert computed == 3 * block_size
+    assert all(cached_blocks.blocks)
+    assert (
+        manager.allocate_slots(
+            second, len(second_tokens) - computed, computed, cached_blocks
+        )
+        is not None
+    )
+    manager.free(first)
+    manager.free(second)
+    assert mamba_manager.block_pool.null_block.ref_cnt == null_ref_count

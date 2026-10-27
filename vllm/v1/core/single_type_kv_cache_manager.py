@@ -1425,6 +1425,7 @@ class MambaManager(SingleTypeKVCacheManager):
         self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
     ) -> None:
         super().__init__(kv_cache_spec, block_pool, **kwargs)
+        self._dedicated_pool = False
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         self.has_prefill_checkpoint_blocks = (
@@ -1602,7 +1603,7 @@ class MambaManager(SingleTypeKVCacheManager):
         freed: list[KVCacheBlock] = []
         # Mamba prefill leaves null gaps between states awaiting retirement.
         for i in range(last_block - 1, first_block - 1, -1):
-            if blocks[i].is_null:
+            if blocks[i].is_null or blocks[i].block_hash is not None:
                 continue
             freed.append(blocks[i])
             blocks[i] = self._null_block
@@ -1637,8 +1638,9 @@ class MambaManager(SingleTypeKVCacheManager):
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
-                    blocks[last_state_block_idx] = self._null_block
+                    if blocks[last_state_block_idx].block_hash is None:
+                        self.block_pool.free_blocks([blocks[last_state_block_idx]])
+                        blocks[last_state_block_idx] = self._null_block
 
     def _needs_internal_checkpoint(
         self,
@@ -1949,7 +1951,10 @@ class MambaManager(SingleTypeKVCacheManager):
                 for entry in self._pending_boundary_state_offloads
                 if entry[0] != request_id
             ]
-        return super().pop_blocks_for_free(request_id)
+        blocks = super().pop_blocks_for_free(request_id)
+        if self._dedicated_pool:
+            return [block for block in blocks if block is not self._null_block]
+        return blocks
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """Get the number of tokens whose mamba state are not needed anymore. Mamba only
