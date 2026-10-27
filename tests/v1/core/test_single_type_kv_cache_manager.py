@@ -9,6 +9,7 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
@@ -268,6 +269,159 @@ def test_external_computed_blocks_do_not_corrupt_free_pool():
 
     assert block_pool.get_num_free_blocks() == num_free_blocks
     assert len(manager.req_to_blocks[request_id]) == 3
+
+
+def _external_mamba_cache_manager(block_size, num_blocks):
+    register_all_kvcache_specs(None)
+    attention = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+    )
+    tail = KpoolTailSpec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=4,
+    )
+    state = MambaSpec(
+        block_size=block_size,
+        shapes=((3, 3072), (8, 128, 128)),
+        dtypes=(torch.bfloat16, torch.float32),
+        mamba_cache_mode="align",
+        page_size_padded=block_size * 656,
+    )
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["mla"], attention),
+            KVCacheGroupSpec(["tail"], tail),
+        ]
+        + [KVCacheGroupSpec([f"kda.{i}"], state) for i in range(4)],
+    )
+    return KVCacheManager(
+        config,
+        max_model_len=32768,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+        enable_caching=False,
+        pcp_world_size=8,
+    )
+
+
+def _external_request(identity, total_tokens):
+    return Request(
+        request_id=identity,
+        prompt_token_ids=[1] * total_tokens,
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+    )
+
+
+def test_sync_external_mamba_admission_rejects_fourth_old_layout_request():
+    """The 48-block pool holds three 12-block restores, not four 8-block estimates."""
+    manager = _external_mamba_cache_manager(8704, 48)
+    for index in range(3):
+        assert (
+            manager.allocate_slots(
+                _external_request(str(index), 19342),
+                1934,
+                num_external_computed_tokens=17408,
+                full_sequence_must_fit=True,
+            )
+            is not None
+        )
+    free_before = manager.block_pool.get_num_free_blocks()
+    assert free_before == 11
+    assert (
+        manager.allocate_slots(
+            _external_request("fourth", 19342),
+            1934,
+            num_external_computed_tokens=17408,
+            full_sequence_must_fit=True,
+        )
+        is None
+    )
+    assert manager.block_pool.get_num_free_blocks() == free_before
+
+
+@pytest.mark.parametrize(
+    "block_size,num_blocks,required", [(8704, 48, 12), (1024, 415, 28)]
+)
+@pytest.mark.parametrize("full_sequence_must_fit", [False, True])
+def test_sync_external_mamba_admission_rejects_one_block_short_before_mutation(
+    block_size, num_blocks, required, full_sequence_must_fit
+):
+    manager = _external_mamba_cache_manager(block_size, num_blocks)
+    pool = manager.block_pool
+    pool.get_new_blocks(pool.get_num_free_blocks() - required + 1)
+    free_before = pool.get_num_free_blocks()
+    assert free_before == required - 1
+    assert (
+        manager.allocate_slots(
+            _external_request("hit", 19342),
+            1934,
+            num_external_computed_tokens=17408,
+            full_sequence_must_fit=full_sequence_must_fit,
+        )
+        is None
+    )
+    assert pool.get_num_free_blocks() == free_before
+
+
+@pytest.mark.parametrize("prefix,total", [(0, 13), (8, 8), (8, 9), (8, 13)])
+@pytest.mark.parametrize("checkpoint", [0, 1])
+@pytest.mark.parametrize("speculative", [0, 2])
+def test_mamba_external_estimate_matches_checkpoint_and_running_allocations(
+    prefix, total, checkpoint, speculative
+):
+    pool = BlockPool(32, False, 4)
+    manager = MambaManager(
+        MambaSpec(
+            block_size=4,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+            num_speculative_blocks=speculative,
+            num_prefill_checkpoint_blocks=checkpoint,
+        ),
+        pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+    )
+    admission = manager.get_num_blocks_to_allocate(
+        "hit", total, [], prefix, 0, total, apply_admission_cap=True
+    )
+    predicted = manager.get_num_blocks_to_allocate("hit", total, [], prefix, 0, total)
+    free_before = pool.get_num_free_blocks()
+    if prefix:
+        manager.add_local_computed_blocks("hit", [], 0, prefix)
+        manager.allocate_external_computed_blocks("hit", 0, prefix)
+    manager.allocate_new_blocks("hit", total, total)
+    assert admission == predicted == free_before - pool.get_num_free_blocks()
+
+
+def test_async_mamba_restore_and_later_suffix_keep_separate_allocations():
+    manager = _external_mamba_cache_manager(8704, 48)
+    request = _external_request("async", 19342)
+    assert (
+        manager.allocate_slots(
+            request,
+            0,
+            num_external_computed_tokens=17408,
+            delay_cache_blocks=True,
+        )
+        is not None
+    )
+    assert manager.block_pool.get_num_free_blocks() == 47 - 7
+    request.num_computed_tokens = 17408
+    assert manager.allocate_slots(request, 1934) is not None
+    assert manager.block_pool.get_num_free_blocks() == 47 - 12
 
 
 def test_mamba_speculative_block_relocation_requires_exclusive_ownership():

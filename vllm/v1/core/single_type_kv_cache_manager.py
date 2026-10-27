@@ -1661,6 +1661,20 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
                 if request_id not in self._allocated_block_reqs:
                     num_new_blocks += self.num_speculative_blocks
+                # A synchronous external hit first restores its prefix state,
+                # then allocates a writable state for this step. The align
+                # estimate above counts only the latter. An internal checkpoint
+                # at that same prefix boundary already accounts for its page.
+                prefix_blocks = cdiv(total_computed_tokens, self.block_size)
+                main_blocks = num_required_blocks - self.num_speculative_blocks
+                if (
+                    total_computed_tokens > num_local_computed_tokens
+                    and request_id not in self.num_cached_block
+                    and len(new_computed_blocks) < prefix_blocks
+                    and main_blocks > prefix_blocks
+                    and not (checkpoint_block and main_blocks == prefix_blocks + 1)
+                ):
+                    num_new_blocks += 1
 
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
