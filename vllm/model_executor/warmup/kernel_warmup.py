@@ -6,6 +6,7 @@ happen during model execution.
 """
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -160,55 +161,49 @@ def _autotune_kimi_k3_kda_qkvg(model: torch.nn.Module) -> None:
 
 
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
+    if os.environ.get("VLLM_SKIP_KERNEL_WARMUP") == "1":
+        logger.info_once("Skipping kernel warmup by VLLM_SKIP_KERNEL_WARMUP=1")
+        return
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
     )
 
     if not worker.use_v2_model_runner:
+        # Pooling models do not use the generation slot-mapping path.
+        if not worker.model_runner.is_pooling_model:
+            warm_v1_block_table_kernels(worker.model_runner)
         # The KV-block zeroing kernel is driven by the scheduler's
         # `new_block_ids_to_zero`, so no dummy run ever reaches it.
         zeroer = getattr(worker.model_runner, "_kv_block_zeroer", None)
         if zeroer is not None:
             zeroer.warmup(worker.model_runner.kv_cache_config.num_blocks)
 
-    enable_jit_warmup = worker.vllm_config.kernel_config.enable_jit_warmup
-    if enable_jit_warmup:
-        logger.info("JIT kernel warmup starting.")
-        jit_warmup_start = time.perf_counter()
-        try:
-            registry = (
-                worker.model_runner.jit_warmup_registry  # type: ignore[attr-defined]
-            )
-            registry.warmup()
-        except Exception:
-            logger.exception(
-                "JIT kernel warmup failed after %.2fs.",
-                time.perf_counter() - jit_warmup_start,
-            )
-            raise
-        logger.info(
-            "JIT kernel warmup finished in %.2fs.",
-            time.perf_counter() - jit_warmup_start,
-        )
-
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
-    qwen_vl_triton_warmup(worker.model_runner)
-    mamba_triton_warmup(worker.model_runner)
 
     compilation_config = worker.vllm_config.compilation_config
     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
 
-    # Run next so input-prep kernels JIT against pristine runner state.
-    if enable_jit_warmup:
-        kimi_k3_triton_warmup(worker)
-        watermark_sample_warmup(worker)
-        qwen4_exp_qsa_triton_warmup(worker)
-
-    if enable_jit_warmup and current_platform.is_device_capability_family(100):
-        _warmup_bf16x3_router_gemm(
+    # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
+    # layer per token; warm them across token sizes first so the first real
+    # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
+    mhc_warmup = globals().get("deepseek_v4_mhc_warmup")
+    if mhc_warmup is not None:
+        mhc_warmup(
             worker.get_model(),
-            worker.scheduler_config.max_num_batched_tokens,
+            max_tokens=worker.scheduler_config.max_num_batched_tokens,
+            cudagraph_capture_sizes=cudagraph_capture_sizes,
         )
+
+    # Run next so input-prep kernels JIT against pristine runner state.
+    if worker.vllm_config.kernel_config.enable_jit_warmup:
+        kimi_k3_triton_warmup(worker)
+        if not current_platform.is_musa():
+            fa4_cutedsl_warmup(worker)
+        else:
+            logger.info_once("Skipping CUDA-only FA4 CuTeDSL warmup on MUSA.")
+        sparse_mla_warmup = globals().get("sparse_mla_triton_warmup")
+        if sparse_mla_warmup is not None:
+            sparse_mla_warmup(worker)
 
     if current_platform.has_device_capability(90):
         _warmup_ll_bf16_router_gemm(worker.get_model())
