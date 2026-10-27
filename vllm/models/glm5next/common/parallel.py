@@ -3,9 +3,15 @@
 from dataclasses import dataclass
 
 from vllm.config import VllmConfig
-from vllm.config.kda_parallel import kda_tp_over_pcp
+from vllm.config.kda_parallel import (
+    get_kda_layer_tp,
+    get_kda_request_windows,
+    kda_layer_tp_axis,
+    kda_tp_over_pcp,
+)
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
+    get_ep_group,
     get_pcp_group,
     get_tp_group,
 )
@@ -14,23 +20,33 @@ from vllm.distributed.parallel_state import (
 @dataclass(frozen=True)
 class KDAParallelSpec:
     group: GroupCoordinator
-    tp_size: int = 1
-    tp_rank: int = 0
-
-    @property
-    def size(self) -> int:
-        return self.tp_size * self.group.world_size
-
-    @property
-    def rank(self) -> int:
-        return self.tp_rank * self.group.world_size + self.group.rank_in_group
+    kda_layer_tp: int
+    kda_layer_rank: int
+    token_layout: str
+    request_windows: int
 
 
 def get_kda_parallel_spec(config: VllmConfig) -> KDAParallelSpec:
     tp = get_tp_group()
-    if kda_tp_over_pcp(config):
-        return KDAParallelSpec(get_pcp_group(), tp.world_size, tp.rank_in_group)
-    return KDAParallelSpec(tp)
+    layout = kda_layer_tp_axis(config.parallel_config)
+    kda_layer_tp = get_kda_layer_tp(config)
+    if layout == "pcp":
+        group = get_pcp_group()
+        rank = tp.rank_in_group * group.world_size + group.rank_in_group
+    elif layout == "dp":
+        group = get_ep_group()
+        assert group.world_size == kda_layer_tp
+        rank = group.rank_in_group
+    else:
+        group = tp
+        rank = tp.rank_in_group
+    return KDAParallelSpec(
+        group=group,
+        kda_layer_tp=kda_layer_tp,
+        kda_layer_rank=rank,
+        token_layout=layout,
+        request_windows=get_kda_request_windows(config),
+    )
 
 
 def get_kda_pcp_collectives(config: VllmConfig, hidden_size: int):
@@ -75,6 +91,7 @@ def get_kda_pcp_collectives(config: VllmConfig, hidden_size: int):
 
         init_logger(__name__).info(
             "KDA mapped Gather/ReduceScatter enabled: PCP=%d, staging=%.2f MiB",
-            group.world_size, rows * hidden_size * element_size / 2**20,
+            group.world_size,
+            rows * hidden_size * element_size / 2**20,
         )
     return group._kda_pcp_collectives

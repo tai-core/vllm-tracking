@@ -12,6 +12,7 @@ from typing_extensions import TypeIs
 import vllm.envs as envs
 from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.distributed import (
+    GroupCoordinator,
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -1692,6 +1693,7 @@ class RowParallelLinear(LinearBase):
         disable_tp: bool = False,
         tp_rank: int | None = None,
         tp_size: int | None = None,
+        parallel_group: GroupCoordinator | None = None,
     ):
         # Divide the weight matrix along the first dimension.
         self.tp_rank = (
@@ -1708,6 +1710,9 @@ class RowParallelLinear(LinearBase):
             if tp_size is not None
             else get_tensor_model_parallel_world_size()
         )
+        # Group the output is reduced over. ``None`` keeps the historical
+        # behaviour of reducing over the TP group.
+        self.parallel_group = parallel_group
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
@@ -1810,7 +1815,10 @@ class RowParallelLinear(LinearBase):
         output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
         if self.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output_parallel)
+            if self.parallel_group is None:
+                output = tensor_model_parallel_all_reduce(output_parallel)
+            else:
+                output = self.parallel_group.all_reduce(output_parallel)
         else:
             output = output_parallel
 

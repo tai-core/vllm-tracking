@@ -49,12 +49,13 @@ def test_kda_recurrent_state_dtype_follows_ssm_cache_dtype(
 @pytest.mark.parametrize("tp,pcp", [(1, 8), (8, 1)])
 @pytest.mark.parametrize("recover", [False, True])
 def test_kda_config_and_layer_agree_on_head_sharded_state(tp, pcp, recover):
-    from vllm.config.kda_parallel import kda_tensor_parallel_size
+    from vllm.config.kda_parallel import get_kda_layer_tp
 
     config = SimpleNamespace(
-        additional_config={"kda_parallel_mode": "tp_pcp"},
+        additional_config={},
         parallel_config=SimpleNamespace(
             tensor_parallel_size=tp,
+            kda_layer_tp=8,
             prefill_context_parallel_size=pcp,
             decode_context_parallel_size=1,
         ),
@@ -69,7 +70,7 @@ def test_kda_config_and_layer_agree_on_head_sharded_state(tp, pcp, recover):
         cache_config=SimpleNamespace(use_kda_recoverssm=recover),
     )
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
-    layer.tp_size = kda_tensor_parallel_size(config)
+    layer.kda_layer_tp = get_kda_layer_tp(config)
     layer.num_heads, layer.head_dim, layer.conv_size, layer.num_spec = 64, 128, 4, 3
     layer.cache_config = config.cache_config
     expected = layer.get_state_shape()

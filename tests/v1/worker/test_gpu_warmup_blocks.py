@@ -100,7 +100,9 @@ def _make_runner(
         model_state=SimpleNamespace(max_encoder_len=0),
         scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=2048),
         kv_cache_config=SimpleNamespace(
-            kv_cache_groups=kv_cache_groups, num_blocks=1024
+            kv_cache_groups=kv_cache_groups,
+            num_blocks=1024,
+            musa_mamba_num_blocks=None,
         ),
         vllm_config=SimpleNamespace(
             num_lookahead_tokens=num_lookahead_tokens, is_mm_encoder_only=False

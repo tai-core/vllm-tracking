@@ -5,12 +5,13 @@
 from dataclasses import replace
 
 import torch
+import torch.distributed
 from torch import nn
+from torch.nn import functional as F
 from transformers import Glm5NextTextConfig
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.config.kda_parallel import kda_tp_over_pcp
 from vllm.distributed import divide
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import (
@@ -81,13 +82,16 @@ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
         output_sizes: list[int],
         replicated_shard_ids: tuple[int, ...],
         tp_size: int,
+        tp_rank: int | None = None,
         **kwargs,
     ) -> None:
         self.replicated_shard_ids = set(replicated_shard_ids)
         output_sizes = output_sizes.copy()
         for sid in self.replicated_shard_ids:
             output_sizes[sid] *= tp_size
-        super().__init__(input_size, output_sizes, tp_size=tp_size, **kwargs)
+        super().__init__(
+            input_size, output_sizes, tp_size=tp_size, tp_rank=tp_rank, **kwargs
+        )
 
     def weight_loader(
         self,
@@ -207,6 +211,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             prefill_checkpoint_alignment=alignment,
         )
 
+    @property
+    def tp_over_pcp(self) -> bool:
+        return self.kda_parallel.token_layout == "pcp"
+
+    @property
+    def tp_over_dp(self) -> bool:
+        return self.kda_parallel.token_layout == "dp"
+
     def get_state_dtype(
         self,
     ) -> tuple[torch.dtype, ...]:
@@ -230,7 +242,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # slide the window across the draft-verify tokens without reading past
         # the allocated width. Matches qwen_gdn_linear_attn.get_state_shape.
         base_shapes = MambaStateShapeCalculator.kda_state_shape(
-            self.tp_size,
+            self.kda_layer_tp,
             self.num_heads,
             self.head_dim,
             conv_kernel_size=self.conv_size,
@@ -242,7 +254,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 base_shapes,
                 self.num_heads,
                 self.head_dim,
-                self.tp_size,
+                self.kda_layer_tp,
                 1 + self.num_spec,
             )
         return base_shapes
@@ -263,25 +275,43 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         self.use_recoverssm = self.cache_config.use_kda_recoverssm
         self.kda_parallel = get_kda_parallel_spec(vllm_config)
-        self.tp_size = self.kda_parallel.size
-        self.tp_rank = self.kda_parallel.rank
-        self.tp_over_pcp = kda_tp_over_pcp(vllm_config)
+        self.kda_layer_tp = self.kda_parallel.kda_layer_tp
+        self.kda_layer_rank = self.kda_parallel.kda_layer_rank
+        self.request_windows = self.kda_parallel.request_windows
+        if self.tp_over_dp:
+            # Each rank holds the head slice of every request in the group, so
+            # the Mamba state pool must be one window per rank wide. That only
+            # exists with MUSA's dedicated Mamba pool: a shared pool sizes the
+            # state tensor from the attention block count instead, and the
+            # window offset would run off the end of it.
+            from vllm.v1.core.kv_cache_utils import (
+                musa_mamba_separate_pool_enabled,
+            )
+
+            assert musa_mamba_separate_pool_enabled(), (
+                "kda_layer_tp > tensor_parallel_size requires the dedicated "
+                "MUSA Mamba state pool."
+            )
         self.head_dim = config.linear_head_dim
         self.num_heads = config.linear_num_heads
         self.conv_size = config.linear_conv_kernel_dim
-        assert self.num_heads % self.tp_size == 0
-        self.local_num_heads = divide(self.num_heads, self.tp_size)
+        assert self.num_heads % self.kda_layer_tp == 0
+        self.local_num_heads = divide(self.num_heads, self.kda_layer_tp)
 
         projection_size = self.head_dim * self.num_heads
-        self.local_projection_size = divide(projection_size, self.tp_size)
+        self.local_projection_size = divide(projection_size, self.kda_layer_tp)
 
         _, recurrent_state_shape, *_ = self.get_state_shape()
         _, recurrent_state_dtype, *_ = self.get_state_dtype()
+        # The scatter covers every gathered request, so its index tensor is
+        # request_windows times the local batch.
         scatter_states.register_warmup(
             state_shape=recurrent_state_shape,
             state_dtype=recurrent_state_dtype,
             indices_dtype=torch.int32,
-            max_num_tokens=vllm_config.scheduler_config.max_num_seqs,
+            max_num_tokens=(
+                vllm_config.scheduler_config.max_num_seqs * self.request_windows
+            ),
         )
 
         # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).
@@ -298,8 +328,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 self.head_dim,  # g_a (shard 5, replicated)
             ],
             replicated_shard_ids=(4, 5),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            tp_size=self.kda_layer_tp,
+            tp_rank=self.kda_layer_rank,
             bias=False,
             quant_config=self.quant_config,
             prefix=f"{prefix}.in_proj_qkvbfg_a",
@@ -311,16 +341,16 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             bias=False,
             quant_config=self.quant_config,
             prefix=f"{prefix}.f_b_proj",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            tp_rank=self.kda_layer_rank,
+            tp_size=self.kda_layer_tp,
         )
         self.dt_bias = nn.Parameter(
-            torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32)
+            torch.empty(divide(projection_size, self.kda_layer_tp), dtype=torch.float32)
         )
 
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0, tp_rank=self.tp_rank)},
+            {"weight_loader": sharded_weight_loader(0, tp_rank=self.kda_layer_rank)},
         )
 
         self.q_conv1d = ColumnParallelLinear(
@@ -329,8 +359,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             bias=False,
             params_dtype=torch.float32,
             prefix=f"{prefix}.q_conv1d",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            tp_rank=self.kda_layer_rank,
+            tp_size=self.kda_layer_tp,
         )
         self.k_conv1d = ColumnParallelLinear(
             input_size=self.conv_size,
@@ -338,8 +368,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             bias=False,
             params_dtype=torch.float32,
             prefix=f"{prefix}.k_conv1d",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            tp_rank=self.kda_layer_rank,
+            tp_size=self.kda_layer_tp,
         )
         self.v_conv1d = ColumnParallelLinear(
             input_size=self.conv_size,
@@ -347,8 +377,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             bias=False,
             params_dtype=torch.float32,
             prefix=f"{prefix}.v_conv1d",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            tp_rank=self.kda_layer_rank,
+            tp_size=self.kda_layer_tp,
         )
         # unsqueeze to fit conv1d weights shape into the linear weights shape.
         # Can't do this in `weight_loader` since it already exists in
@@ -366,7 +396,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )
         set_weight_attrs(
             self.A_log,
-            {"weight_loader": sharded_weight_loader(2, tp_rank=self.tp_rank)},
+            {"weight_loader": sharded_weight_loader(2, tp_rank=self.kda_layer_rank)},
         )
 
         self.g_b_proj = ColumnParallelLinear(
@@ -375,8 +405,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             bias=False,
             quant_config=self.quant_config,
             prefix=f"{prefix}.g_b_proj",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            tp_rank=self.kda_layer_rank,
+            tp_size=self.kda_layer_tp,
         )
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
         self.o_proj = RowParallelLinear(
@@ -384,10 +414,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             self.hidden_size,
             bias=False,
             quant_config=self.quant_config,
-            reduce_results=not self.tp_over_pcp,
+            reduce_results=self.kda_parallel.token_layout == "tp",
             prefix=f"{prefix}.o_proj",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            tp_rank=self.kda_layer_rank,
+            tp_size=self.kda_layer_tp,
+            parallel_group=self.kda_parallel.group,
         )
 
         compilation_config = get_current_vllm_config().compilation_config
@@ -399,7 +430,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         def _a_log_weight_loader(param, loaded_weight):
             if loaded_weight.dim() == 1:
                 loaded_weight = loaded_weight.view([1, 1, -1, 1])
-            return sharded_weight_loader(2, tp_rank=self.tp_rank)(param, loaded_weight)
+            loader = sharded_weight_loader(2, tp_rank=self.kda_layer_rank)
+            return loader(param, loaded_weight)
 
         self.A_log.weight_loader = _a_log_weight_loader
 
@@ -538,6 +570,23 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        # With ``kda_layer_tp`` the KDA layers shard over several DP ranks, so
+        # each rank computes its own head slice for *every* request. Gather the
+        # rank-local tokens in rank order; the reduce_scatter at the end hands
+        # back the tokens this rank started with.
+        gather = self.tp_over_dp
+        num_local_tokens = hidden_states.size(0)
+        if gather:
+            # Ranks can hold different token counts on an eager step, and the
+            # collective needs equal shapes. Pad up to the group maximum; the
+            # extra rows still form one-token sequences, but they carry the
+            # null state block and their outputs are dropped on the way back.
+            max_tokens = self._group_max("tokens", num_local_tokens)
+            if max_tokens > num_local_tokens:
+                hidden_states = F.pad(
+                    hidden_states, (0, 0, 0, max_tokens - num_local_tokens)
+                )
+            hidden_states = self.kda_parallel.group.all_gather(hidden_states, 0)
         num_tokens = hidden_states.size(0)
         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
         projected = self.in_proj_qkvbfg_a(hidden_states)[0]
@@ -564,10 +613,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
         g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
 
-        core_attn_out = torch.empty(
-            (1, num_tokens, self.local_num_heads, self.head_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+        shape = (1, num_tokens, self.local_num_heads, self.head_dim)
+        # Zeroed, not empty, when the batch is shared: the recurrent kernel
+        # returns early on the null block, so a padded row that lands on block
+        # 0 is never written and would otherwise reach the projection as
+        # uninitialized memory.
+        alloc = torch.zeros if gather else torch.empty
+        core_attn_out = alloc(
+            shape, dtype=hidden_states.dtype, device=hidden_states.device
         )
         # Call the decorated eager break directly so host-side prefill branches
         # are not captured by PIECEWISE CUDA graphs.
@@ -579,7 +632,149 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
-        return self.o_proj(core_attn_out)[0]
+        core_attn_out = self.o_proj(core_attn_out)[0]
+        if gather:
+            # o_proj left an unreduced partial sum over the KDA group; complete
+            # it and hand each rank back the tokens it owns. The gather above
+            # is rank-ordered, so rank r's rows are exactly chunk r.
+            core_attn_out = self.kda_parallel.group.reduce_scatter(core_attn_out, 0)
+            if core_attn_out.size(0) > num_local_tokens:
+                core_attn_out = core_attn_out[:num_local_tokens]
+        return core_attn_out
+
+    def _group_max(self, key: str, value: int) -> int:
+        """Largest ``value`` across the KDA group, computed once per step.
+
+        Ranks run different numbers of tokens, but a collective that shares the
+        whole batch needs a shape every rank agrees on. The DP coordination
+        already publishes the per-rank token counts, so read the maximum from
+        there instead of running another collective; the result is cached on
+        the forward context, which all 34 KDA layers share.
+        """
+        cache = get_forward_context().additional_kwargs.setdefault("kda_group_max", {})
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
+        dp_metadata = get_forward_context().dp_metadata
+        kda_world_size = self.kda_parallel.group.world_size
+        if (
+            key == "tokens"
+            and dp_metadata is not None
+            and kda_world_size == dp_metadata.num_tokens_across_dp_cpu.numel()
+        ):
+            # The KDA group spans the whole DP group here, so the DP token
+            # counts ARE its counts -- read the maximum off the host copy the
+            # DP coordination already published instead of a new collective.
+            cached = int(dp_metadata.num_tokens_across_dp_cpu.max())
+        else:
+            t = torch.tensor([value], dtype=torch.int32)
+            torch.distributed.all_reduce(
+                t,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.kda_parallel.group.cpu_group,
+            )
+            cached = int(t[0])
+        cache[key] = cached
+        return cached
+
+    def _dp_decode_metadata(
+        self, meta: GDNAttentionMetadata, max_tokens: int
+    ) -> GDNAttentionMetadata:
+        """Expand rank-local metadata to describe the gathered batch.
+
+        The gathered token buffer is rank-major with a stride of ``max_tokens``,
+        so token row ``t`` on rank ``j`` lands at ``j * max_tokens + t``. The
+        decode kernels index requests by token row, so the request axis is laid
+        out the same way: every rank contributes exactly ``max_tokens`` request
+        slots, of which the leading ones are real. A slot past a rank's own
+        token count still gets its own one-token segment -- ``cu_seqlens``
+        cannot express a gap, and a zero-length segment would make the next
+        rank's segment span the hole -- but it carries that rank's null block
+        and its output is dropped when the row is scattered back.
+        """
+        cached = getattr(meta, "_kda_global_metadata", None)
+        if cached is not None:
+            return cached
+
+        assert meta.num_prefills == 0, (
+            "KDA across DP ranks supports decode batches only; "
+            "prefill token metadata is not globalised"
+        )
+        assert meta.num_spec_decodes == 0, (
+            "kda_layer_tp does not support speculative decoding yet"
+        )
+
+        group = self.kda_parallel.group
+        k = self.request_windows
+        device = meta.non_spec_state_indices_tensor.device
+        rows = max_tokens
+
+        def pad_rows(t: torch.Tensor, fill: int) -> torch.Tensor:
+            """Pad the request axis to ``rows`` with ``fill``."""
+            n = t.shape[0]
+            if n >= rows:
+                return t[:rows]
+            extra = t.new_full((rows - n,) + t.shape[1:], fill)
+            return torch.cat([t, extra], 0)
+
+        # Mamba block ids are per-rank: MUSA gives every rank its own pool, so
+        # each rank's rows shift into its own window of the combined slot
+        # space. A window is one whole local pool wide, null slot included, so
+        # each rank's padding lands on *its own* null block rather than racing
+        # with the next rank's real state.
+        blocks_per_rank = self.kv_cache[1].shape[0]
+        assert blocks_per_rank % k == 0, (
+            f"mamba state pool holds {blocks_per_rank} blocks, which does not "
+            f"split into {k} request windows (kda_layer_tp={self.kda_layer_tp}); "
+            "the pool was "
+            f"sized without kda_layer_tp"
+        )
+        blocks_per_rank //= k
+
+        local_state = meta.non_spec_state_indices_tensor
+        # One token per row is what makes the arange below valid. It holds for
+        # any decode batch: with no prefill and no spec rows every request
+        # schedules exactly one token (or none, for a graph-padded slot).
+        assert local_state.shape[0] <= rows, (
+            f"request axis ({local_state.shape[0]}) exceeds the gathered token "
+            f"stride ({rows}); a decode batch has at most one request per token"
+        )
+        state_indices = (
+            group.all_gather(pad_rows(local_state, 0).contiguous().to(torch.int32), 0)
+            + torch.arange(k, dtype=torch.int32, device=device).repeat_interleave(rows)
+            * blocks_per_rank
+        )
+
+        # Cumulative query lengths mirror the gathered buffer exactly: every
+        # row of it is a one-token sequence, real requests and padding slots
+        # alike, so the global ``cu_seqlens`` is just ``arange(k * rows + 1)``.
+        # Padding slots carry that rank's null block, which the recurrent
+        # kernel treats as "no state" and their outputs are dropped by the
+        # slice back to the local token count.
+        qsl = torch.arange(rows * k + 1, dtype=torch.int32, device=device)
+
+        global_meta = GDNAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=rows * k,
+            num_decode_tokens=rows * k,
+            num_spec_decodes=0,
+            num_spec_decode_tokens=0,
+            num_actual_tokens=rows * k,
+            has_initial_state=None,
+            spec_query_start_loc=None,
+            non_spec_query_start_loc=qsl,
+            spec_state_indices_tensor=None,
+            non_spec_state_indices_tensor=state_indices,
+            spec_sequence_masks=None,
+            spec_token_indx=None,
+            non_spec_token_indx=None,
+            num_accepted_tokens=None,
+            uniform_spec_sequence_length=None,
+        )
+        meta._kda_global_metadata = global_meta
+        return global_meta
 
     @eager_break_during_capture
     def _forward(
@@ -601,6 +796,17 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # Profile/warmup dummy runs may omit mamba-family metadata.
             return
         assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
+        if self.tp_over_dp:
+            # Every rank holds a head slice for *all* requests, so the kernels
+            # must see the whole gathered batch, not just this rank's slice.
+            # The object is shared by all KDA layers and rebuilt each step, so
+            # caching on it keeps this to one round of collectives per step.
+            max_tokens = self._group_max(
+                "tokens", attn_metadata_narrowed.num_actual_tokens
+            )
+            attn_metadata_narrowed = self._dp_decode_metadata(
+                attn_metadata_narrowed, max_tokens
+            )
         has_initial_state = attn_metadata_narrowed.has_initial_state
         non_spec_query_start_loc = attn_metadata_narrowed.non_spec_query_start_loc
         non_spec_state_indices_tensor = (

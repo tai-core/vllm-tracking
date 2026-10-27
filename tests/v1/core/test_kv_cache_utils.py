@@ -3590,6 +3590,62 @@ def test_auto_fit_max_model_len_with_hybrid():
     assert vllm_config.model_config.max_model_len == 1024
 
 
+@pytest.mark.parametrize("layout,windows", [("pcp", 1), ("dp", 8)])
+def test_auto_fit_max_model_len_reserves_dedicated_mamba_pool(
+    monkeypatch, tmp_path, layout, windows
+):
+    """Auto-fit must reserve the MUSA Mamba pool at its admission-bound size.
+
+    ``MambaSpec.max_memory_usage_bytes`` reports only the blocks one request
+    holds resident (2 in align mode), but the dedicated pool is sized on
+    ``max_num_seqs`` and does not shrink with ``max_model_len``. Counting the
+    Mamba layers through the shared-pool formula therefore credits attention
+    with memory it never receives, and auto-fit accepts a length whose requests
+    cannot be scheduled.
+    """
+    monkeypatch.setattr(
+        "vllm.v1.core.kv_cache_utils.musa_mamba_separate_pool_enabled",
+        lambda: True,
+    )
+    from transformers import OPTConfig
+    from vllm.utils.math_utils import cdiv
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(model=str(tmp_path), max_model_len=1024),
+        scheduler_config=SchedulerConfig(
+            max_model_len=1024, is_encoder_decoder=False, max_num_seqs=4
+        ),
+    )
+    vllm_config.parallel_config.kda_layer_tp = 8
+    vllm_config.parallel_config.prefill_context_parallel_size = (
+        8 if layout == "pcp" else 1
+    )
+    vllm_config.parallel_config.data_parallel_size = 8 if layout == "dp" else 1
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
+    groups = [
+        KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=new_kv_cache_spec()),
+        KVCacheGroupSpec(
+            layer_names=["mamba"],
+            kv_cache_spec=new_mamba_spec(mamba_cache_mode="align"),
+        ),
+    ]
+
+    needed = kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
+    mamba_bytes = kv_cache_utils._musa_mamba_pool_bytes(vllm_config, groups)
+    attn_only = kv_cache_utils._shared_pool_max_memory_usage_bytes(
+        vllm_config, groups[:1]
+    )
+    spec = groups[1].kv_cache_spec
+    per_request = cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
+    assert mamba_bytes == spec.page_size_bytes * (4 * per_request + 1) * windows
+    assert mamba_bytes > 0
+    assert needed == mamba_bytes + attn_only
+    # The dedicated pool covers max_num_seqs requests, not just the one the
+    # shared-pool formula charges.
+    assert mamba_bytes > groups[1].kv_cache_spec.max_memory_usage_bytes(vllm_config)
+
+
 def test_auto_fit_max_model_len_not_triggered():
     """Test that auto-fit is not triggered when original_max_model_len is not -1."""
     model_config = ModelConfig(max_model_len=16)
@@ -3894,6 +3950,65 @@ def test_unify_kv_cache_spec_page_size_mamba():
         "attn_layer": new_kv_cache_spec(),
     }
     assert kv_cache_utils.unify_kv_cache_spec_page_size(specs) == specs
+
+
+def test_unify_kv_cache_spec_page_size_leaves_mamba_alone_when_unpooled():
+    """A Mamba layer outside the attention pool keeps its own page size.
+
+    The dedicated Mamba pool gives each layer a block stride equal to its own
+    page, so padding it up to the attention page only wastes memory. With TP8
+    KDA sharding that padding is 45% of every state block.
+    """
+    mamba_spec = new_mamba_spec()  # page_size_bytes = 16384
+    attn_spec = new_kv_cache_spec(num_kv_heads=4)  # 32768
+
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {"mamba_layer": mamba_spec, "attn_layer": attn_spec}, pad_mamba=False
+    )
+    assert unified["mamba_layer"] == mamba_spec
+    assert unified["mamba_layer"].page_size_bytes == 16384
+    assert unified["mamba_layer"].page_size_padded is None
+    # Attention still unifies among itself as before.
+    assert unified["attn_layer"].page_size_bytes == 32768
+
+    # Default behaviour is unchanged: the Mamba page is padded to the maximum.
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {"mamba_layer": mamba_spec, "attn_layer": attn_spec}
+    )
+    assert unified["mamba_layer"].page_size_bytes == 32768
+    assert unified["mamba_layer"].page_size_padded == 32768
+
+
+def test_musa_dedicated_pool_skips_block_outermost_packing(monkeypatch):
+    """Packing would put Mamba pages inside the attention block.
+
+    Its block stride would then be the packed block rather than the state page,
+    which the dedicated pool cannot address. Reachable only once the Mamba page
+    stops being padded to a common size, so guard it explicitly.
+    """
+    monkeypatch.setattr(
+        "vllm.v1.core.kv_cache_utils.musa_mamba_separate_pool_enabled",
+        lambda: True,
+    )
+    config = SimpleNamespace(
+        kv_transfer_config=None,
+        speculative_config=None,
+        cache_config=SimpleNamespace(
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC,
+        ),
+    )
+    specs = {
+        "mamba_layer": new_mamba_spec(),
+        "attn_layer": new_kv_cache_spec(num_kv_heads=4),
+    }
+    assert kv_cache_utils._get_packed_kv_cache_groups(config, specs) is None
+
+    # Attention-only specs still pack: the guard is specific to Mamba state.
+    attn_only = {
+        "a": new_kv_cache_spec(),
+        "b": new_kv_cache_spec(num_kv_heads=4),
+    }
+    assert kv_cache_utils._get_packed_kv_cache_groups(config, attn_only) is not None
 
 
 def test_hma_not_disabled_when_kv_events_enabled():
@@ -4442,3 +4557,20 @@ def test_kv_cache_groups_tp_replicas(specs, tp_size, dcp_size, expected):
     """Replicas are the gcd of each layer's tp_size // max_tp_shards."""
     groups = [KVCacheGroupSpec([f"l.{i}"], spec) for i, spec in enumerate(specs)]
     assert kv_cache_groups_tp_replicas(groups, tp_size, dcp_size) == expected
+
+
+@pytest.mark.parametrize(
+    "kinds,expected",
+    [
+        (("attention", "mamba"), True),
+        (("mamba", "attention"), True),
+        (("attention", "attention"), False),
+        (("mamba", "mamba"), False),
+        ((), False),
+    ],
+)
+def test_hybrid_pool_detection_accepts_single_pass_specs(kinds, expected):
+    specs = (
+        new_mamba_spec() if kind == "mamba" else new_kv_cache_spec() for kind in kinds
+    )
+    assert kv_cache_utils._has_mamba_and_attention(specs) is expected

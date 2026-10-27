@@ -935,6 +935,18 @@ class Platform:
         if cache_config.mamba_page_size_padded is not None:
             cache_config.mamba_page_size_padded = shared_page
 
+    @staticmethod
+    def _mamba_owns_separate_pool(vllm_config: "VllmConfig") -> bool:
+        """Whether Mamba state will be allocated outside the attention pool.
+
+        The separate pool is decided from the resolved cache groups, which do
+        not exist yet here. This is only called for a hybrid model that has
+        Mamba state, so the platform and connector checks settle it alone.
+        """
+        from vllm.v1.core.kv_cache_utils import _musa_mamba_dedicated_pool
+
+        return _musa_mamba_dedicated_pool(vllm_config)
+
     @classmethod
     def _align_hybrid_block_size(
         cls,
@@ -1107,6 +1119,11 @@ class Platform:
         assert attn_page_size >= mamba_page_size
 
         if attn_page_size == mamba_page_size:
+            return
+
+        if cls._mamba_owns_separate_pool(vllm_config):
+            # Its block stride is its own page, so matching attention's page
+            # would only pad every state block for an alignment nothing reads.
             return
 
         if (

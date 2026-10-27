@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from vllm import PoolingParams, SamplingParams
+from vllm.config.kda_parallel import kda_tp_over_dp
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.utils.math_utils import cdiv
@@ -102,7 +103,10 @@ def _warmup_block_allocator(
 
     def alloc(group_id: int, num_blocks: int) -> list[int]:
         pool = shared
-        if dedicated and isinstance(groups[group_id].kv_cache_spec, MambaSpec):
+        spec = groups[group_id].kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = spec.first_spec
+        if dedicated and isinstance(spec, MambaSpec):
             pool = group_id
         start = next_block_ids[pool]
         next_block_ids[pool] = start + num_blocks
@@ -122,6 +126,10 @@ def run_mixed_prefill_decode_warmup(
 ) -> bool:
     """Run a V2 mixed prefill+decode step through normal scheduler inputs."""
     if model_runner.is_pooling_model or model_runner.max_num_reqs < 2 or num_tokens < 3:
+        return False
+    if kda_tp_over_dp(model_runner.vllm_config):
+        # KDA layers sharding across DP ranks only arm their gather on a pure
+        # decode batch; a mixed step would run them unsharded.
         return False
 
     decode_req_id = f"{req_id_prefix}_decode_"
@@ -282,9 +290,17 @@ def _warmup_kernels(
 
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
-    # Use decode_query_len + 1 tokens so the prefill batch's per-request query
-    # length exceeds decode_query_len, preventing it from being misclassified as
-    # a uniform decode batch.
+    # Cross-DP KDA gathers independent requests and builds one-token sequence
+    # metadata. The ordinary initial prefill would violate that contract even
+    # on a decode-only server: kv_consumer/FULL_DECODE_ONLY do not change this
+    # kernel warmup. Start from a synthetic cached prefix instead; keep the
+    # model's rejection of real DP prefill/speculative batches intact.
+    # PCP has a global sequence layout and must still warm its prefill path.
+    decode_only = kda_tp_over_dp(model_runner.vllm_config)
+    if decode_only and (num_spec_steps or decode_query_len != 1):
+        raise ValueError("KDA across DP ranks requires non-speculative decode warmup")
+    # Ordinary layouts execute the whole prompt as an unambiguous prefill.
+    # DP KDA uses the same prompt but schedules only its last token below.
     prompt_len = decode_query_len + 1
     prompt_token_ids = list(range(prompt_len))
     # Upper bound on the decode steps built in `decode_steps` below.
@@ -337,6 +353,21 @@ def _warmup_kernels(
             max(1, (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req),
         )
 
+    if decode_only:
+        # Each scheduler owns only one window of the gathered state pool.
+        # Using the full tensor's block count here could allocate another
+        # DP owner's slots; forward adds the owner-window offset separately.
+        allocatable = model_runner.kv_cache_config.musa_mamba_alloc_num_blocks
+        if allocatable is None:
+            raise ValueError("DP KDA decode warmup requires its dedicated state pool")
+        for spec, blocks in zip(kv_cache_specs, decode_block_counts):
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.first_spec
+            if isinstance(spec, MambaSpec) and blocks:
+                num_reqs = min(num_reqs, (allocatable - 1) // blocks)
+        if num_reqs < 1:
+            raise ValueError("No KDA state slots available for decode warmup")
+
     req_ids = [f"_warmup_{i}_" for i in range(num_reqs)]
 
     # SamplingParams exercising all sampling features.
@@ -359,7 +390,10 @@ def _warmup_kernels(
     if model_runner.kv_block_zeroer is not None:
         model_runner.kv_block_zeroer.warmup(model_runner.kv_cache_config.num_blocks)
 
-    # Step 1: Prefill all requests with 1 + decode_query_len prompt tokens each.
+    # DP KDA starts with a synthetic cached prefix and one decode token.
+    # allocate_kv_cache initializes both attention and state pools with zeros;
+    # DecodeBench may replace these with finite dummy KV before warmup.
+    # Other layouts still start with a prefill of the whole prompt.
     new_reqs = [
         NewRequestData.from_request(
             Request(
@@ -377,15 +411,21 @@ def _warmup_kernels(
         for i in range(num_reqs)
     ]
 
-    prefill_output = SchedulerOutput.make_empty()
-    prefill_output.num_spec_tokens_to_schedule = num_spec_steps
-    prefill_output.scheduled_new_reqs = new_reqs
-    prefill_output.num_scheduled_tokens = {rid: prompt_len for rid in req_ids}
-    prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
+    initial_query_len = prompt_len
+    if decode_only:
+        initial_query_len = 1
+        for req in new_reqs:
+            req.num_computed_tokens = prompt_len - initial_query_len
+
+    initial_output = SchedulerOutput.make_empty()
+    initial_output.num_spec_tokens_to_schedule = num_spec_steps
+    initial_output.scheduled_new_reqs = new_reqs
+    initial_output.num_scheduled_tokens = {rid: initial_query_len for rid in req_ids}
+    initial_output.total_num_scheduled_tokens = initial_query_len * num_reqs
 
     # Disable KV connector for warmup run.
     model_runner.kv_connector.set_disabled(True)
-    worker_execute_model(prefill_output)
+    worker_execute_model(initial_output)
 
     if not model_runner.is_pooling_model:
         # Warm up sampler and perform a decode step for non-pooling models.

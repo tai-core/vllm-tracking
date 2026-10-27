@@ -534,6 +534,7 @@ class EngineArgs:
     dcp_q_replicate: bool | None = ParallelConfig.dcp_q_replicate
     dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
     cp_kv_cache_interleave_size: int | None = None
+    kda_layer_tp: int | None = ParallelConfig.kda_layer_tp
     data_parallel_size: int = ParallelConfig.data_parallel_size
     data_parallel_rank: int | None = None
     data_parallel_start_rank: int | None = None
@@ -1199,6 +1200,17 @@ class EngineArgs:
                 **parallel_kwargs["cp_kv_cache_interleave_size"],
                 "default": None,
             },
+        )
+        parallel_group.add_argument(
+            "--kda-layer-tp",
+            type=int,
+            default=None,
+            help=(
+                "Tensor-parallel degree for the KDA (linear-attention) layers. "
+                "Defaults to the TP group, which replicates KDA weights on "
+                "every DP rank. Set to TP * PCP to shard across PCP, or TP * DP "
+                "to shard across DP (decode only). Only complete groups are supported."
+            ),
         )
         parallel_group.add_argument(
             "--prefill-context-parallel-size",
@@ -2578,6 +2590,7 @@ class EngineArgs:
                 if self.cp_kv_cache_interleave_size is not None
                 else ParallelConfig.cp_kv_cache_interleave_size
             ),
+            kda_layer_tp=self.kda_layer_tp,
             _allow_auto_resolve_cp_interleave_size=(
                 self.cp_kv_cache_interleave_size is None
             ),

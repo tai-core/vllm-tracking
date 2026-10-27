@@ -416,6 +416,15 @@ class ParallelConfig:
     in the group.
     """
 
+    kda_layer_tp: int | None = None
+    """Total tensor-parallel degree of KDA projections, heads and state.
+
+    None uses the ordinary TP group.
+    Set TP x PCP to shard KDA across PCP, or TP x DP to shard across DP.
+    Only complete groups are supported; expanding across both PCP and DP is
+    not implemented. Cross-DP KDA currently supports decode batches only.
+    """
+
     cp_kv_cache_interleave_size: int = 1
     """Interleave size of kv_cache storage while using DCP.
     Store interleave_size tokens on dcp_rank i, then store next
@@ -555,6 +564,11 @@ class ParallelConfig:
             raise ValueError(
                 "numa_bind_nodes and numa_bind_cpus require numa_bind=True."
             )
+
+        if self.kda_layer_tp is not None:
+            from vllm.config.kda_parallel import kda_layer_tp_axis
+
+            kda_layer_tp_axis(self)
 
         if self.enable_eplb:
             if not current_platform.is_cuda_alike() and not current_platform.is_xpu():

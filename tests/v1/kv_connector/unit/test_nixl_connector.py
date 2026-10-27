@@ -4216,20 +4216,26 @@ def test_transfer_mode_changes_compatibility_hash():
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize("mode", ["pull", "push"])
 @pytest.mark.parametrize(
-    "tp_size,pcp_size,dcp_size,transfer_tp_size,kda_mode",
+    "tp_size,pcp_size,dcp_size,transfer_tp_size,kda_sharded",
     [
-        (1, 1, 1, 1, "tp"),
-        (4, 1, 1, 4, "tp"),
-        (4, 1, 4, 4, "tp"),
-        (1, 4, 1, 1, "tp"),
-        (1, 4, 4, 4, "tp"),
-        (1, 8, 1, 8, "tp_pcp"),
-        (2, 4, 1, 8, "tp_pcp"),
-        (8, 1, 1, 8, "tp_pcp"),
+        (1, 1, 1, 1, False),
+        (4, 1, 1, 4, False),
+        (4, 1, 4, 4, False),
+        (1, 4, 1, 1, False),
+        (1, 4, 4, 4, False),
+        (1, 8, 1, 8, True),
+        (2, 4, 1, 8, True),
+        (8, 1, 1, 8, True),
     ],
 )
 def test_scheduler_advertises_transfer_topology(
-    mode, tp_size, pcp_size, dcp_size, transfer_tp_size, kda_mode, tmp_path
+    mode,
+    tp_size,
+    pcp_size,
+    dcp_size,
+    transfer_tp_size,
+    kda_sharded,
+    tmp_path,
 ):
     """The consumer must address every distinct producer KV shard."""
     from transformers import OPTConfig
@@ -4244,7 +4250,7 @@ def test_scheduler_advertises_transfer_topology(
     model_dir = tmp_path / "model"
     OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(model_dir)
     config = create_vllm_config(model=str(model_dir), kv_role="kv_producer")
-    config.additional_config = {"kda_parallel_mode": kda_mode}
+    config.parallel_config.kda_layer_tp = tp_size * pcp_size if kda_sharded else tp_size
     config.parallel_config.tensor_parallel_size = tp_size
     config.parallel_config.prefill_context_parallel_size = pcp_size
     config.parallel_config.decode_context_parallel_size = dcp_size

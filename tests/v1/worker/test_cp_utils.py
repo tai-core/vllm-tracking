@@ -14,6 +14,7 @@ def test_cp_checks_allow_a_replicated_draft_backend_without_dcp(monkeypatch):
 
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
+            kda_layer_tp=8,
             prefill_context_parallel_size=1,
             decode_context_parallel_size=4,
             cp_kv_cache_interleave_size=16,
@@ -85,12 +86,13 @@ def test_cp_backend_check_only_exempts_adapted_kda(monkeypatch, adapted):
 
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
+            kda_layer_tp=8,
             prefill_context_parallel_size=8,
             tensor_parallel_size=1,
             decode_context_parallel_size=1,
             cp_kv_cache_interleave_size=1,
         ),
-        additional_config={"kda_parallel_mode": "tp_pcp"},
+        additional_config={},
         speculative_config=None,
     )
     backend = SimpleNamespace(supports_pcp=lambda: False, get_name=lambda: "GDN_ATTN")

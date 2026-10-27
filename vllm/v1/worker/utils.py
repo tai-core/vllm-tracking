@@ -582,10 +582,14 @@ def allocate_kv_cache(
     # MUSA may use separate attention and Mamba pools. Each pool has its own
     # backing allocation; the default v0.30 layout continues to share one.
     separate_musa_pools = kv_cache_config.musa_mamba_num_blocks is not None
-    sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
-    if not separate_musa_pools:
-        assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
-    raw_size = max(sizes)
+    shared_tensors = [
+        tensor
+        for tensor in kv_cache_config.kv_cache_tensors
+        if not tensor.musa_mamba_pool
+    ]
+    sizes = {tensor.size for tensor in shared_tensors}
+    assert len(sizes) <= 1, "KV cache tensors must share one backing allocation."
+    raw_size = max(sizes) if sizes else 0
     # wvSplitKrc's process-lifetime static workspaces (csrc/rocm/skinny_gemms.cu)
     # are created lazily on the first qualifying GEMM. Force that now, before
     # the giant backing allocation below: if one landed in this segment's
@@ -601,16 +605,18 @@ def allocate_kv_cache(
     else:
         buf_size = raw_size
     shared_buf = (
-        None
-        if separate_musa_pools
-        else torch.zeros(buf_size, dtype=torch.int8, device=device)
+        torch.zeros(buf_size, dtype=torch.int8, device=device)
+        if shared_tensors
+        else None
     )
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
+        # Attention tensors alias the one shared pool; each Mamba group gets its
+        # own block-id space and therefore its own backing allocation.
         buf = (
             torch.zeros(tensor.size, dtype=torch.int8, device=device)
-            if separate_musa_pools
+            if separate_musa_pools and tensor.musa_mamba_pool
             else shared_buf
         )
         assert buf is not None

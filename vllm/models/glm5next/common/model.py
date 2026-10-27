@@ -9,7 +9,7 @@ from torch import nn
 from transformers import Glm5NextTextConfig
 
 from vllm.config import ParallelConfig, VllmConfig
-from vllm.config.kda_parallel import kda_tensor_parallel_size
+from vllm.config.kda_parallel import get_kda_layer_tp
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -1146,14 +1146,16 @@ class Glm5NextForCausalLM(
         cls, vllm_config: "VllmConfig"
     ) -> tuple[tuple[int, ...], ...]:
         hf_config = vllm_config.model_config.hf_text_config
-        tp_size = kda_tensor_parallel_size(vllm_config)
+        # ``kda_layer_tp`` widens this past the TP group in a pure-DP
+        # deployment, where the layers shard over the flattened DP x TP group.
+        kda_layer_tp = get_kda_layer_tp(vllm_config)
         num_spec = (
             vllm_config.speculative_config.num_speculative_tokens
             if vllm_config.speculative_config
             else 0
         )
         base_shapes = MambaStateShapeCalculator.kda_state_shape(
-            tp_size,
+            kda_layer_tp,
             hf_config.linear_num_heads,
             hf_config.linear_head_dim,
             conv_kernel_size=hf_config.linear_conv_kernel_dim,
@@ -1165,7 +1167,7 @@ class Glm5NextForCausalLM(
                 base_shapes,
                 hf_config.linear_num_heads,
                 hf_config.linear_head_dim,
-                tp_size,
+                kda_layer_tp,
                 1 + num_spec,
             )
         return base_shapes

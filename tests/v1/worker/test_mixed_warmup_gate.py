@@ -42,6 +42,7 @@ def test_mixed_warmup_disables_watermarking():
                 SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))
             ],
             num_blocks=128,
+            musa_mamba_num_blocks=None,
         ),
         vllm_config=SimpleNamespace(num_lookahead_tokens=0),
         max_model_len=128,
@@ -91,3 +92,55 @@ def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_
     assert runner.adaptive_verification is manager
     assert manager.cost_tables is None
     assert rejection_sampler.enable_adaptive_verification
+
+
+def test_dp_kda_warmup_starts_from_cached_prefix_and_only_decodes(monkeypatch):
+    import torch
+
+    from tests.v1.worker.test_gpu_warmup_blocks import (
+        _attention_group,
+        _make_runner,
+        _mamba_group,
+    )
+
+    mamba = _mamba_group("align")
+    # No speculative state is needed for DP KDA.
+    from dataclasses import replace
+
+    mamba.kv_cache_spec = replace(mamba.kv_cache_spec, num_speculative_blocks=0)
+    runner = _make_runner([_attention_group(), mamba], 0, num_spec_steps=0)
+    runner.vllm_config.parallel_config = SimpleNamespace(
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=1,
+        data_parallel_size=8,
+        decode_context_parallel_size=1,
+        kda_layer_tp=8,
+    )
+    runner.kv_cache_config.musa_mamba_num_blocks = 40
+    runner.kv_cache_config.musa_mamba_alloc_num_blocks = 5
+    outputs = []
+    disabled = []
+    runner.kv_connector.set_disabled = disabled.append
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    warmup._warmup_kernels(runner, outputs.append, lambda _: None)
+    assert disabled == [True, False]
+    active = [out for out in outputs if out.total_num_scheduled_tokens]
+    assert active
+    first = active[0]
+    assert first.scheduled_new_reqs
+    for req in first.scheduled_new_reqs:
+        assert req.num_computed_tokens == 1
+        assert len(req.prompt_token_ids) == 2
+        assert req.block_ids[1]
+        assert all(0 < block < 5 for block in req.block_ids[1])
+    for out in active:
+        assert set(out.num_scheduled_tokens.values()) == {1}
+    assert outputs[-1].finished_req_ids == {
+        req.req_id for req in first.scheduled_new_reqs
+    }
+    assert not warmup.run_mixed_prefill_decode_warmup(
+        runner,
+        _fail,
+        _fail,
+        num_tokens=32,
+    )

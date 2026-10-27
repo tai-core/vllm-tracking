@@ -26,6 +26,7 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.attention.backend import MultipleOf
+    from vllm.v1.pcp.layout import PCPPageLayout
 
 logger = init_logger(__name__)
 
@@ -162,11 +163,28 @@ class SparseCacheRole(str, Enum):
 
 
 @dataclass(frozen=True)
+class PCPCacheSpec:
+    """Page ownership capability declared by an attention/cache layer.
+
+    Equal nonempty ownership_group names require the same scheduler block IDs.
+    The name is opaque to the cache planner, not a model or layer-name pattern.
+    """
+
+    query_alignment: int = 1
+    ownership_group: str | None = None
+
+    def __post_init__(self):
+        if self.query_alignment <= 0:
+            raise ValueError("PCP query alignment must be positive")
+
+
+@dataclass(frozen=True)
 class KVCacheSpec:
     """A base class for specifying the KV cache format of one layer."""
 
     # number of tokens in a block
     block_size: int
+    pcp: PCPCacheSpec | None = field(default=None, kw_only=True)
     dcp_sharded: bool = field(default=False, kw_only=True)
     """Whether DCP shards this cache's token positions across ranks."""
 
@@ -640,6 +658,7 @@ class FullAttentionSpec(AttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            pcp=specs[0].pcp,
             block_stride_alignment=specs[0].block_stride_alignment,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
@@ -724,8 +743,10 @@ class MLAAttentionSpec(FullAttentionSpec):
             "quantization method, tokens per state, model version, cache role, "
             "index-sharing role, and block stride alignment."
         )
+        assert len({spec.pcp for spec in specs}) == 1
         merged_spec = cls(
             block_size=specs[0].block_size,
+            pcp=specs[0].pcp,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
@@ -1001,8 +1022,10 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             "quantization method, tokens per state, model version, sliding "
             "window size, retained token count, and replay policy."
         )
+        assert len({spec.pcp for spec in specs}) == 1
         return cls(
             block_size=specs[0].block_size,
+            pcp=specs[0].pcp,
             block_stride_alignment=block_stride_alignment_set.pop(),
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
@@ -1190,6 +1213,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            pcp=specs[0].pcp,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             head_size_v=specs[0].head_size_v,
@@ -1335,6 +1359,17 @@ def iter_layer_specs(kv_cache_spec: KVCacheSpec) -> Collection[KVCacheSpec]:
     return (kv_cache_spec,)
 
 
+def is_mamba_group(group: "KVCacheGroupSpec") -> bool:
+    """Whether a KV cache group holds Mamba layers.
+
+    Worker-side groups wrap their layers in ``UniformTypeKVCacheSpecs``, so the
+    group spec is not itself a ``MambaSpec``; look through the wrapper.
+    """
+    return any(
+        isinstance(spec, MambaSpec) for spec in iter_layer_specs(group.kv_cache_spec)
+    )
+
+
 def is_full_attention_spec(kv_cache_spec: KVCacheSpec) -> bool:
     """Whether a KV cache group spec is (or wraps) full attention.
 
@@ -1427,6 +1462,7 @@ class KVCacheTensor:
     block_stride: int
     offset: int = 0  # byte offset of layers[0]'s block 0
     host_resident: bool = False
+    musa_mamba_pool: bool = False  # MUSA: backs the separate mamba state pool
 
 
 class KVCacheGroupRole(str, Enum):
@@ -1473,7 +1509,30 @@ class KVCacheConfig:
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
     prefix_cache_retention_interval: int | None = None
+    # MUSA: block count of the separate mamba state pool when dedicated policy is selected.
+    musa_mamba_num_blocks: int | None = None
     """Resolved retention policy for local prefix-cache checkpoints."""
+    musa_mamba_alloc_num_blocks: int | None = None
+    """Blocks the scheduler may hand out from that pool.
+
+    When the KDA layers shard over several ranks (``kda_layer_tp``), each rank
+    holds the state of every request in that group and the tensor is sized for
+    one window per rank, while block ids stay window-local: the scheduler only
+    allocates within one window and the window offset is applied at forward
+    time. ``None`` means the whole pool is allocatable (one window).
+    """
+    musa_mamba_lease_start: int | None = None
+    """First block id this rank may allocate when ids are global.
+
+    Set only with ``kda_mamba_shared_pool`` and static leases: block 0 is the
+    pool-wide null block and each rank allocates
+    ``musa_mamba_alloc_num_blocks`` ids starting here. ``None`` with
+    ``musa_mamba_shared_ids`` set means admission leases, where the front-end
+    grants slots per request. The KDA forward pass applies no window offset in
+    either mode.
+    """
+    musa_mamba_shared_ids: bool = False
+    """Mamba state block ids are global across the KDA DP group."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
     hash_block_size: int | None = None
@@ -1491,6 +1550,12 @@ class KVCacheConfig:
 
     kv_tp_replicas: int = 1
     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
+
+    pcp_layout: PCPPageLayout | None = None
+    """Resolved page ownership/query geometry, shared by planner and worker."""
+
+    pcp_memory_budget_bytes: int | None = None
+    """Physical PCP cache plus page-workspace budget measured on this worker."""
 
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:
@@ -1556,6 +1621,14 @@ class KVCacheConfig:
     def num_blocks_of(self, tensor: KVCacheTensor) -> int:
         """Number of blocks addressable by the pool backing ``tensor``."""
         if not tensor.host_resident:
+            if self.musa_mamba_num_blocks is not None:
+                tensor_layers = set(tensor.layers)
+                if any(
+                    is_mamba_group(group)
+                    and tensor_layers.intersection(group.layer_names)
+                    for group in self.kv_cache_groups
+                ):
+                    return self.musa_mamba_num_blocks
             return self.num_blocks
         assert self.hisparse_host_num_blocks is not None
         return self.hisparse_host_num_blocks
