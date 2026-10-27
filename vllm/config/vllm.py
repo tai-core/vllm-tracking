@@ -71,6 +71,11 @@ else:
 
 logger = init_logger(__name__)
 
+# MUSA: these architectures default to Model Runner V1.
+MUSA_DEFAULT_MRV1_ARCHITECTURES = frozenset(
+    {"DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM", "GlmMoeDsaForCausalLM"}
+)
+
 DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
     {
         "DeepseekV32MTPModel",
@@ -721,6 +726,18 @@ class VllmConfig:
         if use_v2_model_runner is not None:
             return use_v2_model_runner
 
+        from vllm.platforms import current_platform
+
+        model_config = self.model_config
+        is_musa = getattr(current_platform, "is_musa", None)
+        if model_config is not None and callable(is_musa) and is_musa():
+            architectures = getattr(model_config, "architectures", ())
+            if any(arch in MUSA_DEFAULT_MRV1_ARCHITECTURES for arch in architectures):
+                logger.warning_once(
+                    "Defaulting to V1 model runner on MUSA for model architectures: %s",
+                    ", ".join(architectures),
+                )
+                return False
         if not HAS_TRITON:
             logger.warning_once(
                 "Model Runner V2 requires Triton; using the V1 model runner instead."
