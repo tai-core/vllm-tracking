@@ -938,6 +938,10 @@ def _supports_varlen_paged_mqa_logits() -> bool:
 
 
 def _supports_flattened_device_query_lens() -> bool:
+    if current_platform.is_musa():
+        # MUSA: the decode kernels read the per-token rows built from device
+        # metadata, so the flattened path accepts device-decided query lengths.
+        return True
     return (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(90)
@@ -1756,7 +1760,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                         meta_lens = seq_lens.squeeze(-1)
                     metadata = musa_deep_gemm.get_paged_mqa_logits_metadata(
                         meta_lens,
-                        self.kv_cache_spec.storage_block_size,
+                        self.kv_cache_spec.num_states,
                         self.num_sms,
                     )
                     schedule_metadata = self.scheduler_metadata_buffer[

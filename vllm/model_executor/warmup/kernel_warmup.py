@@ -169,9 +169,6 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     )
 
     if not worker.use_v2_model_runner:
-        # Pooling models do not use the generation slot-mapping path.
-        if not worker.model_runner.is_pooling_model:
-            warm_v1_block_table_kernels(worker.model_runner)
         # The KV-block zeroing kernel is driven by the scheduler's
         # `new_block_ids_to_zero`, so no dummy run ever reaches it.
         zeroer = getattr(worker.model_runner, "_kv_block_zeroer", None)
@@ -197,10 +194,6 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     # Run next so input-prep kernels JIT against pristine runner state.
     if worker.vllm_config.kernel_config.enable_jit_warmup:
         kimi_k3_triton_warmup(worker)
-        if not current_platform.is_musa():
-            fa4_cutedsl_warmup(worker)
-        else:
-            logger.info_once("Skipping CUDA-only FA4 CuTeDSL warmup on MUSA.")
         sparse_mla_warmup = globals().get("sparse_mla_triton_warmup")
         if sparse_mla_warmup is not None:
             sparse_mla_warmup(worker)
