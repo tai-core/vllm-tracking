@@ -3,7 +3,7 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
@@ -152,6 +152,7 @@ class SimpleCPUOffloadScheduler:
         lazy_offload: bool = False,
         disk_capacity_bytes: int = 0,
         use_page_cache: bool = False,
+        block_pool_factory: Callable[[int], BlockPool] | None = None,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -218,6 +219,11 @@ class SimpleCPUOffloadScheduler:
             hash_block_size=self.hash_block_size,
             allow_partial_hash_hits=not lazy_offload,
             num_prefill_lookahead=vllm_config.num_prefill_lookahead_tokens,
+            block_pool=(
+                block_pool_factory(self.num_cpu_blocks)
+                if block_pool_factory is not None
+                else None
+            ),
         )
         self.group_block_sizes = self.cpu_coordinator.group_block_sizes
         # FA group's own resolved block_size; divides scheduler_block_size (the

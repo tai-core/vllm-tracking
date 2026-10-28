@@ -369,6 +369,17 @@ class EngineCore:
             update_kv_cache_capacity(vllm_config, scheduler_kv_cache_config)
 
         vllm_config.validate_block_size()
+        transfer = vllm_config.kv_transfer_config
+        if transfer is not None:
+            children = (transfer.kv_connector_extra_config or {}).get("connectors", [])
+            if transfer.kv_connector == "SharedCPUOffloadConnector" or any(
+                c.get("kv_connector") == "SharedCPUOffloadConnector" for c in children
+            ):
+                from vllm.v1.shared_kv_offload.shared_adapter import (
+                    preflight_shared_pool,
+                )
+
+                preflight_shared_pool(vllm_config, scheduler_kv_cache_config)
 
         scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
             scheduler_kv_cache_config, vllm_config
