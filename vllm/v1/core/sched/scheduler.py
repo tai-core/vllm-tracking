@@ -216,11 +216,17 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        self._restore_ready_at: dict[str, float] = {}
         transfer_config = vllm_config.kv_transfer_config
         self.async_load_prefetch = bool(
             self.connector is not None
             and transfer_config is not None
             and transfer_config.enable_async_load_prefetch
+        )
+        self.async_load_batch_wait_s = (
+            transfer_config.async_load_batch_wait_ms / 1000
+            if transfer_config is not None
+            else 0.0
         )
 
         # Grammar compilation failures to finish as per-request errors in
@@ -791,6 +797,10 @@ class Scheduler(SchedulerInterface):
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
+            coalesce_restores = self._should_coalesce_async_restores(
+                min(token_budget, input_budget - draft_slots),
+                bool(num_scheduled_tokens),
+            )
             prefetch_scanned = 0
             while self.waiting or self.skipped_waiting:
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
@@ -814,6 +824,16 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if (
+                    coalesce_restores
+                    and request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                    and request_id in self.finished_recving_kv_req_ids
+                    and request_id not in self.failed_recving_kv_req_ids
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -2521,6 +2541,7 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        self._restore_ready_at.pop(request.request_id, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing
@@ -2854,6 +2875,35 @@ class Scheduler(SchedulerInterface):
             self._request_remaining_blocks(req) for req in self._inflight_prefills
         )
 
+    def _should_coalesce_async_restores(
+        self, token_budget: int, has_running_work: bool
+    ) -> bool:
+        """Collect a partial restored batch without blocking the scheduler thread."""
+        if self.async_load_batch_wait_s <= 0 or has_running_work or token_budget <= 0:
+            return False
+        ready_tokens = []
+        ready_times = []
+        pending = False
+        for request in self.skipped_waiting:
+            if request.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            req_id = request.request_id
+            if req_id not in self.finished_recving_kv_req_ids:
+                pending = True
+            elif req_id not in self.failed_recving_kv_req_ids:
+                ready_tokens.append(
+                    max(1, request.num_tokens - request.num_computed_tokens)
+                )
+                ready_times.append(self._restore_ready_at[req_id])
+        if not pending or not ready_tokens:
+            return False
+        # No further whole request would fit; do not hold a full batch.
+        if sum(ready_tokens) + min(ready_tokens) > token_budget or len(
+            ready_tokens
+        ) >= self.max_num_running_reqs - len(self.running):
+            return False
+        return time.monotonic() - min(ready_times) < self.async_load_batch_wait_s
+
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """
         KV Connector: update request state after async recv is finished.
@@ -2897,6 +2947,7 @@ class Scheduler(SchedulerInterface):
                 request.num_computed_tokens = request.num_tokens - 1
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
+        self._restore_ready_at.pop(request.request_id, None)
 
     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
         """
@@ -2955,6 +3006,7 @@ class Scheduler(SchedulerInterface):
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
+                self._restore_ready_at.setdefault(req_id, time.monotonic())
             else:
                 assert RequestStatus.is_finished(req.status)
                 self._free_blocks(self.requests[req_id])

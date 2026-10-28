@@ -76,6 +76,11 @@ class KVTransferConfig:
     submit them before forward. Connector submission must be non-blocking;
     completion still uses finished_recving. Disabled by default."""
 
+    async_load_batch_wait_ms: float = 0.0
+    """Maximum time to collect a batch of restored prefills while other restores
+    are in flight. A full batch, the last restore, and running work bypass the
+    wait. Zero disables coalescing."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -95,6 +100,8 @@ class KVTransferConfig:
         return hash_str
 
     def __post_init__(self) -> None:
+        if not 0 <= self.async_load_batch_wait_ms < float("inf"):
+            raise ValueError("async_load_batch_wait_ms must be finite and nonnegative")
         if self.engine_id is None:
             self.engine_id = str(uuid.uuid4())
 

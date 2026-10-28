@@ -6337,3 +6337,62 @@ def test_async_restore_admission_after_compute_capacity(
     assert second.status == (
         RequestStatus.WAITING_FOR_REMOTE_KVS if prefetch else RequestStatus.WAITING
     )
+
+
+@pytest.mark.parametrize("release", ["pending", "timeout", "full", "last", "running"])
+def test_restore_completion_aware_batching(restore_test_model, monkeypatch, release):
+    """Collect restores; release on timeout, capacity or final completion."""
+    scheduler = _create_restore_scheduler(
+        model=restore_test_model,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+    )
+    scheduler.async_load_batch_wait_s = 0.25
+    requests = create_requests(num_requests=3, num_tokens=32)
+    for request in requests:
+        scheduler.add_request(request)
+    out = scheduler.schedule()
+    ready = (
+        requests
+        if release == "last"
+        else requests[:2]
+        if release == "full"
+        else requests[:1]
+    )
+    now = [100.0]
+    monkeypatch.setattr("vllm.v1.core.sched.scheduler.time.monotonic", lambda: now[0])
+    scheduler.update_from_output(
+        out,
+        dataclasses.replace(
+            EMPTY_MODEL_RUNNER_OUTPUT,
+            kv_connector_output=KVConnectorOutput(
+                finished_recving={r.request_id for r in ready}
+            ),
+        ),
+    )
+    if release == "timeout":
+        now[0] += 0.251
+    if release == "running":
+        # Running work must never be held for remote data.
+        assert not scheduler._should_coalesce_async_restores(32, True)
+        return
+    out = scheduler.schedule()
+    if release == "pending":
+        assert out.total_num_scheduled_tokens == 0
+        assert ready[0].status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        # The next chunk becomes runnable after the remaining restore finishes.
+        scheduler.update_from_output(
+            out,
+            dataclasses.replace(
+                EMPTY_MODEL_RUNNER_OUTPUT,
+                kv_connector_output=KVConnectorOutput(
+                    finished_recving={r.request_id for r in requests[1:]}
+                ),
+            ),
+        )
+        out = scheduler.schedule()
+        assert out.total_num_scheduled_tokens == 32
+    else:
+        assert out.total_num_scheduled_tokens > 0
+        assert ready[0].status == RequestStatus.RUNNING
+        assert ready[0].request_id not in scheduler._restore_ready_at
