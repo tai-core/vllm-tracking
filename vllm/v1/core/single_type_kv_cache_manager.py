@@ -1396,6 +1396,9 @@ class MambaManager(SingleTypeKVCacheManager):
             # into a private cow_block; we record that block for connector
             # offload (see _pending_boundary_state_offloads).
             self._producer_partial_tail_reqs: dict[str, int] = {}
+            # Requests whose async restore allocated only prefix columns; the
+            # first compute may reuse the restored page as writable state.
+            self._deferred_restore_reqs: set[str] = set()
 
     @classmethod
     def find_longest_cache_hit(
@@ -1597,6 +1600,7 @@ class MambaManager(SingleTypeKVCacheManager):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        reuse_external_state: bool = False,
     ) -> int:
         assert isinstance(self.kv_cache_spec, MambaSpec)
         if (
@@ -1676,13 +1680,45 @@ class MambaManager(SingleTypeKVCacheManager):
                 ):
                     num_new_blocks += 1
 
+            req_blocks = self.req_to_blocks[request_id]
+            # Same-step restore: no blocks yet. Deferred restore: exactly the
+            # restored prefix columns, ending in the private restored page.
+            fresh_restore = (
+                not req_blocks
+                and request_id not in self.num_cached_block
+                and num_local_computed_tokens == 0
+            )
+            deferred_restore = (
+                request_id in self._deferred_restore_reqs
+                and len(req_blocks) == total_computed_tokens // self.block_size
+                and self.block_pool.is_block_writable(req_blocks[-1])
+            )
+            if (
+                reuse_external_state
+                and not self.enable_caching
+                and self.num_speculative_blocks == 0
+                and checkpoint_block == 0
+                and not has_partial_hit
+                and not new_computed_blocks
+                and total_computed_tokens > 0
+                and total_computed_tokens % self.block_size == 0
+                and num_tokens > total_computed_tokens
+                and (fresh_restore or deferred_restore)
+            ):
+                # The restored prefix page is also the writable state.
+                num_new_blocks -= 1
+
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
             )
             return num_new_blocks + num_evictable_computed_blocks
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+        self,
+        request_id: str,
+        num_tokens: int,
+        num_tokens_main_model: int,
+        reuse_external_state: bool = False,
     ) -> list[KVCacheBlock]:
         assert isinstance(self.kv_cache_spec, MambaSpec)
         if self.mamba_cache_mode != "align":
@@ -1712,11 +1748,36 @@ class MambaManager(SingleTypeKVCacheManager):
             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
             # over-allocated at last round.
             if num_required_blocks <= len(req_blocks) and not has_partial_hit:
+                if (
+                    reuse_external_state
+                    and request_id not in self._allocated_block_reqs
+                    and req_blocks
+                    and self.block_pool.is_block_writable(req_blocks[-1])
+                ):
+                    # Deferred restore: only the prefix columns exist so far.
+                    self._deferred_restore_reqs.add(request_id)
                 self._allocated_block_reqs.add(request_id)
                 return []
             else:
                 prev_block_len = len(req_blocks)
                 blocks_allocated = request_id in self._allocated_block_reqs
+                restored_state = (
+                    req_blocks[-1]
+                    if reuse_external_state
+                    and not self.enable_caching
+                    and self.num_speculative_blocks == 0
+                    and checkpoint_block == 0
+                    # Same-step restore, or the first compute after a
+                    # deferred restore that only allocated prefix columns.
+                    and (
+                        not blocks_allocated
+                        or request_id in self._deferred_restore_reqs
+                    )
+                    and not has_partial_hit
+                    and prev_block_len > 0
+                    and self.block_pool.is_block_writable(req_blocks[-1])
+                    else None
+                )
                 # Record the last state block
                 if blocks_allocated:
                     # We always save the running state at the last
@@ -1757,7 +1818,14 @@ class MambaManager(SingleTypeKVCacheManager):
                 if not blocks_allocated:
                     max_new_blocks += self.num_speculative_blocks
                 assert num_new_blocks <= max_new_blocks
-                new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                new_blocks = self.block_pool.get_new_blocks(
+                    num_new_blocks - int(restored_state is not None)
+                )
+                if restored_state is not None:
+                    # Keep the prefix column for H2D restoration until its normal
+                    # cleanup; both logical columns own a reference to this page.
+                    self.block_pool.touch([restored_state])
+                    new_blocks.append(restored_state)
                 returned_blocks = req_blocks[prev_block_len:]
                 if partial_hit is not None:
                     block_idx, source_block = partial_hit
@@ -1797,6 +1865,7 @@ class MambaManager(SingleTypeKVCacheManager):
                         returned_blocks = [cow_block] + returned_blocks
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
+                self._deferred_restore_reqs.discard(request_id)
                 self._partial_hit_reqs.pop(request_id, None)
                 returned_blocks.extend(new_blocks)
                 return returned_blocks
@@ -1815,6 +1884,7 @@ class MambaManager(SingleTypeKVCacheManager):
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
+            self._deferred_restore_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
             self._num_checkpoint_blocks.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)

@@ -281,6 +281,11 @@ class Scheduler(SchedulerInterface):
                 )
 
         # Create the KV cache manager.
+        self.requires_mamba_checkpoint_splits = (
+            self.cache_config.enable_prefix_caching
+            or self.connector is None
+            or self.connector.requires_mamba_checkpoint_splits
+        )
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
@@ -299,6 +304,10 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+            reuse_external_mamba_state=(
+                not self.requires_mamba_checkpoint_splits
+                and vllm_config.use_v2_model_runner
+            ),
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -325,11 +334,6 @@ class Scheduler(SchedulerInterface):
         self._skip_zero_block_ids: set[int] = set()
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
-        )
-        self.requires_mamba_checkpoint_splits = (
-            self.cache_config.enable_prefix_caching
-            or self.connector is None
-            or self.connector.requires_mamba_checkpoint_splits
         )
         self.mamba_has_prefill_checkpoint_blocks = (
             self.has_mamba_layers
@@ -2810,6 +2814,9 @@ class Scheduler(SchedulerInterface):
             num_local_computed_tokens=request.num_computed_tokens,
             num_tokens_main_model=full_num_tokens,
             apply_admission_cap=True,
+            reuse_external_mamba_state=(
+                self.kv_cache_manager.defers_external_mamba_state(request.request_id)
+            ),
         )
 
     def _inflight_prefill_reserved_blocks(self) -> int:
@@ -2832,6 +2839,7 @@ class Scheduler(SchedulerInterface):
         if request.request_id in self.failed_recving_kv_req_ids:
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
+            self.kv_cache_manager.forget_external_mamba_state(request.request_id)
             if request.num_computed_tokens:
                 # Cache any valid computed tokens.
                 self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)

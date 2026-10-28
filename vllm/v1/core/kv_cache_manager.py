@@ -132,6 +132,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
+        reuse_external_mamba_state: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -141,6 +142,16 @@ class KVCacheManager:
             max_in_flight_tokens = max_model_len
 
         self.enable_caching = enable_caching
+        # The caller opts in only when no connector retains prefix checkpoints.
+        self.reuse_external_mamba_state = (
+            reuse_external_mamba_state
+            and not enable_caching
+            and not use_eagle
+            and num_prefill_lookahead == 0
+        )
+        # Requests whose asynchronous restore will seed the first writable
+        # Mamba state from their private restored prefix page.
+        self._deferred_external_mamba_state: set[str] = set()
         self.enable_kv_cache_events = enable_kv_cache_events
         self.use_eagle = use_eagle
         self.log_stats = log_stats
@@ -458,6 +469,23 @@ class KVCacheManager:
             num_local_computed_tokens + num_external_computed_tokens,
             self.max_model_len,
         )
+        reuse_external_mamba_state = (
+            self.reuse_external_mamba_state
+            and total_computed_tokens > 0
+            and total_computed_tokens % self.coordinator.scheduler_block_size == 0
+            and num_lookahead_tokens == 0
+            and request.num_in_flight_tokens == 0
+            and (
+                # Restored and computed in the same step.
+                (num_external_computed_tokens > 0 and num_local_computed_tokens == 0)
+                # First compute after an asynchronous restore completed.
+                or (
+                    request.request_id in self._deferred_external_mamba_state
+                    and num_external_computed_tokens == 0
+                    and num_new_computed_tokens == 0
+                )
+            )
+        )
 
         watermark_blocks = 0
         # The watermark is applied to waiting/preempted requests only, and only
@@ -481,6 +509,7 @@ class KVCacheManager:
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
+                reuse_external_mamba_state=reuse_external_mamba_state,
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
@@ -515,6 +544,7 @@ class KVCacheManager:
             + num_external_computed_tokens,
             num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
+            reuse_external_mamba_state=reuse_external_mamba_state,
         )
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
@@ -543,7 +573,14 @@ class KVCacheManager:
             num_tokens_need_slot,
             num_tokens_main_model,
             num_encoder_tokens,
+            reuse_external_mamba_state=reuse_external_mamba_state,
         )
+
+        if reuse_external_mamba_state and delay_cache_blocks:
+            # The restored page becomes the writable state at the first compute.
+            self._deferred_external_mamba_state.add(request.request_id)
+        else:
+            self._deferred_external_mamba_state.discard(request.request_id)
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -571,7 +608,16 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        self._deferred_external_mamba_state.discard(request.request_id)
         self.coordinator.free(request.request_id)
+
+    def defers_external_mamba_state(self, request_id: str) -> bool:
+        """Whether an async restore will reuse its page as writable state."""
+        return request_id in self._deferred_external_mamba_state
+
+    def forget_external_mamba_state(self, request_id: str) -> None:
+        """Stop reusing a restored state page, e.g. after a failed load."""
+        self._deferred_external_mamba_state.discard(request_id)
 
     def remove_skipped_blocks(
         self,

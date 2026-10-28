@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -172,6 +173,7 @@ class KVCacheCoordinator(ABC):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        reuse_external_mamba_state: bool = False,
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -194,6 +196,8 @@ class KVCacheCoordinator(ABC):
                 per-request admission cap (SWA / chunked-local). Set only by
                 the full-sequence admission gate; per-step allocation must
                 leave it False so the predictor matches `allocate_new_blocks`.
+            reuse_external_mamba_state: Reuse a private restored prefix page
+                for the first writable Mamba state when prefix storage is disabled.
 
         Returns:
             The number of blocks to allocate.
@@ -221,6 +225,12 @@ class KVCacheCoordinator(ABC):
                     num_local_computed_tokens,
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
+                    **(
+                        {"reuse_external_state": True}
+                        if reuse_external_mamba_state
+                        and isinstance(manager, MambaManager)
+                        else {}
+                    ),
                 )
         return num_blocks_to_allocate
 
@@ -276,6 +286,7 @@ class KVCacheCoordinator(ABC):
         num_tokens: int,
         num_tokens_main_model: int,
         num_encoder_tokens: int = 0,
+        reuse_external_mamba_state: bool = False,
     ) -> tuple[list[KVCacheBlock], ...]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -290,6 +301,8 @@ class KVCacheCoordinator(ABC):
                 with spec decode, it is num_tokens - num_lookahead_tokens.
             num_encoder_tokens: The number of encoder tokens for allocating
                 blocks for cross-attention.
+            reuse_external_mamba_state: Whether the first compute after a restore
+                may reuse its private Mamba prefix page as writable state.
 
         Returns:
             The new allocated blocks.
@@ -301,6 +314,11 @@ class KVCacheCoordinator(ABC):
                 if isinstance(manager, CrossAttentionManager)
                 else num_tokens,
                 num_tokens_main_model,
+                **(
+                    {"reuse_external_state": True}
+                    if reuse_external_mamba_state and isinstance(manager, MambaManager)
+                    else {}
+                ),
             )
             for manager in self.single_type_managers
         )

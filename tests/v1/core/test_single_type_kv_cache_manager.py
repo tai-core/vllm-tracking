@@ -271,7 +271,9 @@ def test_external_computed_blocks_do_not_corrupt_free_pool():
     assert len(manager.req_to_blocks[request_id]) == 3
 
 
-def _external_mamba_cache_manager(block_size, num_blocks):
+def _external_mamba_cache_manager(
+    block_size, num_blocks, *, reuse_external_mamba_state=False
+):
     register_all_kvcache_specs(None)
     attention = MLAAttentionSpec(
         block_size=block_size,
@@ -310,6 +312,7 @@ def _external_mamba_cache_manager(block_size, num_blocks):
         hash_block_size=block_size,
         enable_caching=False,
         pcp_world_size=8,
+        reuse_external_mamba_state=reuse_external_mamba_state,
     )
 
 
@@ -320,6 +323,205 @@ def _external_request(identity, total_tokens):
         sampling_params=SamplingParams(max_tokens=1),
         pooling_params=None,
     )
+
+
+@pytest.mark.parametrize("reuse,required,capacity", [(False, 18, 19), (True, 14, 24)])
+def test_sync_external_mamba_reuse_increases_capacity(reuse, required, capacity):
+    """Private restored states need one physical page, with two owned references."""
+    manager = _external_mamba_cache_manager(1024, 345, reuse_external_mamba_state=reuse)
+    requests = [_external_request(str(i), 9102) for i in range(capacity)]
+    for request in requests:
+        before = manager.block_pool.get_num_free_blocks()
+        assert (
+            manager.allocate_slots(
+                request,
+                910,
+                num_external_computed_tokens=8192,
+                full_sequence_must_fit=True,
+            )
+            is not None
+        )
+        assert before - manager.block_pool.get_num_free_blocks() == required
+        for state in manager.coordinator.single_type_managers[2:]:
+            blocks = state.req_to_blocks[request.request_id]
+            assert (blocks[7] is blocks[8]) is reuse
+            assert blocks[8].ref_cnt == (2 if reuse else 1)
+    free_before = manager.block_pool.get_num_free_blocks()
+    assert (
+        manager.allocate_slots(
+            _external_request("overflow", 9102),
+            910,
+            num_external_computed_tokens=8192,
+            full_sequence_must_fit=True,
+        )
+        is None
+    )
+    assert manager.block_pool.get_num_free_blocks() == free_before
+    for request in requests:
+        manager.free(request)
+    assert manager.block_pool.get_num_free_blocks() == 344
+
+
+@pytest.mark.parametrize("finish_after_first", [False, True])
+def test_sync_external_mamba_reuse_next_chunk_and_free(finish_after_first):
+    manager = _external_mamba_cache_manager(1024, 345, reuse_external_mamba_state=True)
+    request = _external_request("reuse", 12000)
+    assert (
+        manager.allocate_slots(request, 1024, num_external_computed_tokens=8192)
+        is not None
+    )
+    states = manager.coordinator.single_type_managers[2:]
+    restored = [state.req_to_blocks[request.request_id][7] for state in states]
+    assert all(block.ref_cnt == 2 for block in restored)
+    if not finish_after_first:
+        # The processed boundary, not optimistic in-flight tokens, owns cleanup.
+        request.num_computed_tokens = 9216
+        request.num_in_flight_tokens = 1024
+        manager.remove_skipped_blocks(request.request_id, 8192)
+        assert all(block.ref_cnt == 2 for block in restored)
+        request.num_in_flight_tokens = 0
+        assert manager.allocate_slots(request, 1024) is not None
+        for state, block in zip(states, restored):
+            slots = state.req_to_blocks[request.request_id]
+            assert slots[7].is_null and slots[8] is block
+            assert block.ref_cnt == 1
+            assert slots[9] is not block and slots[9].ref_cnt == 1
+        request.num_computed_tokens = 10240
+        manager.remove_skipped_blocks(request.request_id, 10240)
+        assert all(block.ref_cnt == 0 for block in restored)
+        assert manager.allocate_slots(request, 1024) is not None
+    manager.free(request)
+    assert manager.block_pool.get_num_free_blocks() == 344
+
+
+@pytest.mark.parametrize("inflight,lookahead", [(1, 0), (0, 1)])
+def test_external_mamba_reuse_excludes_unsafe_admissions(inflight, lookahead):
+    manager = _external_mamba_cache_manager(1024, 345, reuse_external_mamba_state=True)
+    request = _external_request("separate", 9102)
+    request.num_in_flight_tokens = inflight
+    assert (
+        manager.allocate_slots(
+            request,
+            910,
+            num_external_computed_tokens=8192,
+            num_lookahead_tokens=lookahead,
+        )
+        is not None
+    )
+    assert not manager.defers_external_mamba_state(request.request_id)
+    for state in manager.coordinator.single_type_managers[2:]:
+        blocks = state.req_to_blocks[request.request_id]
+        assert blocks[7] is not blocks[8]
+    manager.free(request)
+    assert manager.block_pool.get_num_free_blocks() == 344
+
+
+@pytest.mark.parametrize("reason", ["shared", "hashed", "apc"])
+def test_external_mamba_reuse_does_not_alias_nonprivate_state(reason):
+    cache = _external_mamba_cache_manager(1024, 345)
+    manager = cache.coordinator.single_type_managers[2]
+    manager.add_local_computed_blocks("hit", [], 0, 8192)
+    manager.allocate_external_computed_blocks("hit", 0, 8192)
+    restored = manager.req_to_blocks["hit"][7]
+    if reason == "shared":
+        manager.block_pool.touch([restored])
+    elif reason == "hashed":
+        restored.set_block_hash(make_block_hash_with_group_id(BlockHash(b"test"), 2))
+    else:
+        manager.enable_caching = True
+    new = manager.allocate_new_blocks("hit", 9102, 9102, reuse_external_state=True)
+    assert len(new) == 1 and new[0] is not restored
+
+
+@pytest.mark.parametrize("reuse,required,capacity", [(False, 18, 19), (True, 14, 24)])
+def test_async_external_mamba_reuse_matches_sync_capacity(reuse, required, capacity):
+    """Async admission reserves, then reuses, the same single restored page."""
+    manager = _external_mamba_cache_manager(1024, 345, reuse_external_mamba_state=reuse)
+    requests = [_external_request(str(i), 9102) for i in range(capacity)]
+    for request in requests:
+        before = manager.block_pool.get_num_free_blocks()
+        assert (
+            manager.allocate_slots(
+                request,
+                0,
+                num_external_computed_tokens=8192,
+                delay_cache_blocks=True,
+                full_sequence_must_fit=True,
+            )
+            is not None
+        )
+        assert manager.defers_external_mamba_state(request.request_id) is reuse
+        request.num_computed_tokens = 8192
+        assert manager.allocate_slots(request, 910) is not None
+        assert not manager.defers_external_mamba_state(request.request_id)
+        assert before - manager.block_pool.get_num_free_blocks() == required
+        for state in manager.coordinator.single_type_managers[2:]:
+            blocks = state.req_to_blocks[request.request_id]
+            assert (blocks[7] is blocks[8]) is reuse
+            assert blocks[8].ref_cnt == (2 if reuse else 1)
+    for request in requests:
+        manager.free(request)
+    assert manager.block_pool.get_num_free_blocks() == 344
+
+
+@pytest.mark.parametrize("block_size,num_blocks", [(1024, 345), (8192, 48)])
+def test_async_external_mamba_reuse_spans_multiple_compute_blocks(
+    block_size, num_blocks
+):
+    """A first compute crossing several blocks still aliases the restored page."""
+    manager = _external_mamba_cache_manager(
+        block_size, num_blocks, reuse_external_mamba_state=True
+    )
+    request = _external_request("long", 32767)
+    assert manager.allocate_slots(
+        request,
+        0,
+        num_external_computed_tokens=8192,
+        delay_cache_blocks=True,
+        full_sequence_must_fit=True,
+    )
+    request.num_computed_tokens = 8192
+    assert manager.allocate_slots(request, 8192, full_sequence_must_fit=True)
+    source = 8192 // block_size - 1
+    current = 16384 // block_size - 1
+    for state in manager.coordinator.single_type_managers[2:]:
+        slots = state.req_to_blocks[request.request_id]
+        assert slots[source] is slots[current] and slots[current].ref_cnt == 2
+    manager.free(request)
+    assert manager.block_pool.get_num_free_blocks() == num_blocks - 1
+
+
+def test_async_external_mamba_reuse_next_chunk_and_failed_load():
+    manager = _external_mamba_cache_manager(1024, 345, reuse_external_mamba_state=True)
+    request = _external_request("async", 12000)
+    manager.allocate_slots(
+        request, 0, num_external_computed_tokens=8192, delay_cache_blocks=True
+    )
+    request.num_computed_tokens = 8192
+    assert manager.allocate_slots(request, 1024) is not None
+    states = manager.coordinator.single_type_managers[2:]
+    restored = [state.req_to_blocks[request.request_id][7] for state in states]
+    assert all(block.ref_cnt == 2 for block in restored)
+    request.num_computed_tokens = 9216
+    assert manager.allocate_slots(request, 1024) is not None
+    for state, block in zip(states, restored):
+        slots = state.req_to_blocks[request.request_id]
+        assert slots[7].is_null and slots[8] is block and block.ref_cnt == 1
+    manager.free(request)
+    assert manager.block_pool.get_num_free_blocks() == 344
+
+    failed = _external_request("failed", 9102)
+    manager.allocate_slots(
+        failed, 0, num_external_computed_tokens=8192, delay_cache_blocks=True
+    )
+    manager.forget_external_mamba_state(failed.request_id)
+    failed.num_computed_tokens = 8192
+    assert manager.allocate_slots(failed, 910) is not None
+    for state in states:
+        slots = state.req_to_blocks[failed.request_id]
+        assert slots[7] is not slots[8]
+    manager.free(failed)
+    assert manager.block_pool.get_num_free_blocks() == 344
 
 
 def test_sync_external_mamba_admission_rejects_fourth_old_layout_request():
@@ -373,11 +575,12 @@ def test_sync_external_mamba_admission_rejects_one_block_short_before_mutation(
     assert pool.get_num_free_blocks() == free_before
 
 
+@pytest.mark.parametrize("reuse", [False, True])
 @pytest.mark.parametrize("prefix,total", [(0, 13), (8, 8), (8, 9), (8, 13)])
 @pytest.mark.parametrize("checkpoint", [0, 1])
 @pytest.mark.parametrize("speculative", [0, 2])
 def test_mamba_external_estimate_matches_checkpoint_and_running_allocations(
-    prefix, total, checkpoint, speculative
+    prefix, total, checkpoint, speculative, reuse
 ):
     pool = BlockPool(32, False, 4)
     manager = MambaManager(
@@ -395,14 +598,23 @@ def test_mamba_external_estimate_matches_checkpoint_and_running_allocations(
         scheduler_block_size=4,
     )
     admission = manager.get_num_blocks_to_allocate(
-        "hit", total, [], prefix, 0, total, apply_admission_cap=True
+        "hit",
+        total,
+        [],
+        prefix,
+        0,
+        total,
+        apply_admission_cap=True,
+        reuse_external_state=reuse,
     )
-    predicted = manager.get_num_blocks_to_allocate("hit", total, [], prefix, 0, total)
+    predicted = manager.get_num_blocks_to_allocate(
+        "hit", total, [], prefix, 0, total, reuse_external_state=reuse
+    )
     free_before = pool.get_num_free_blocks()
     if prefix:
         manager.add_local_computed_blocks("hit", [], 0, prefix)
         manager.allocate_external_computed_blocks("hit", 0, prefix)
-    manager.allocate_new_blocks("hit", total, total)
+    manager.allocate_new_blocks("hit", total, total, reuse_external_state=reuse)
     assert admission == predicted == free_before - pool.get_num_free_blocks()
 
 
