@@ -71,6 +71,11 @@ class KVTransferConfig:
     'recompute': reschedule the request to recompute failed blocks
     'fail': immediately fail the request with an error finish reason (default)"""
 
+    enable_async_load_prefetch: bool = False
+    """Admit queued asynchronous restores after the compute batch fills and
+    submit them before forward. Connector submission must be non-blocking;
+    completion still uses finished_recving. Disabled by default."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

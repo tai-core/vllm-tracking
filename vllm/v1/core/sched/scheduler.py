@@ -216,6 +216,12 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        transfer_config = vllm_config.kv_transfer_config
+        self.async_load_prefetch = bool(
+            self.connector is not None
+            and transfer_config is not None
+            and transfer_config.enable_async_load_prefetch
+        )
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -785,14 +791,23 @@ class Scheduler(SchedulerInterface):
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                if input_budget <= draft_slots:
-                    break
+            prefetch_scanned = 0
+            while self.waiting or self.skipped_waiting:
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
-                if num_running >= self.max_num_running_reqs:
-                    break
+                prefetch_only = (
+                    token_budget <= 0
+                    or input_budget <= draft_slots
+                    or num_running >= self.max_num_running_reqs
+                )
+                if prefetch_only:
+                    if (
+                        not self.async_load_prefetch
+                        or prefetch_scanned >= self.max_num_running_reqs
+                    ):
+                        break
+                    prefetch_scanned += 1
 
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
@@ -951,6 +966,19 @@ class Scheduler(SchedulerInterface):
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
+
+                if (prefetch_only and not load_kv_async) or (
+                    load_kv_async
+                    and self.async_load_prefetch
+                    and sum(
+                        r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                        for r in self._inflight_prefills
+                    )
+                    >= self.max_num_running_reqs
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.

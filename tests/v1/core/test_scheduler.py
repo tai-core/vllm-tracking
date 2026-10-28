@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
     DraftTokenIds,
     ECConnectorOutput,
     KVConnectorOutput,
@@ -6276,3 +6277,63 @@ def test_encoder_input_skipped_when_connector_already_has_the_item(ec_role: str)
 
     assert output.num_scheduled_tokens[req_id] > 0
     assert not output.scheduled_encoder_inputs.get(req_id)
+
+
+@pytest.fixture(scope="module")
+def restore_test_model(tmp_path_factory):
+    # Only model geometry is needed; avoid network access in scheduler tests.
+    from transformers import OPTConfig
+
+    path = tmp_path_factory.mktemp("restore-opt")
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(path)
+    return str(path)
+
+
+def _create_restore_scheduler(**kwargs):
+    from tests.v1.kv_connector.unit.utils import (
+        create_scheduler as make_scheduler,
+    )
+    from tests.v1.kv_connector.unit.utils import (
+        create_vllm_config,
+    )
+
+    config = create_vllm_config(
+        **kwargs,
+        kv_connector="MockKVConnector",
+        kv_connector_extra_config={"matched_tokens": 16, "is_async": True},
+    )
+    return make_scheduler(config)
+
+
+@pytest.mark.parametrize("prefetch", [False, True])
+@pytest.mark.parametrize("capacity", ["tokens", "sequences"])
+def test_async_restore_admission_after_compute_capacity(
+    restore_test_model, prefetch, capacity
+):
+    """Restore-only admission must not depend on compute token/sequence capacity."""
+    scheduler = _create_restore_scheduler(
+        model=restore_test_model,
+        max_num_seqs=1 if capacity == "sequences" else 4,
+        max_num_batched_tokens=32,
+    )
+    scheduler.async_load_prefetch = prefetch
+    first, second = create_requests(num_requests=2, num_tokens=32)
+    scheduler.add_request(first)
+    out = scheduler.schedule()
+    scheduler.update_from_output(
+        out,
+        dataclasses.replace(
+            EMPTY_MODEL_RUNNER_OUTPUT,
+            kv_connector_output=KVConnectorOutput(finished_recving={first.request_id}),
+        ),
+    )
+    scheduler.add_request(second)
+    # First consumes all tokens, or the only compute slot. Neither should
+    # prevent second's restore from being submitted with this forward.
+    if capacity == "tokens":
+        scheduler.max_num_scheduled_tokens = 16
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {first.request_id: 16}
+    assert second.status == (
+        RequestStatus.WAITING_FOR_REMOTE_KVS if prefetch else RequestStatus.WAITING
+    )

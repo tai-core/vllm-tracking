@@ -180,3 +180,17 @@ def test_early_load_wait_failure_propagates(monkeypatch: pytest.MonkeyPatch):
 
     with pytest.raises(RuntimeError, match="load failed"):
         connector.wait_for_pre_state_load()
+
+
+def test_prefetch_submits_before_forward_and_next_chunk_starts_once(monkeypatch):
+    """An async restore must overlap forward and bind once per chunk."""
+    events = []
+    connector = _make_connector(monkeypatch, events)
+    connector.vllm_config.kv_transfer_config.enable_async_load_prefetch = True
+    for _ in range(2):
+        events.clear()
+        output = _scheduler_output(False)
+        connector.pre_forward(output)
+        events.append("forward")
+        connector.post_forward(set())
+        assert events == ["handle", "bind", "start", "forward", "wait", "clear"]

@@ -88,8 +88,12 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.handle_preemptions(kv_connector_metadata)
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
 
-        if scheduler_output.has_sync_kv_loads:
-            # Sync loads need to run before this step's forward.
+        if (
+            scheduler_output.has_sync_kv_loads
+            or self.vllm_config.kv_transfer_config.enable_async_load_prefetch
+        ):
+            # Async destinations are private and unavailable to forward until
+            # finished_recving. Submitting here overlaps them with this batch.
             self._start_load_kv()
         else:
             # Start any async loads in post-forward instead, keeping

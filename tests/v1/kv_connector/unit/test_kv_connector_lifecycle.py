@@ -3,6 +3,8 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from vllm.distributed.kv_transfer.kv_connector.v1.example_connector import (  # noqa: E501
     ExampleConnectorMetadata,
 )
@@ -75,3 +77,28 @@ def test_kv_connector_mixin_clears_metadata():
     finally:
         # Ensure we clean up the global connector between tests
         ensure_kv_transfer_shutdown()
+
+
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_mixin_async_prefetch_submit_phase(monkeypatch, prefetch):
+    """Both runner paths must honor the Core prefetch option without waiting."""
+    from types import SimpleNamespace
+
+    import vllm.v1.worker.kv_connector_model_runner_mixin as runner
+    from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+
+    events = []
+    connector = MagicMock(spec=KVConnectorBase)
+    connector._vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(enable_async_load_prefetch=prefetch)
+    )
+    connector.start_load_kv.side_effect = lambda _: events.append("submit")
+    connector.get_finished.return_value = (set(), set())
+    connector.get_block_ids_with_load_errors.return_value = set()
+    monkeypatch.setattr(runner, "get_kv_transfer_group", lambda: connector)
+    monkeypatch.setattr(runner, "get_forward_context", lambda: None)
+    output = _make_empty_scheduler_output()
+    with runner.KVConnectorModelRunnerMixin._get_kv_connector_output(output):
+        events.append("forward")
+    assert events == (["submit", "forward"] if prefetch else ["forward", "submit"])
+    connector.wait_for_layer_load.assert_not_called()
