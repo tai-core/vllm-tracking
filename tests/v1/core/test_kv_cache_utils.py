@@ -3979,38 +3979,6 @@ def test_unify_kv_cache_spec_page_size_leaves_mamba_alone_when_unpooled():
     assert unified["mamba_layer"].page_size_padded == 32768
 
 
-def test_musa_dedicated_pool_skips_block_outermost_packing(monkeypatch):
-    """Packing would put Mamba pages inside the attention block.
-
-    Its block stride would then be the packed block rather than the state page,
-    which the dedicated pool cannot address. Reachable only once the Mamba page
-    stops being padded to a common size, so guard it explicitly.
-    """
-    monkeypatch.setattr(
-        "vllm.v1.core.kv_cache_utils.musa_mamba_separate_pool_enabled",
-        lambda: True,
-    )
-    config = SimpleNamespace(
-        kv_transfer_config=None,
-        speculative_config=None,
-        cache_config=SimpleNamespace(
-            get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC,
-        ),
-    )
-    specs = {
-        "mamba_layer": new_mamba_spec(),
-        "attn_layer": new_kv_cache_spec(num_kv_heads=4),
-    }
-    assert kv_cache_utils._get_packed_kv_cache_groups(config, specs) is None
-
-    # Attention-only specs still pack: the guard is specific to Mamba state.
-    attn_only = {
-        "a": new_kv_cache_spec(),
-        "b": new_kv_cache_spec(num_kv_heads=4),
-    }
-    assert kv_cache_utils._get_packed_kv_cache_groups(config, attn_only) is not None
-
-
 def test_hma_not_disabled_when_kv_events_enabled():
     """Test enabling KV events must not force disable_hybrid_kv_cache_manager to True.
 

@@ -26,6 +26,7 @@ from vllm.compilation.cudagraph_pool import (
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.kda_parallel import kda_tp_over_dp
 from vllm.distributed.parallel_state import (
     get_pp_group,
     graph_capture,
@@ -344,8 +345,14 @@ class CudaGraphManager:
                         descs_by_mode[decode_mode].append(ubatch_desc)
 
             # recoverSSM cannot capture a dummy query wider than its workspace.
+            # KDA sharded over DP ranks only gathers decode batches, which is
+            # the same restriction: a dummy wider than a decode step spreads
+            # several tokens over one request and is read as a prefill.
             if mixed_mode and (
-                not self.vllm_config.cache_config.use_kda_recoverssm
+                not (
+                    self.vllm_config.cache_config.use_kda_recoverssm
+                    or kda_tp_over_dp(self.vllm_config)
+                )
                 or num_tokens <= max_decode_tokens
             ):
                 # for PIECEWISE graphs there is no limit on requests when replaying
