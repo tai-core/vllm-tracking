@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -19,7 +21,10 @@ from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
-from vllm.model_executor.layers.fused_moe.utils import _resize_cache
+from vllm.model_executor.layers.fused_moe.utils import (
+    _resize_cache,
+    count_expert_num_tokens,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
     per_token_group_quant_fp8_packed_for_deepgemm,
@@ -48,6 +53,107 @@ from vllm.utils.deep_gemm import (
 from vllm.utils.import_utils import has_deep_gemm
 
 logger = init_logger(__name__)
+
+# MUSA: run the grouped expert GEMM through MATE's per-expert mubin kernel
+# ("RaggedPSumLayout") instead of the per-token one ("Ragged"). Both consume the
+# same alignment-padded contiguous layout; the per-expert kernel is given the
+# padded per-expert token counts and can therefore use a 256-row M tile per
+# expert (a single pass over that expert's weights) instead of a 128-row tile
+# (two passes). On for every prefill-shaped batch by default; set
+# VLLM_MUSA_MOE_GEMM_PER_EXPERT=0 to fall back to the per-token kernel.
+# See docs/DEEPGEMM-PREFILL-OPT.md for the measurements.
+_MUSA_PER_EXPERT_ENV = "VLLM_MUSA_MOE_GEMM_PER_EXPERT"
+_MUSA_PER_EXPERT_MIN_TILE_M = 256
+_musa_per_expert_logged = False
+_musa_per_expert_disabled = False
+
+
+_MUSA_PROF_ENV = "VLLM_MUSA_MOE_PROFILE"
+_musa_prof = {"n": 0, "apply_ms": 0.0, "mm1_ms": 0.0, "mm2_ms": 0.0, "rows": 0}
+_musa_prof_pending: list = []
+
+
+def _musa_prof_enabled() -> bool:
+    return os.environ.get(_MUSA_PROF_ENV, "0") == "1"
+
+
+def _musa_prof_record(evs: list, rows: int) -> None:
+    """Accumulate one apply()'s CUDA-event timings; log every 512 calls."""
+    _musa_prof_pending.append((evs, rows))
+    if len(_musa_prof_pending) < 64:
+        return
+    torch.musa.synchronize()
+    for ev, n_rows in _musa_prof_pending:
+        _musa_prof["apply_ms"] += ev[0].elapsed_time(ev[5])
+        _musa_prof["mm1_ms"] += ev[1].elapsed_time(ev[2])
+        _musa_prof["mm2_ms"] += ev[3].elapsed_time(ev[4])
+        _musa_prof["rows"] += n_rows
+        _musa_prof["n"] += 1
+    _musa_prof_pending.clear()
+    n = _musa_prof["n"]
+    if n and n % 512 < 64:
+        logger.info(
+            "MUSA MoE apply profile: n=%d rows=%d apply=%.3fms mm1=%.3fms mm2=%.3fms "
+            "(gemm %.1f%% of apply)",
+            n,
+            _musa_prof["rows"] // n,
+            _musa_prof["apply_ms"] / n,
+            _musa_prof["mm1_ms"] / n,
+            _musa_prof["mm2_ms"] / n,
+            100.0 * (_musa_prof["mm1_ms"] + _musa_prof["mm2_ms"]) / max(1e-9, _musa_prof["apply_ms"]),
+        )
+
+
+def _musa_per_expert_counts(
+    expert_tokens_meta: mk.ExpertTokensMetadata | None,
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    local_num_experts: int,
+    M_sum: int,
+    alignment: int,
+) -> torch.Tensor | None:
+    """Padded per-expert token counts for MATE's per-expert grouped GEMM, or None.
+
+    Returns ``None`` (i.e. keeps the fused per-token path) when the switch is off,
+    when the layout does not add up, or when the batch is too small for a 256-row
+    M tile to pay off (decode-sized epochs).
+    """
+    global _musa_per_expert_logged, _musa_per_expert_disabled
+    if os.environ.get(_MUSA_PER_EXPERT_ENV, "1") == "0" or _musa_per_expert_disabled:
+        return None
+    if local_num_experts <= 0 or M_sum // local_num_experts < _MUSA_PER_EXPERT_MIN_TILE_M:
+        return None
+    counts = None
+    if expert_tokens_meta is not None:
+        counts = expert_tokens_meta.expert_num_tokens
+    if counts is None:
+        counts = count_expert_num_tokens(topk_ids, local_num_experts, expert_map)
+    if counts.ndim != 1 or counts.numel() != local_num_experts:
+        return None
+    padded = (counts + (alignment - 1)) // alignment * alignment
+    if not _musa_per_expert_logged:
+        # One-shot validation only: a per-call host sync here costs ~15% on the
+        # GEMM itself (it drains the stream in front of every layer).
+        _musa_per_expert_logged = True
+        padded_sum = int(padded.sum().item())
+        if padded_sum != M_sum:
+            logger.warning(
+                "MUSA per-expert grouped GEMM disabled: padded expert rows %d != M_sum %d",
+                padded_sum,
+                M_sum,
+            )
+            _musa_per_expert_disabled = True
+            return None
+        logger.info(
+            "MUSA per-expert grouped GEMM enabled: experts=%d M_sum=%d alignment=%d "
+            "counts[min=%d max=%d]",
+            local_num_experts,
+            M_sum,
+            alignment,
+            int(counts.min().item()),
+            int(counts.max().item()),
+        )
+    return padded
 
 
 def _fp8_workspace_shape(
@@ -338,6 +444,12 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         assert self.w1_scale is not None
         assert self.w2_scale is not None
 
+        _prof = _musa_prof_enabled()
+        _ev = []
+        if _prof:
+            _ev = [torch.musa.Event(enable_timing=True) for _ in range(6)]
+            _ev[0].record()
+
         a1q = hidden_states
         _, N, K = w1.size()
 
@@ -397,14 +509,43 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         if use_psum_layout:
             gemm_kwargs["use_psum_layout"] = True
 
+        # MUSA prefill: hand the (padded) per-expert token counts to MATE so the
+        # grouped GEMM can run one 256-row M tile — and therefore one pass over
+        # the expert weights — per expert.
+        if not use_psum_layout and not self.mxfp8 and current_platform.is_musa():
+            musa_counts = _musa_per_expert_counts(
+                expert_tokens_meta,
+                topk_ids,
+                expert_map,
+                local_num_experts,
+                M_sum,
+                get_mk_alignment_for_contiguous_layout()[0],
+            )
+            if musa_counts is not None:
+                gemm_kwargs["expert_counts"] = musa_counts
+
         # Cap DG's BLOCK_M heuristic at the workspace's per-expert alignment;
         # otherwise the scheduler can pick the wrong expert id from m_indices
         # under cudagraph replay.
+        if os.environ.get("VLLM_MUSA_CONTRACT_LOG", "0") == "1" and not globals().get(
+            "_contract_apply", False
+        ):
+            globals()["_contract_apply"] = True
+            logger.info(
+                "MUSA_CONTRACT_APPLY a1q=%s topk_ids=%s topk_w=%s output=%s M_sum=%d",
+                tuple(a1q.shape),
+                tuple(topk_ids.shape),
+                tuple(topk_weights.shape),
+                tuple(output.shape),
+                M_sum,
+            )
         with mk_alignment_scope(align_used):
             mm1_out = _resize_cache(workspace2, (M_sum, N))
             # MUSA mate ragged_moe_gemm_8bit asserts scale tensors are contiguous.
             a1q_scale = a1q_scale.contiguous()
             w1_scale = self.w1_scale.contiguous()
+            if _prof:
+                _ev[1].record()
             m_grouped_fp8_gemm_nt_contiguous(
                 (a1q, a1q_scale),
                 (w1, w1_scale),
@@ -412,6 +553,8 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                 grouped_layout,
                 **gemm_kwargs,
             )
+            if _prof:
+                _ev[2].record()
 
             activation_out_dim = self.adjust_N_for_activation(N, activation)
             quant_out = _resize_cache(
@@ -429,6 +572,8 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             # MUSA mate ragged_moe_gemm_8bit asserts scale tensors are contiguous.
             a2q_scale = a2q_scale.contiguous()
             w2_scale = self.w2_scale.contiguous()
+            if _prof:
+                _ev[3].record()
             m_grouped_fp8_gemm_nt_contiguous(
                 (a2q, a2q_scale),
                 (w2, w2_scale),
@@ -436,6 +581,8 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                 grouped_layout,
                 **gemm_kwargs,
             )
+            if _prof:
+                _ev[4].record()
 
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)
@@ -448,6 +595,9 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             expert_map=expert_map,
             output=output,
         )
+        if _prof:
+            _ev[5].record()
+            _musa_prof_record(_ev, M_sum)
 
 
 class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
