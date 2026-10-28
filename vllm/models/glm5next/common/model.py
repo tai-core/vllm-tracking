@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Iterable
 from typing import ClassVar, Literal
 
@@ -318,6 +319,112 @@ class Glm5NextMoE(nn.Module):
             swiglu_limit=swiglu_limit,
         )
 
+        # ---- MUSA MegaMoE (opt-in) -------------------------------------
+        # MATE's fp8_fp8_mega_moe fuses dispatch + both expert GEMMs + SwiGLU
+        # + combine into one kernel and consumes this checkpoint's 128x128
+        # block-FP8 weights directly.
+        self.musa_mega_moe = None
+        if os.environ.get("VLLM_MUSA_MEGA_MOE", "0") == "1":
+            # Aliased: a local ``get_ep_group`` binding would shadow the
+            # module-level import used elsewhere in this __init__.
+            from vllm.config import get_current_vllm_config
+            from vllm.distributed import get_ep_group as _get_ep_group
+            from vllm.models.glm5next.musa.mega_moe import MusaMegaMoEExperts
+
+            # The workspace holds ``ranks x tokens_per_rank`` activation rows,
+            # so size it from the per-rank token count: prefill context
+            # parallelism already split the batch across ranks.
+            _vllm_config = get_current_vllm_config()
+            _sched = _vllm_config.scheduler_config
+            _pcp = getattr(
+                _vllm_config.parallel_config, "prefill_context_parallel_size", 1
+            ) or 1
+            # Size the workspace from the per-rank token count.  At runtime
+            # prefill context parallelism hands each rank about 1/pcp of the
+            # batch; the startup warmup feeds the whole max_num_batched_tokens
+            # batch and the adapter chunks it locally.
+            # (Under PCP the MoE input is not split by vLLM itself -- see issue
+            # #54732 -- so the chunking in the adapter is what keeps the kernel
+            # call within the workspace.)
+            _max_tokens_per_rank = max(
+                1, int(_sched.max_num_batched_tokens) // int(_pcp)
+            )
+            # The shared-expert MLP is built with reduce_results=False because
+            # MoERunner fuses its partial sum with the routed MoE's and reduces
+            # once.  MegaMoE replaces the runner and already returns a fully
+            # reduced routed result, so the shared branch has to reduce itself --
+            # otherwise only 1/tp of the shared contribution is added.
+            if self.shared_experts is not None:
+                self.shared_experts.down_proj.reduce_results = True
+            self.musa_mega_moe = MusaMegaMoEExperts(
+                num_experts=config.n_routed_experts,
+                num_max_tokens_per_rank=_max_tokens_per_rank,
+                top_k=config.num_experts_per_tok,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                ep_group=_get_ep_group().device_group,
+                tp_world=int(getattr(_vllm_config.parallel_config, "tensor_parallel_size", 1)),
+                activation_clamp=swiglu_limit,
+            )
+            self._musa_mega_moe_tensors = None
+            self._mega_top_k = config.num_experts_per_tok
+            self._mega_scoring_func = config.scoring_func
+            self._mega_renormalize = config.norm_topk_prob
+
+    def _mega_moe_weights(self):
+        """Locate this rank's 3-D block-FP8 expert tensors in the MoE runner."""
+        if self._musa_mega_moe_tensors is None:
+            wanted = (
+                "w13_weight",
+                "w13_weight_scale_inv",
+                "w2_weight",
+                "w2_weight_scale_inv",
+            )
+            found = {}
+            candidates = []
+            for name, param in self.experts.named_parameters():
+                if any(key in name for key in ("w13", "w2", "expert")):
+                    candidates.append((name, tuple(param.shape)))
+                for key in wanted:
+                    if name.endswith(key) and param.dim() == 3 and key not in found:
+                        found[key] = param
+            missing = [k for k in wanted if k not in found]
+            if missing:
+                raise RuntimeError(
+                    "MUSA MegaMoE could not find 3-D expert tensors "
+                    f"{missing}. Candidates (name, shape): {candidates}"
+                )
+            self._musa_mega_moe_tensors = found
+        return self._musa_mega_moe_tensors
+
+    def _forward_musa_mega_moe(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+            fused_topk_bias,
+        )
+
+        router_logits, _ = self.gate(hidden_states)
+        bias = self.gate.e_score_correction_bias
+        topk_weights, topk_ids = fused_topk_bias(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            scoring_func=self._mega_scoring_func,
+            e_score_correction_bias=bias.data if bias is not None else None,
+            topk=self._mega_top_k,
+            renormalize=self._mega_renormalize,
+            indices_type=torch.int64,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
+        if not self.musa_mega_moe.is_ready:
+            tensors = self._mega_moe_weights()
+            self.musa_mega_moe.build(
+                tensors["w13_weight"],
+                tensors["w13_weight_scale_inv"],
+                tensors["w2_weight"],
+                tensors["w2_weight_scale_inv"],
+            )
+        y_mega = self.musa_mega_moe(hidden_states, topk_weights, topk_ids)
+        return y_mega
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -333,9 +440,18 @@ class Glm5NextMoE(nn.Module):
         # MoERunner holds the gate (passed to FusedMoEFactory) and computes
         # the router logits itself, so nothing is precomputed here (matches
         # DeepseekV2MoE; `router_logits` is a placeholder).
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=hidden_states
-        )
+        if self.musa_mega_moe is not None:
+            final_hidden_states = self._forward_musa_mega_moe(hidden_states)
+            if self.shared_experts is not None:
+                # MegaMoE covers the ROUTED experts only; MoERunner would have
+                # added the shared-expert MLP, so do it here.
+                final_hidden_states = final_hidden_states + self.shared_experts(
+                    hidden_states
+                )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=hidden_states
+            )
 
         if self.is_sequence_parallel and not already_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
