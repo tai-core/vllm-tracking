@@ -51,11 +51,11 @@ def test_align_state_resume_index_does_not_depend_on_local_prefix_cache(
 
 
 @pytest.mark.parametrize(
-    ("dummy_run", "num_tokens", "wait_fails"),
-    [(False, 1, False), (False, 1, True), (False, 0, False), (True, 1, False)],
+    ("dummy_run", "num_tokens"),
+    [(False, 1), (False, 0), (True, 1)],
 )
-def test_execute_model_waits_for_restore_before_recurrent_state_read(
-    monkeypatch, dummy_run, num_tokens, wait_fails
+def test_execute_model_prepares_recurrent_state_before_forward(
+    monkeypatch, dummy_run, num_tokens
 ):
     events = []
 
@@ -67,21 +67,12 @@ def test_execute_model_waits_for_restore_before_recurrent_state_read(
             raise BoundaryReached("dummy dispatch")
         return SimpleNamespace(num_tokens=num_tokens), None
 
-    def wait_for_load():
-        events.append("wait_load")
-        if wait_fails:
-            raise RuntimeError("restore failed")
-
     def read_state(*args):
         events.append("read_state")
         raise BoundaryReached("state read")
 
     empty_output = object()
-    connector = SimpleNamespace(
-        start_pre_state_load=lambda output: events.append("submit_load"),
-        wait_for_pre_state_load=wait_for_load,
-        no_forward=Mock(return_value=empty_output),
-    )
+    connector = SimpleNamespace(no_forward=Mock(return_value=empty_output))
     runner = SimpleNamespace(
         update_pp_decode_requests=Mock(),
         finish_requests=Mock(),
@@ -117,27 +108,21 @@ def test_execute_model_waits_for_restore_before_recurrent_state_read(
 
     if num_tokens == 0:
         assert GPUModelRunner.execute_model(runner, output) is empty_output
-        assert events == ["table_writes", "submit_load"]
+        assert events == ["table_writes"]
         connector.no_forward.assert_called_once_with(output)
     elif dummy_run:
         with pytest.raises(BoundaryReached, match="dummy dispatch"):
             GPUModelRunner.execute_model(runner, output, dummy_run=True)
         assert events == []
     else:
-        error, message = (
-            (RuntimeError, "restore failed")
-            if wait_fails
-            else (BoundaryReached, "state read")
-        )
-        with pytest.raises(error, match=message):
+        with pytest.raises(BoundaryReached, match="state read"):
             GPUModelRunner.execute_model(runner, output)
         assert events == [
             "table_writes",
-            "submit_load",
             "prepare_inputs",
             "prepare_attn",
-            "wait_load",
-        ] + ([] if wait_fails else ["read_state"])
+            "read_state",
+        ]
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):

@@ -58,7 +58,6 @@ class MockConnector(KVConnectorBase_V1):
     def __new__(cls, *args, **kwargs):
         # mock all KVConnectorBase_V1 functions
         mock = MagicMock(spec_set=KVConnectorBase_V1)
-        mock.requires_pre_state_load = False
         mock.supports_divergent_local_hybrid_hits = (
             cls._supports_divergent_local_hybrid_hits
         )
@@ -102,7 +101,6 @@ class MockHMAConnector(KVConnectorBase_V1, SupportsHMA):
 
     def __new__(cls, *args, **kwargs):
         mock = MagicMock(spec_set=cls)
-        mock.requires_pre_state_load = False
         mock.supports_divergent_local_hybrid_hits = (
             cls._supports_divergent_local_hybrid_hits
         )
@@ -177,29 +175,6 @@ def mc() -> MultiConnector:
     )
 
     return mc
-
-
-@pytest.mark.parametrize(
-    "requires_early", [(False, False), (True, False), (False, True)]
-)
-def test_pre_state_load_wait_only_reaches_opted_in_children(requires_early):
-    mc = MultiConnector.__new__(MultiConnector)
-    mc._connectors = [MagicMock(spec_set=KVConnectorBase_V1) for _ in requires_early]
-    for connector, required in zip(mc._connectors, requires_early):
-        connector.requires_pre_state_load = required
-
-    assert mc.requires_pre_state_load is any(requires_early)
-    mc.wait_for_pre_state_load()
-
-    for connector, required in zip(mc._connectors, requires_early):
-        assert connector.wait_for_pre_state_load.call_count == int(required)
-
-
-def test_base_pre_state_load_is_opt_in_and_requires_wait_implementation():
-    mc = MultiConnector.__new__(MultiConnector)
-    assert not KVConnectorBase_V1.requires_pre_state_load.fget(mc)
-    with pytest.raises(NotImplementedError):
-        KVConnectorBase_V1.wait_for_pre_state_load(mc)
 
 
 @pytest.mark.parametrize("children", [(False, False), (True, False), (False, True)])

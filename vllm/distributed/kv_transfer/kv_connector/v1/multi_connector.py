@@ -210,10 +210,6 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
     @property
-    def requires_pre_state_load(self) -> bool:
-        return any(c.requires_pre_state_load for c in self._connectors)
-
-    @property
     def requires_mamba_checkpoint_splits(self) -> bool:
         return any(c.requires_mamba_checkpoint_splits for c in self._connectors)
 
@@ -294,11 +290,6 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         for c in self._connectors:
             c.start_load_kv(forward_context, **kwargs)
-
-    def wait_for_pre_state_load(self) -> None:
-        for c in self._connectors:
-            if c.requires_pre_state_load:
-                c.wait_for_pre_state_load()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         for c in self._connectors:

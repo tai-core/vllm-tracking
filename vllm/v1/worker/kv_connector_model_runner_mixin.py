@@ -83,9 +83,11 @@ class KVConnectorModelRunnerMixin:
         # zeroing. Sync loads feed this step's forward so must precede it;
         # otherwise start (async) loads after the forward launch, keeping
         # their host-side submission cost off the critical path.
+        kv_transfer_config = kv_connector._vllm_config.kv_transfer_config
+        assert kv_transfer_config is not None
         start_after_forward = not (
             scheduler_output.has_sync_kv_loads
-            or kv_connector._vllm_config.kv_transfer_config.enable_async_load_prefetch
+            or kv_transfer_config.enable_async_load_prefetch
         )
         if not start_after_forward:
             kv_connector.start_load_kv(get_forward_context())

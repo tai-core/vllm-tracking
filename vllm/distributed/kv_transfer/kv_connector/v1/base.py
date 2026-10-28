@@ -183,18 +183,6 @@ class KVConnectorBase_V1(ABC):
         return False
 
     @property
-    def requires_pre_state_load(self) -> bool:
-        """Whether current-step loads need ordering before cache state is read.
-
-        Opting in allows ``start_load_kv`` before input preparation, with
-        scheduler metadata bound and no attention metadata in the forward
-        context. ``wait_for_pre_state_load`` must make the restored state
-        readable before recurrent-state preprocessing, for example by adding
-        a dependency to the consuming device stream.
-        """
-        return False
-
-    @property
     def requires_mamba_checkpoint_splits(self) -> bool:
         """Whether prefill must stop to materialize reusable Mamba states.
 
@@ -324,16 +312,6 @@ class KVConnectorBase_V1(ABC):
 
         """
         pass
-
-    def wait_for_pre_state_load(self) -> None:
-        """Order early loads before recurrent cache state is read.
-
-        Required only for connectors opting into ``requires_pre_state_load``.
-        The implementation may enqueue a device-stream wait without blocking
-        the host for transfer completion. Submission failures must raise before
-        the model uses the restored state.
-        """
-        raise NotImplementedError
 
     @abstractmethod
     def wait_for_layer_load(self, layer_name: str) -> None:
