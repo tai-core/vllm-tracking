@@ -11,11 +11,17 @@ import json
 import mmap
 import time
 from pathlib import Path
+from typing import cast
 
 import torch
 
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, make_block_hash_with_group_id
+from vllm.v1.core.kv_cache_utils import (
+    BlockHashWithGroupId,
+    KVCacheBlock,
+    make_block_hash_with_group_id,
+    resolve_block_hashes,
+)
 from vllm.v1.shared_kv_offload.shared_pool import PoolClient
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
@@ -67,9 +73,10 @@ class SharedBlockPool(BlockPool):
         self.enable_caching = True
         self.metrics_collector = None
         self.medium = "CPU"
-        self.blocks = {0: KVCacheBlock(0, pool=self, is_null=True)}
+        # BlockPool methods used here only index blocks by ID.
+        self.blocks = {0: KVCacheBlock(0, pool=self, is_null=True)}  # type: ignore[assignment]
         self.null_block = self.blocks[0]
-        self.cached_block_hash_to_block = _HashView()
+        self.cached_block_hash_to_block = _HashView()  # type: ignore[assignment]
         self.cached_block_hashes_by_block = {}
         self.kv_event_queue = []
         self.enable_kv_cache_events = False
@@ -91,7 +98,7 @@ class SharedBlockPool(BlockPool):
             return self.blocks[slot]
         b = KVCacheBlock(slot, pool=self)
         if primary is not None:
-            b.set_block_hash(bytes.fromhex(primary), tokens)
+            b.set_block_hash(BlockHashWithGroupId(bytes.fromhex(primary)), tokens)
         self.blocks[slot] = b
         self._refs[slot] = {
             "generation": generation,
@@ -102,14 +109,19 @@ class SharedBlockPool(BlockPool):
         return b
 
     @contextlib.contextmanager
-    def lookup_scope(self, keys, acquire):
-        view = self.cached_block_hash_to_block.rows
+    def lookup_scope(self, keys, acquire, *, rows=None):
+        view = cast(_HashView, self.cached_block_hash_to_block).rows
         assert not view
         leased = []
         try:
-            rows = self.client.call(
-                "acquire" if acquire else "lookup", [k.hex() for k in keys]
-            )
+            if rows is None:
+                rows = (
+                    self.client.call(
+                        "acquire" if acquire else "lookup", [k.hex() for k in keys]
+                    )
+                    if keys
+                    else []
+                )
             seen = set()
             for key, slot, generation, primary, tokens in rows:
                 if acquire:
@@ -132,22 +144,22 @@ class SharedBlockPool(BlockPool):
     @contextlib.contextmanager
     def admission(self, keys, limit):
         assert self._credits is None
+        view = cast(_HashView, self.cached_block_hash_to_block).rows
+        assert not view
         self._credits = []
         try:
-            with self.lookup_scope(keys, False):
-                missing = sum(
-                    k not in self.cached_block_hash_to_block.rows for k in keys
-                )
-                refs = (
-                    self.client.call("reserve", min(missing, limit)) if missing else []
-                )
-                for slot, generation in refs:
+            if keys:
+                result = self.client.call("admit", [k.hex() for k in keys], limit)
+                for key, slot, *_ in result["rows"]:
+                    view[bytes.fromhex(key)] = KVCacheBlock(slot)
+                for slot, generation in result["reserved"]:
                     b = self._from_row(slot, generation)
                     b.ref_cnt = 1
                     self._refs[slot]["leases"] = 1
                     self._credits.append(b)
-                yield
+            yield
         finally:
+            view.clear()
             unused = self._credits
             self._credits = None
             if unused:
@@ -211,11 +223,15 @@ class SharedBlockPool(BlockPool):
 
 
 class SharedOffloadScheduler(SimpleCPUOffloadScheduler):
+    cpu_block_pool: SharedBlockPool
+
     def __init__(
         self, config, cache_config, capacity_bytes, block_size, hash_size, extra
     ):
         self._extra = extra
-        self._client = None
+        self._client: PoolClient
+        self._pending_lookups = {}
+        self._async_lookup = extra.get("async_lookup", True)
         self._bytes_per_slot = (
             cache_config.kv_cache_tensors[0].size // cache_config.num_blocks
         )
@@ -245,14 +261,82 @@ class SharedOffloadScheduler(SimpleCPUOffloadScheduler):
         )
         self.enable_kv_cache_events = False
 
+    def _discard_lookup(self, request_id):
+        pending = self._pending_lookups.pop(request_id, None)
+        if pending is None:
+            return
+        future = pending[1]
+        if future.cancel():
+            return
+        client = self._client
+
+        def release(done):
+            rows = done.result()
+            refs = {(row[1], row[2]) for row in rows}
+            if refs:
+                client.call(
+                    "finish", [[slot, generation, {}] for slot, generation in refs]
+                )
+
+        future.add_done_callback(release)
+
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        req_id = request.request_id
+        pending_hit = self._pending_cpu_hits.get(req_id)
+        if (
+            pending_hit is not None
+            and pending_hit[2] == num_computed_tokens
+            and not request.skip_reading_prefix_cache
+        ):
+            return pending_hit[1], True
+        if (
+            request.skip_reading_prefix_cache
+            or num_computed_tokens % self.block_size
+            or request.num_tokens - 1 <= num_computed_tokens
+        ):
+            self._discard_lookup(req_id)
+            with self.cpu_block_pool.lookup_scope([], True):
+                return super().get_num_new_matched_tokens(request, num_computed_tokens)
+        hashes = request.block_hashes[num_computed_tokens // self.hash_block_size :]
+        signature = (num_computed_tokens, len(hashes), hashes[-1] if hashes else None)
+        pending = self._pending_lookups.get(req_id)
+        if pending is not None and pending[0] != signature:
+            self._discard_lookup(req_id)
+            pending = None
+        if self._async_lookup and hashes:
+            if pending is None:
+                wire_keys = [
+                    make_block_hash_with_group_id(h, g).hex()
+                    for h in hashes
+                    for g in self.prefix_cacheable_group_ids
+                ]
+                self._pending_lookups[req_id] = (
+                    signature,
+                    self._client.submit("acquire", wire_keys),
+                )
+                return None, False
+            if not pending[1].done():
+                return None, False
+            rows = pending[1].result()
+            del self._pending_lookups[req_id]
+            with self.cpu_block_pool.lookup_scope([], True, rows=rows):
+                return super().get_num_new_matched_tokens(request, num_computed_tokens)
         keys = [
             make_block_hash_with_group_id(h, g)
-            for h in request.block_hashes
+            for h in hashes
             for g in self.prefix_cacheable_group_ids
         ]
         with self.cpu_block_pool.lookup_scope(keys, True):
             return super().get_num_new_matched_tokens(request, num_computed_tokens)
+
+    def request_finished(self, request, block_ids):
+        self._discard_lookup(request.request_id)
+        return super().request_finished(request, block_ids)
+
+    def reset(self):
+        for req_id in list(self._pending_lookups):
+            self._discard_lookup(req_id)
+        return super().reset()
 
     def _keys_for_ids(self, ids):
         gpu = self._gpu_block_pool
@@ -276,28 +360,93 @@ class SharedOffloadScheduler(SimpleCPUOffloadScheduler):
         self._credit_at = now
         return int(self._store_credit)
 
+    def _candidate_ids(self, state, block_ids, new_groups=(), *, reset=False):
+        """Query only confirmed positional candidates beyond the store cursor."""
+        if self._gpu_block_pool is None:
+            return
+        confirmed = (
+            state.request.num_computed_tokens - state.request.num_output_placeholders
+        )
+        for g in self.prefix_cacheable_group_ids:
+            manager = self.cpu_coordinator.single_type_managers[g]
+            if not manager.has_positionally_stable_blocks:
+                continue
+            old = () if reset else block_ids[g]
+            new = (new_groups[g] or ()) if g < len(new_groups) else ()
+            ready = min(
+                len(old) + len(new),
+                self.cpu_coordinator.get_num_cacheable_tokens(confirmed, g)
+                // self.group_block_sizes[g],
+            )
+            start = 0 if reset else state.num_stored_blocks[g]
+            hashes = None
+            for i in range(start, ready):
+                bid = old[i] if i < len(old) else new[i - len(old)]
+                block = self._gpu_block_pool.blocks[bid]
+                if block.is_null:
+                    if hashes is None:
+                        hashes = resolve_block_hashes(
+                            state.request.block_hashes,
+                            self.hash_block_size,
+                            self.group_block_sizes[g],
+                        )
+                    block = self._cached_gpu_block(hashes, i, g)
+                    if block is None:
+                        continue
+                if block.block_id not in self._in_flight_store_gpu_blocks:
+                    yield block.block_id
+
     def _prepare_eager_store_specs(self, output):
-        ids = []
-        for state in self._reqs_to_store.values():
-            for group in state.block_ids:
-                ids.extend(group)
         from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 
-        for _, groups, _ in yield_req_data(output):
-            for group in groups or ():
-                ids.extend(group or ())
+        ids = []
+        preempted = output.preempted_req_ids or ()
+        for req_id, groups, _ in yield_req_data(output):
+            state = self._reqs_to_store.get(req_id)
+            if (
+                state is None
+                or state.finished
+                or not output.num_scheduled_tokens.get(req_id, 0)
+            ):
+                continue
+            ids.extend(
+                self._candidate_ids(
+                    state,
+                    state.block_ids,
+                    groups or (),
+                    reset=req_id in preempted,
+                )
+            )
         if output.kv_connector_block_state is not None:
             for (
-                entries
-            ) in output.kv_connector_block_state.boundary_state_offloads.values():
-                ids.extend(x[1] for x in entries)
+                req_id,
+                entries,
+            ) in output.kv_connector_block_state.boundary_state_offloads.items():
+                state = self._reqs_to_store.get(req_id)
+                if (
+                    state is not None
+                    and not state.finished
+                    and req_id not in preempted
+                    and req_id not in output.finished_req_ids
+                ):
+                    ids.extend(
+                        x[1]
+                        for x in entries
+                        if x[1] not in self._in_flight_store_gpu_blocks
+                    )
         with self.cpu_block_pool.admission(self._keys_for_ids(ids), self._limit()):
             result = super()._prepare_eager_store_specs(output)
             self._store_credit -= len(result[0])
             return result
 
     def _queue_finished_eager_store(self, request, block_ids):
-        ids = [i for group in block_ids for i in group]
+        state = self._reqs_to_store.get(request.request_id)
+        if state is None or self._gpu_block_pool is None:
+            return
+        ids = list(self._candidate_ids(state, block_ids))
+        partial = self._find_fa_partial_tail_source(request, block_ids)
+        if partial is not None:
+            ids.append(partial)
         with self.cpu_block_pool.admission(self._keys_for_ids(ids), self._limit()):
             n = len(self._pending_finished_stores)
             super()._queue_finished_eager_store(request, block_ids)

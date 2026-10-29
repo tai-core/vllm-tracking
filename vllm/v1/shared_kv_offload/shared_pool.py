@@ -12,7 +12,9 @@ import socket
 import socketserver
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 MAX_FRAME = 16 * 1024 * 1024
 
@@ -22,21 +24,21 @@ class PoolState:
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.epoch = uuid.uuid4().hex
-        self.namespace = None
+        self.namespace: str | None = None
         self.capacity = 0
-        self.free = collections.deque()
-        self.records = {}
-        self.index = {}
-        self.owners = collections.defaultdict(set)
-        self.lru = collections.OrderedDict()
-        self.generations = {}
+        self.free: collections.deque[int] = collections.deque()
+        self.records: dict[int, dict[str, Any]] = {}
+        self.index: dict[str, int] = {}
+        self.owners: dict[str, set[int]] = collections.defaultdict(set)
+        self.lru: collections.OrderedDict[int, None] = collections.OrderedDict()
+        self.generations: dict[int, int] = {}
         self.layout = None
-        self.contracts = {}
+        self.contracts: dict[str, Any] = {}
         self.file = (
             Path(backing_file) if backing_file else self.root / (self.epoch + ".kv")
         )
         self.version = 0
-        self.stats = collections.Counter()
+        self.stats: collections.Counter[str] = collections.Counter()
         self.lock = threading.RLock()
 
     def _drop(self, slot):
@@ -62,8 +64,24 @@ class PoolState:
                     r["state"] = "quarantined"
                     self.stats["quarantined"] += 1
 
-    def dispatch(self, owner, op, a):
+    def dispatch(self, owner, op, a, *, internal=False):
         with self.lock:
+            if not internal:
+                self.stats["rpc_" + op] += 1
+            if op == "admit":
+                keys, limit = a
+                keys = list(dict.fromkeys(keys))
+                self.stats["admission_keys"] += len(keys)
+                rows = self.dispatch(owner, "lookup", (keys,), internal=True)
+                missing = len(keys) - len(rows)
+                reserved = (
+                    self.dispatch(
+                        owner, "reserve", (min(missing, limit),), internal=True
+                    )
+                    if missing and limit
+                    else []
+                )
+                return {"rows": rows, "reserved": reserved}
             if op == "hello":
                 ns, capacity = a
                 if capacity < 2:
@@ -74,7 +92,7 @@ class PoolState:
                 if (ns, capacity) != (self.namespace, self.capacity):
                     raise ValueError(
                         f"Shared KV namespace/capacity mismatch: "
-                        f"expected {self.namespace[:12]}/{self.capacity}, "
+                        f"expected {str(self.namespace)[:12]}/{self.capacity}, "
                         f"got {ns[:12]}/{capacity}"
                     )
                 return {"epoch": self.epoch, "capacity": self.capacity}
@@ -132,10 +150,14 @@ class PoolState:
                 self.stats["reserved"] += len(out)
                 return out
             if op in ("lookup", "acquire"):
+                self.stats[op + "_keys"] += len(a[0])
                 found = []
                 held = set()
                 for key in a[0]:
-                    slot = self.index.get(key)
+                    indexed_slot = self.index.get(key)
+                    if indexed_slot is None:
+                        continue
+                    slot = indexed_slot
                     r = self.records.get(slot)
                     if r is None or r["state"] != "ready":
                         continue
@@ -204,6 +226,8 @@ class PoolState:
 
 
 class Handler(socketserver.StreamRequestHandler):
+    server: PoolServer
+
     def handle(self):
         owner = uuid.uuid4().hex
         try:
@@ -242,6 +266,7 @@ class PoolClient:
         self.sock.connect(address)
         self.stream = self.sock.makefile("rwb")
         self.lock = threading.Lock()
+        self._executor = None
         self.epoch = self.call("hello", namespace, capacity)["epoch"]
 
     def call(self, op, *args):
@@ -264,7 +289,16 @@ class PoolClient:
                 raise RuntimeError(r["error"])
             return r["result"]
 
+    def submit(self, op, *args):
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="shared-l2"
+            )
+        return self._executor.submit(self.call, op, *args)
+
     def close(self):
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
         self.stream.close()
         self.sock.close()
 

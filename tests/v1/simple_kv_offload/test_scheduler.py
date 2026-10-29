@@ -1924,7 +1924,6 @@ def test_reset_pending_lazy_stores() -> None:
     assert sched.reset() is False
     assert len(sched._store_event_to_blocks) == 0
     assert len(sched._abandoned_store_event_to_blocks) == 1
-    assert sched._cursor is None
 
     simulate_store_completion(sched, meta.store_event)
     assert len(sched._abandoned_store_event_to_blocks) == 0

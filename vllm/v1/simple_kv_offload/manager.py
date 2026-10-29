@@ -853,8 +853,6 @@ class SimpleCPUOffloadScheduler:
         for g, group_gpu_ids in enumerate(block_ids_by_group):
             if g not in self.prefix_cacheable_group_ids:
                 continue
-            if len(gpu_block_ids) >= num_free:
-                break
             group_manager = self.cpu_coordinator.single_type_managers[g]
             if not group_manager.has_positionally_stable_blocks:
                 continue
