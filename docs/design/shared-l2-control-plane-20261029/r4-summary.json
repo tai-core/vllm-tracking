@@ -1,0 +1,207 @@
+{
+  "actual_offered_input_tpm": null,
+  "nominal_offered_input_tpm": 369323214.0441706,
+  "sent_requests": 4414,
+  "unfinished_at_client_kill": 2019,
+  "client_killed_without_drain": true,
+  "requests": 2395,
+  "success": 2395,
+  "errors": [],
+  "sending_seconds": 120.02253699302673,
+  "drain_seconds": null,
+  "stop_reasons": [
+    "plan_complete",
+    "plan_complete"
+  ],
+  "windows": [
+    {
+      "start_s": 30.0,
+      "end_s": 90.0,
+      "requests": 1429,
+      "input_tpm": 241183934.0,
+      "output_tps": 47110.1,
+      "ttft_p99": 31.79232679367066,
+      "cache_ratio": 0.9001361093977346
+    },
+    {
+      "start_s": 60.0,
+      "end_s": 120.0,
+      "requests": 1757,
+      "input_tpm": 293201085.0,
+      "output_tps": 60333.6,
+      "ttft_p99": 38.828241462707524,
+      "cache_ratio": 0.9001383333898645
+    }
+  ],
+  "last60": {
+    "start_s": 60.02253699302673,
+    "end_s": 120.02253699302673,
+    "requests": 1758,
+    "input_tpm": 293332068.0,
+    "output_tps": 60361.23333333333,
+    "ttft_p99": 38.82806719779968,
+    "cache_ratio": 0.9001382828692293
+  },
+  "whole_including_drain": null,
+  "manager_cpu_percent": {
+    "median": 20.47,
+    "max": 31.57,
+    "p95": 27.57699999999999
+  },
+  "pool_counter_delta": {
+    "rpc_hello": 0,
+    "rpc_contract": 0,
+    "rpc_attach": 0,
+    "rpc_acquire": 4217,
+    "acquire_keys": 547811,
+    "acquire_hits": 0,
+    "rpc_stats": 3579,
+    "rpc_admit": 6982,
+    "admission_keys": 4494986,
+    "lookup_keys": 4494986,
+    "lookup_hits": 3991528,
+    "rpc_finish": 3553
+  },
+  "queue_samples": [
+    {
+      "elapsed": 5.044365882873535,
+      "running": 21.0,
+      "waiting": 577.0
+    },
+    {
+      "elapsed": 15.421937704086304,
+      "running": 22.0,
+      "waiting": 685.0
+    },
+    {
+      "elapsed": 25.692327737808228,
+      "running": 21.0,
+      "waiting": 828.0
+    },
+    {
+      "elapsed": 37.975855112075806,
+      "running": 25.0,
+      "waiting": 900.0
+    },
+    {
+      "elapsed": 48.2437698841095,
+      "running": 23.0,
+      "waiting": 1014.0
+    },
+    {
+      "elapsed": 58.52248787879944,
+      "running": 21.0,
+      "waiting": 1123.0
+    },
+    {
+      "elapsed": 68.77353525161743,
+      "running": 23.0,
+      "waiting": 1193.0
+    },
+    {
+      "elapsed": 79.08990693092346,
+      "running": 24.0,
+      "waiting": 1289.0
+    },
+    {
+      "elapsed": 89.35379195213318,
+      "running": 25.0,
+      "waiting": 1303.0
+    },
+    {
+      "elapsed": 98.64324355125427,
+      "running": 21.0,
+      "waiting": 1281.0
+    },
+    {
+      "elapsed": 108.9040470123291,
+      "running": 20.0,
+      "waiting": 1317.0
+    },
+    {
+      "elapsed": 119.22649264335632,
+      "running": 20.0,
+      "waiting": 1298.0
+    }
+  ],
+  "cache_tier_delta": {
+    "device": 559396736.0,
+    "host": 0.0
+  },
+  "final_pool": {
+    "result": {
+      "rpc_hello": 24,
+      "rpc_contract": 24,
+      "rpc_attach": 8,
+      "rpc_acquire": 22111,
+      "acquire_keys": 3132978,
+      "acquire_hits": 223125,
+      "rpc_stats": 52239,
+      "rpc_admit": 40977,
+      "admission_keys": 25880555,
+      "lookup_keys": 25880555,
+      "lookup_hits": 23220108,
+      "reserved": 2646364,
+      "rpc_finish": 21848,
+      "committed": 2624946,
+      "evicted": 231650,
+      "deduplicated": 17970,
+      "slots": 2396745,
+      "free": 0,
+      "evictable": 2393296,
+      "held": 3448,
+      "objects": 2396744,
+      "keys": 2393296
+    }
+  },
+  "decode_queue_samples": [
+    {
+      "elapsed": 7.1731276512146,
+      "waiting": 24.0
+    },
+    {
+      "elapsed": 17.176934242248535,
+      "waiting": 14.0
+    },
+    {
+      "elapsed": 27.181172132492065,
+      "waiting": 9.0
+    },
+    {
+      "elapsed": 37.184969425201416,
+      "waiting": 16.0
+    },
+    {
+      "elapsed": 47.18849444389343,
+      "waiting": 17.0
+    },
+    {
+      "elapsed": 57.191495180130005,
+      "waiting": 20.0
+    },
+    {
+      "elapsed": 67.1946280002594,
+      "waiting": 19.0
+    },
+    {
+      "elapsed": 77.19786953926086,
+      "waiting": 19.0
+    },
+    {
+      "elapsed": 87.20088052749634,
+      "waiting": 11.0
+    },
+    {
+      "elapsed": 97.20442008972168,
+      "waiting": 16.0
+    },
+    {
+      "elapsed": 107.20818567276001,
+      "waiting": 13.0
+    },
+    {
+      "elapsed": 117.2123498916626,
+      "waiting": 17.0
+    }
+  ]
+}

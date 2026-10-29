@@ -62,3 +62,20 @@ not a controlled same-machine baseline.
 
 If broker CPU remains saturated after redundant key traffic drops, profile the
 remaining operations before adding sharding or changing the storage backend.
+
+## End-to-end benchmark checkpoint
+
+The completed 2026-10-29 development-node measurements are recorded in
+[BENCHMARK.md](BENCHMARK.md), with per-run summaries and the final runtime
+state alongside it. Completed input throughput was approximately 293–296M TPM
+at approximately 90.014% cache hit; higher offered load increased Prefill queues.
+This did not demonstrate sustained 350M or 400M capacity.
+
+The 350M and 400M stages ended by killing clients without waiting for drain,
+as requested. Their unfinished requests are reported separately. The final
+snapshot, taken after evidence collection, shows no active clients, zero P/D
+queues, and zero held cache leases. Model services remain running. CP source
+development remains paused, with its former Prefill service stopped.
+
+`evidence-locations.json` identifies the external raw results and frozen control
+scripts by SHA256. Credentials and bulk request logs are excluded from Git.

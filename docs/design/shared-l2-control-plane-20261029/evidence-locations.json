@@ -1,0 +1,37 @@
+{
+  "root": "/mnt/gjkj/wsz/code/tuoyu/deployments/shared-l2-perf-20261029",
+  "source_commit": "f15d7e3ef2ad6ae299c21dbbd1311d568700088b",
+  "controller_snapshot": {
+    "path": "/mnt/gjkj/wsz/code/tuoyu/deployments/shared-l2-perf-20261029/benchmark-control-snapshot.tar.gz",
+    "sha256": "96fc36f21cde37669da7e797a340b9ecfd98122e17c485b731caa5d6991c55a1"
+  },
+  "results": {
+    "r1": {
+      "gateway-results.tar.gz": "ae396c1a58f50735a783f1dee66662936831b9781194c63160163026c41dfa62",
+      "summary.json": "82108cef25f7d45b45121c3581329fb9d004c6a808f9fc9a92d6a79ac7e66f50",
+      "host.jsonl": "ce9af807317a30980bac5bc38352d6e0cd7c05d8ef1d82fab7d095e5b7a3e5fd",
+      "decode.jsonl": "30ac4f6dcd81c928cd7501b5086bb281a78b58269831c9ed698e8a38056e4bb1"
+    },
+    "r2": {
+      "gateway-results.tar.gz": "6b0943c0793833780e0716e683f660b6ae8bc9ebfde55f037fd82a60dabf150a",
+      "host.jsonl": "bd931b1eede35c7cbacb0baa26c05465c6eba0d5f79e516344a2ba479beab469",
+      "decode.jsonl": "4d03bd47e6365542332db30d4e08c860645af472b37929d768fd857a4f3d14d0",
+      "summary.json": "95a18ac31f41fd945303cce85a05a44b4359e61278b81d355907e108fbfc03f3"
+    },
+    "r3": {
+      "host.jsonl": "f521ae5581800798f3a815ad60ba65cf80836465d0a2d6431e2b2b03ec6d04c2",
+      "decode.jsonl": "d6823e2d674eef3e006b8a20bde0abcb9888adaca15e4476dcd396d0fab8512d",
+      "summary.json": "b22c326f42c8c7f27df06093d1e1d5ab8c2a9e0b3595a9ab3043b79141ee4e44",
+      "gateway-results.tar.gz": "4c0c4b9420e40e541c5da85e9b0cf4eea016bc26d0bed0f21e2c8decc1989050"
+    },
+    "r4": {
+      "decode.jsonl": "c4fc11ff290445d688a81c96702afea73655e9e01fd93499aadd61c599b580ae",
+      "gateway-results.tar.gz": "98c9375ba4e506b6ca09b75da34c0e3778a29c876e34c6f7e5566f00a8fb8d80",
+      "host.jsonl": "a4cbf2755951e645a31df7b56e84e6c6ba04b647aac2222a0fa99ffcdd6d3f4d",
+      "summary.json": "6fb905f7a85d808f773f8b495e21b00ff75d0021fffe083c04f8ae5fb5070e59"
+    }
+  },
+  "remote_prefill_release": "TY18:/data/services/tuoyu-shared-l2-perf-20261029/service-r1",
+  "remote_clients": "TYCPU:/opt/tai-gateway/validation/shared-l2-perf-20261029-r{1,2,3,4}",
+  "credentials": "Excluded; remain only on remote host."
+}

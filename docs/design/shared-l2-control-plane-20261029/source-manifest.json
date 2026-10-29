@@ -1,0 +1,24 @@
+{
+  "commit": "f15d7e3ef2ad6ae299c21dbbd1311d568700088b",
+  "remote": "/data/services/tuoyu-shared-l2-perf-20261029/service-r1",
+  "files": {
+    "vllm/distributed/kv_transfer/kv_connector/v1/base.py": "ea816ecb308592c7a664ddbc10dfc8e070579e788c36df947272e2d94952398e",
+    "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py": "de8de6a153ff4a55915ad352b8ddadf124080fcc9e5473e19dd24b18adf1374d",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py": "f89070246daf3347909dda7da56fdc6ef27724dfca305b24e39f78db2545876f",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py": "e8c1ec3ad454a0821d9e862ecfde2db9a2d19156f0c5924d03eae15354819e58",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py": "29878e08f59cdebf9bf2747e9b89ee3d29b6801ebf3f0fc82de5b2871998f8f8",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py": "0f1938e57e062f197503ddbc41232567cd6094bdeefb369559cab89871634b9d",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py": "0ae577c6fb307a1e7e93a7de106d3cb0746ce33069c0463403405ffbd6bd26bb",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py": "9dac4c6fd40a8a87028601f0f6197e9e8d81fbff0dd44d5d11b1ef3f80d4ad34",
+    "vllm/distributed/kv_transfer/kv_connector/v1/shared_cpu_offload_connector.py": "76ee1a23632c40124f0ffc9d07ca502e04563c1687753424d24b58ee6b30c12b",
+    "vllm/v1/core/kv_cache_coordinator.py": "869401b6a3e91b4989a8466b129c53c732a1c748ecc7dea4afc71dd095503b02",
+    "vllm/v1/core/sched/scheduler.py": "f6ec8016f23652714633e61965aa82afbb4fc42859c6dda63e40ec2abd8a1c43",
+    "vllm/v1/engine/core.py": "fd55ea2c0ef11bdd5b11060a1dea9b3c16e958f841a3799258bb48e4ce6eba82",
+    "vllm/v1/shared_kv_offload/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm/v1/shared_kv_offload/shared_adapter.py": "ad3d08f0fddc8ffab9718f33cf6760883ea4b3738630452c6252be3c2453293e",
+    "vllm/v1/shared_kv_offload/shared_pool.py": "3090021e27c40acb8e342724cfc2cea81f24816222ed72eebeca0434f9629bed",
+    "vllm/v1/simple_kv_offload/manager.py": "c0e8c8319f63a6053618e9b0b26a46d2f5dfa56e93bed12c3bd9c5db34f428dd"
+  },
+  "decode": "TY19 existing service-r22",
+  "pool": "/dev/shm/tuoyu-shared-l2-dev-20261028/pool.kv"
+}

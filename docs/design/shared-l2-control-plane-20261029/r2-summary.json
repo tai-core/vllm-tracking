@@ -1,0 +1,271 @@
+{
+  "actual_offered_input_tpm": 299382693.5498744,
+  "nominal_offered_input_tpm": 299549193.86584604,
+  "sent_requests": 5372,
+  "unfinished_at_client_kill": 0,
+  "client_killed_without_drain": false,
+  "requests": 5372,
+  "success": 5372,
+  "errors": [],
+  "sending_seconds": 180.1693878173828,
+  "drain_seconds": 33.70282530784607,
+  "stop_reasons": [
+    "plan_complete",
+    "plan_complete"
+  ],
+  "windows": [
+    {
+      "start_s": 30.0,
+      "end_s": 90.0,
+      "requests": 1616,
+      "input_tpm": 270594554.0,
+      "output_tps": 55116.48333333333,
+      "ttft_p99": 6.010379743576049,
+      "cache_ratio": 0.9001376723938058
+    },
+    {
+      "start_s": 60.0,
+      "end_s": 120.0,
+      "requests": 1725,
+      "input_tpm": 289484255.0,
+      "output_tps": 59086.96666666667,
+      "ttft_p99": 6.552070188522339,
+      "cache_ratio": 0.900139650082178
+    },
+    {
+      "start_s": 120.0,
+      "end_s": 180.0,
+      "requests": 1770,
+      "input_tpm": 295600288.0,
+      "output_tps": 61687.25,
+      "ttft_p99": 7.739278750419615,
+      "cache_ratio": 0.9001396372117202
+    }
+  ],
+  "last60": {
+    "start_s": 120.16938781738281,
+    "end_s": 180.1693878173828,
+    "requests": 1773,
+    "input_tpm": 295927690.0,
+    "output_tps": 61879.7,
+    "ttft_p99": 7.738107719421386,
+    "cache_ratio": 0.9001394631235758
+  },
+  "whole_including_drain": {
+    "start_s": 0.0,
+    "end_s": 213.87321305274963,
+    "requests": 5372,
+    "input_tpm": 252203610.96224028,
+    "output_tps": 52204.111214461685,
+    "ttft_p99": 8.349985165596008,
+    "cache_ratio": 0.900140035196281
+  },
+  "manager_cpu_percent": {
+    "median": 14.78,
+    "max": 78.79,
+    "p95": 65.03
+  },
+  "pool_counter_delta": {
+    "rpc_hello": 0,
+    "rpc_contract": 0,
+    "rpc_attach": 0,
+    "rpc_acquire": 5122,
+    "acquire_keys": 673765,
+    "acquire_hits": 0,
+    "rpc_stats": 5370,
+    "rpc_admit": 9859,
+    "admission_keys": 6258369,
+    "lookup_keys": 6258369,
+    "lookup_hits": 5634214,
+    "rpc_finish": 5227
+  },
+  "queue_samples": [
+    {
+      "elapsed": 4.930732011795044,
+      "running": 17.0,
+      "waiting": 31.0
+    },
+    {
+      "elapsed": 15.203722953796387,
+      "running": 22.0,
+      "waiting": 38.0
+    },
+    {
+      "elapsed": 25.482266902923584,
+      "running": 24.0,
+      "waiting": 72.0
+    },
+    {
+      "elapsed": 36.2502019405365,
+      "running": 20.0,
+      "waiting": 72.0
+    },
+    {
+      "elapsed": 46.5474579334259,
+      "running": 21.0,
+      "waiting": 78.0
+    },
+    {
+      "elapsed": 56.814982414245605,
+      "running": 21.0,
+      "waiting": 97.0
+    },
+    {
+      "elapsed": 67.13455271720886,
+      "running": 22.0,
+      "waiting": 87.0
+    },
+    {
+      "elapsed": 77.42129421234131,
+      "running": 23.0,
+      "waiting": 97.0
+    },
+    {
+      "elapsed": 87.7062463760376,
+      "running": 21.0,
+      "waiting": 98.0
+    },
+    {
+      "elapsed": 98.02101039886475,
+      "running": 22.0,
+      "waiting": 107.0
+    },
+    {
+      "elapsed": 108.31969952583313,
+      "running": 19.0,
+      "waiting": 114.0
+    },
+    {
+      "elapsed": 118.61439871788025,
+      "running": 25.0,
+      "waiting": 113.0
+    },
+    {
+      "elapsed": 128.9012327194214,
+      "running": 23.0,
+      "waiting": 110.0
+    },
+    {
+      "elapsed": 139.1652374267578,
+      "running": 22.0,
+      "waiting": 125.0
+    },
+    {
+      "elapsed": 149.44344782829285,
+      "running": 21.0,
+      "waiting": 137.0
+    },
+    {
+      "elapsed": 160.06906008720398,
+      "running": 22.0,
+      "waiting": 154.0
+    },
+    {
+      "elapsed": 170.3605968952179,
+      "running": 24.0,
+      "waiting": 166.0
+    }
+  ],
+  "cache_tier_delta": {
+    "device": 809219840.0,
+    "host": 0.0
+  },
+  "final_pool": {
+    "result": {
+      "rpc_hello": 24,
+      "rpc_contract": 24,
+      "rpc_attach": 8,
+      "rpc_acquire": 11382,
+      "acquire_keys": 1736406,
+      "acquire_hits": 223125,
+      "rpc_stats": 42241,
+      "rpc_admit": 22025,
+      "admission_keys": 13729896,
+      "lookup_keys": 13729896,
+      "lookup_hits": 12337201,
+      "reserved": 1392695,
+      "rpc_finish": 12112,
+      "committed": 1392695,
+      "slots": 2396745,
+      "free": 1004049,
+      "evictable": 1392695,
+      "held": 0,
+      "objects": 1392695,
+      "keys": 1392695
+    }
+  },
+  "decode_queue_samples": [
+    {
+      "elapsed": 7.793573617935181,
+      "waiting": 11.0
+    },
+    {
+      "elapsed": 17.797399759292603,
+      "waiting": 15.0
+    },
+    {
+      "elapsed": 27.801186561584473,
+      "waiting": 21.0
+    },
+    {
+      "elapsed": 37.805020570755005,
+      "waiting": 12.0
+    },
+    {
+      "elapsed": 47.80846071243286,
+      "waiting": 15.0
+    },
+    {
+      "elapsed": 57.811392307281494,
+      "waiting": 13.0
+    },
+    {
+      "elapsed": 67.81491994857788,
+      "waiting": 13.0
+    },
+    {
+      "elapsed": 77.81794023513794,
+      "waiting": 9.0
+    },
+    {
+      "elapsed": 87.82180452346802,
+      "waiting": 19.0
+    },
+    {
+      "elapsed": 97.82502388954163,
+      "waiting": 15.0
+    },
+    {
+      "elapsed": 107.82869958877563,
+      "waiting": 13.0
+    },
+    {
+      "elapsed": 117.83260846138,
+      "waiting": 20.0
+    },
+    {
+      "elapsed": 127.83606576919556,
+      "waiting": 15.0
+    },
+    {
+      "elapsed": 137.84010410308838,
+      "waiting": 16.0
+    },
+    {
+      "elapsed": 147.8437466621399,
+      "waiting": 10.0
+    },
+    {
+      "elapsed": 157.8469955921173,
+      "waiting": 21.0
+    },
+    {
+      "elapsed": 167.85057377815247,
+      "waiting": 8.0
+    },
+    {
+      "elapsed": 177.85409498214722,
+      "waiting": 30.0
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "TY18": {
+    "at": 1793273026.100569,
+    "queues": {
+      "18000": {
+        "running": 0.0,
+        "waiting": 0.0
+      },
+      "18100": {
+        "running": 0.0,
+        "waiting": 0.0
+      },
+      "18200": {
+        "running": 0.0,
+        "waiting": 0.0
+      },
+      "18300": {
+        "running": 0.0,
+        "waiting": 0.0
+      }
+    },
+    "pool": {
+      "result": {
+        "rpc_hello": 24,
+        "rpc_contract": 24,
+        "rpc_attach": 8,
+        "rpc_acquire": 22459,
+        "acquire_keys": 3180001,
+        "acquire_hits": 223125,
+        "rpc_stats": 53926,
+        "rpc_admit": 43782,
+        "admission_keys": 27647934,
+        "lookup_keys": 27647934,
+        "lookup_hits": 24808169,
+        "reserved": 2825682,
+        "rpc_finish": 23336,
+        "committed": 2807712,
+        "evicted": 410968,
+        "deduplicated": 17970,
+        "slots": 2396745,
+        "free": 0,
+        "evictable": 2396744,
+        "held": 0,
+        "objects": 2396744,
+        "keys": 2396744
+      }
+    }
+  },
+  "TY19": {
+    "at": 1793273028.016826,
+    "queues": {
+      "28000": {
+        "running": 0.0,
+        "waiting": 0.0
+      }
+    }
+  },
+  "clients": []
+}

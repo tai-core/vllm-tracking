@@ -1,0 +1,263 @@
+{
+  "actual_offered_input_tpm": null,
+  "nominal_offered_input_tpm": 349602480.7560467,
+  "sent_requests": 6268,
+  "unfinished_at_client_kill": 1670,
+  "client_killed_without_drain": true,
+  "requests": 4598,
+  "success": 4598,
+  "errors": [],
+  "sending_seconds": 180.15149235725403,
+  "drain_seconds": null,
+  "stop_reasons": [
+    "plan_complete",
+    "plan_complete"
+  ],
+  "windows": [
+    {
+      "start_s": 30.0,
+      "end_s": 90.0,
+      "requests": 1625,
+      "input_tpm": 272002615.0,
+      "output_tps": 55441.36666666667,
+      "ttft_p99": 14.275612077713012,
+      "cache_ratio": 0.9001400519623681
+    },
+    {
+      "start_s": 60.0,
+      "end_s": 120.0,
+      "requests": 1730,
+      "input_tpm": 287114553.0,
+      "output_tps": 60032.5,
+      "ttft_p99": 18.928674161434177,
+      "cache_ratio": 0.9001434629473484
+    },
+    {
+      "start_s": 120.0,
+      "end_s": 180.0,
+      "requests": 1745,
+      "input_tpm": 293218998.0,
+      "output_tps": 59914.8,
+      "ttft_p99": 27.854534654617307,
+      "cache_ratio": 0.9001396560259715
+    }
+  ],
+  "last60": {
+    "start_s": 120.15149235725403,
+    "end_s": 180.15149235725403,
+    "requests": 1745,
+    "input_tpm": 293481145.0,
+    "output_tps": 59845.416666666664,
+    "ttft_p99": 27.854534654617307,
+    "cache_ratio": 0.9001394348519391
+  },
+  "whole_including_drain": null,
+  "manager_cpu_percent": {
+    "median": 15.32,
+    "max": 109.93,
+    "p95": 62.99399999999996
+  },
+  "pool_counter_delta": {
+    "rpc_hello": 0,
+    "rpc_contract": 0,
+    "rpc_attach": 0,
+    "rpc_acquire": 5392,
+    "acquire_keys": 701872,
+    "acquire_hits": 0,
+    "rpc_stats": 5301,
+    "rpc_admit": 10215,
+    "admission_keys": 6532256,
+    "lookup_keys": 6532256,
+    "lookup_hits": 5878249,
+    "rpc_finish": 5254
+  },
+  "queue_samples": [
+    {
+      "elapsed": 5.405437707901001,
+      "running": 22.0,
+      "waiting": 56.0
+    },
+    {
+      "elapsed": 15.683992862701416,
+      "running": 25.0,
+      "waiting": 116.0
+    },
+    {
+      "elapsed": 25.940877199172974,
+      "running": 20.0,
+      "waiting": 186.0
+    },
+    {
+      "elapsed": 36.32708716392517,
+      "running": 24.0,
+      "waiting": 238.0
+    },
+    {
+      "elapsed": 46.61022162437439,
+      "running": 23.0,
+      "waiting": 282.0
+    },
+    {
+      "elapsed": 56.900399923324585,
+      "running": 20.0,
+      "waiting": 351.0
+    },
+    {
+      "elapsed": 67.55212306976318,
+      "running": 21.0,
+      "waiting": 420.0
+    },
+    {
+      "elapsed": 78.5190737247467,
+      "running": 23.0,
+      "waiting": 479.0
+    },
+    {
+      "elapsed": 89.93279027938843,
+      "running": 25.0,
+      "waiting": 552.0
+    },
+    {
+      "elapsed": 101.54682850837708,
+      "running": 23.0,
+      "waiting": 607.0
+    },
+    {
+      "elapsed": 113.01121020317078,
+      "running": 29.0,
+      "waiting": 681.0
+    },
+    {
+      "elapsed": 123.27470803260803,
+      "running": 20.0,
+      "waiting": 698.0
+    },
+    {
+      "elapsed": 133.5740406513214,
+      "running": 19.0,
+      "waiting": 753.0
+    },
+    {
+      "elapsed": 143.83518481254578,
+      "running": 25.0,
+      "waiting": 822.0
+    },
+    {
+      "elapsed": 154.11425256729126,
+      "running": 21.0,
+      "waiting": 885.0
+    },
+    {
+      "elapsed": 164.43107080459595,
+      "running": 25.0,
+      "waiting": 952.0
+    },
+    {
+      "elapsed": 175.95231747627258,
+      "running": 26.0,
+      "waiting": 974.0
+    }
+  ],
+  "cache_tier_delta": {
+    "device": 782598016.0,
+    "host": 0.0
+  },
+  "final_pool": {
+    "result": {
+      "rpc_hello": 24,
+      "rpc_contract": 24,
+      "rpc_attach": 8,
+      "rpc_acquire": 16947,
+      "acquire_keys": 2460188,
+      "acquire_hits": 223125,
+      "rpc_stats": 47751,
+      "rpc_admit": 32496,
+      "admission_keys": 20424431,
+      "lookup_keys": 20424431,
+      "lookup_hits": 18363424,
+      "reserved": 2061007,
+      "rpc_finish": 17495,
+      "committed": 2057690,
+      "slots": 2396745,
+      "free": 335737,
+      "evictable": 2057690,
+      "held": 3317,
+      "objects": 2061007,
+      "keys": 2057690
+    }
+  },
+  "decode_queue_samples": [
+    {
+      "elapsed": 7.798908948898315,
+      "waiting": 18.0
+    },
+    {
+      "elapsed": 17.802372217178345,
+      "waiting": 13.0
+    },
+    {
+      "elapsed": 27.805805921554565,
+      "waiting": 10.0
+    },
+    {
+      "elapsed": 37.809327840805054,
+      "waiting": 17.0
+    },
+    {
+      "elapsed": 47.81241989135742,
+      "waiting": 15.0
+    },
+    {
+      "elapsed": 57.815746545791626,
+      "waiting": 13.0
+    },
+    {
+      "elapsed": 67.81901502609253,
+      "waiting": 11.0
+    },
+    {
+      "elapsed": 77.82230019569397,
+      "waiting": 16.0
+    },
+    {
+      "elapsed": 87.82642006874084,
+      "waiting": 15.0
+    },
+    {
+      "elapsed": 97.82950568199158,
+      "waiting": 11.0
+    },
+    {
+      "elapsed": 107.83265972137451,
+      "waiting": 17.0
+    },
+    {
+      "elapsed": 117.83602571487427,
+      "waiting": 16.0
+    },
+    {
+      "elapsed": 127.83961606025696,
+      "waiting": 17.0
+    },
+    {
+      "elapsed": 137.84255623817444,
+      "waiting": 18.0
+    },
+    {
+      "elapsed": 147.8456208705902,
+      "waiting": 17.0
+    },
+    {
+      "elapsed": 157.84881854057312,
+      "waiting": 18.0
+    },
+    {
+      "elapsed": 167.8515920639038,
+      "waiting": 17.0
+    },
+    {
+      "elapsed": 177.854745388031,
+      "waiting": 11.0
+    }
+  ]
+}
