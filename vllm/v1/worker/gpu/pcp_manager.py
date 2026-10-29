@@ -173,7 +173,12 @@ class PCPManager:
             raise NotImplementedError(
                 "MRV2 PCP does not support encoder-decoder models yet."
             )
-        if supports_mm_inputs:
+        # MM PCP is validated only for GLM-5.3-Flash without M-RoPE.
+        if supports_mm_inputs and (
+            getattr(model_config.hf_text_config, "model_type", None)
+            != "glm5_next_text"
+            or model_config.uses_mrope
+        ):
             raise NotImplementedError("MRV2 PCP does not support MM inputs yet.")
         if vllm_config.lora_config is not None:
             raise NotImplementedError("MRV2 PCP does not support LoRA yet.")

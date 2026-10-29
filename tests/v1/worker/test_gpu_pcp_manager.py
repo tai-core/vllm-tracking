@@ -69,6 +69,25 @@ def test_validate_config_accepts_decode_only_full_graphs(cudagraph_mode):
     PCPManager.validate_config(_make_config(cudagraph_mode), supports_mm_inputs=False)
 
 
+@pytest.mark.parametrize(
+    ("model_type", "uses_mrope", "supported"),
+    [
+        ("glm5_next_text", False, True),
+        ("glm5_next_text", True, False),
+        ("deepseek_v3", False, False),
+    ],
+)
+def test_validate_config_multimodal_scope(model_type, uses_mrope, supported):
+    config = _make_config(CUDAGraphMode.NONE)
+    config.model_config.hf_text_config.model_type = model_type
+    config.model_config.uses_mrope = uses_mrope
+    if supported:
+        PCPManager.validate_config(config, supports_mm_inputs=True)
+    else:
+        with pytest.raises(NotImplementedError, match="does not support MM inputs"):
+            PCPManager.validate_config(config, supports_mm_inputs=True)
+
+
 def test_validate_config_rejects_full_graph_for_prefills():
     with pytest.raises(NotImplementedError, match="decode-only routines"):
         PCPManager.validate_config(

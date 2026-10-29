@@ -146,6 +146,32 @@ def _gather(runner: EncoderRunner, *, num_scheduled: int, draft_lookahead: int):
     )
 
 
+@pytest.mark.parametrize("with_active_row", [False, True])
+def test_gather_skips_empty_pcp_row_inside_image(with_active_row):
+    image = _feature("image", offset=2, length=10)
+    runner = _make_runner([image], cached=[image])
+    lengths = np.array([0, 2] if with_active_row else [0])
+    starts = np.array([9, 10] if with_active_row else [9])
+
+    mm_embeds, is_mm_embed = runner.gather_mm_embeddings(
+        req_ids=["req0"] * len(lengths),
+        total_num_scheduled_tokens=int(lengths.sum()),
+        num_scheduled_tokens=lengths,
+        query_start_loc=np.array([0, 0] if with_active_row else [0]),
+        prefill_lens=np.full(len(lengths), 1000),
+        num_computed_tokens=starts,
+    )
+
+    assert is_mm_embed.tolist() == ([True, True] if with_active_row else [])
+    if with_active_row:
+        assert len(mm_embeds) == 1
+        torch.testing.assert_close(
+            mm_embeds[0], runner.encoder_cache.encoder_outputs["image"][8:10]
+        )
+    else:
+        assert mm_embeds == []
+
+
 def test_draft_lookahead_uses_boundary_feature_when_cached():
     """The drafter's +1 look-ahead can reach the feature at offset ==
     processed_end (the next chunk). When its encoder output is already cached
