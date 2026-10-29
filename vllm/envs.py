@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_USE_RAY_V2_EXECUTOR_BACKEND: bool = False
+    VLLM_DP_METADATA_SHM: bool = False
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
     VLLM_XLA_USE_SPMD: bool = False
     VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn"] = "fork"
@@ -944,6 +945,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_RAY_V2_EXECUTOR_BACKEND": lambda: bool(
         int(os.getenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", "1"))
     ),
+    # Use shared-memory queues for single-node DP metadata coordination.
+    "VLLM_DP_METADATA_SHM": lambda: bool(int(os.getenv("VLLM_DP_METADATA_SHM", "0"))),
     # When True, GroupCoordinator constructs its CPU/device subgroups via
     # ``torch.distributed.split_group(backend=...)``
     # and ``init_distributed_environment`` initializes the default PG with

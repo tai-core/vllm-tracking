@@ -559,6 +559,8 @@ class GroupCoordinator:
 
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
+        self.dp_metadata_shm: Any | None = None
+        self.dp_metadata_shm_initialized = False
         self.mq_broadcaster: MessageQueue | None = None
         if use_message_queue_broadcaster and self.world_size > 1:
             self.mq_broadcaster = MessageQueue.create_from_process_group(
@@ -1393,6 +1395,10 @@ class GroupCoordinator:
         return self.device_communicator.recv(size, dtype, src)
 
     def destroy(self):
+        if self.dp_metadata_shm is not None:
+            self.dp_metadata_shm.shutdown()
+            self.dp_metadata_shm = None
+        self.dp_metadata_shm_initialized = False
         # Device communicators can own collective workspaces whose teardown
         # uses these process groups (for example FlashInfer PCIe IPC barriers).
         # Release them before destroying the groups they depend on.

@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 import torch
 import torch.distributed as dist
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_dp_group
@@ -63,17 +64,34 @@ def sync_cudagraph_and_dp_padding(
     Returns (synced_batch_desc, sync). `sync` is None when no rank has work.
     """
     assert dp_size > 1, "DP size must be greater than 1"
-    group = get_dp_group().cpu_group
-    tensor = torch.zeros(6, dp_size, dtype=torch.int32, device="cpu")
-    tensor[0][dp_rank] = num_tokens
-    tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
-    tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
-    tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
-    tensor[4][dp_rank] = int(allow_ubatching)
-    tensor[5][dp_rank] = num_reqs
+    coordinator = get_dp_group()
+    group = coordinator.cpu_group
+    metadata = (
+        num_tokens,
+        desired_batch_desc.cg_mode.value,
+        uniform_token_count or 0,  # 0 means None
+        max_query_len or -1,  # -1 means None
+        int(allow_ubatching),
+        num_reqs,
+    )
+    tensor = None
     if should_skip_dp_coordination():
-        tensor[:] = tensor[:, dp_rank, None].clone()
-    else:
+        local = torch.tensor(metadata, dtype=torch.int32, device="cpu")
+        tensor = local[:, None].expand(-1, dp_size).clone()
+    elif envs.VLLM_DP_METADATA_SHM:
+        if not coordinator.dp_metadata_shm_initialized:
+            from vllm.distributed.device_communicators.dp_metadata_shm import (
+                DPMetadataShm,
+            )
+
+            coordinator.dp_metadata_shm = DPMetadataShm.create(group)
+            coordinator.dp_metadata_shm_initialized = True
+        if coordinator.dp_metadata_shm is not None:
+            tensor = coordinator.dp_metadata_shm.all_gather(metadata)
+
+    if tensor is None:
+        tensor = torch.zeros(6, dp_size, dtype=torch.int32, device="cpu")
+        tensor[:, dp_rank] = torch.tensor(metadata, dtype=torch.int32, device="cpu")
         dist.all_reduce(tensor, group=group)
 
     num_tokens_across_dp = tensor[0]
