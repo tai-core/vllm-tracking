@@ -108,3 +108,58 @@ Remaining waits are visible: lookup-ready to allocation is 348ms P50, and ready
 requests can still wait behind model batches. The new control send costs 12.35ms
 wall / 7.81ms thread CPU P50 per control batch. This reduces waiting; it does not
 claim zero cache overhead or 180k logical tokens/s capacity.
+
+## Open-loop SLA capacity sweep
+
+A subsequent AIPerf request-rate sweep uses strict TTFT P90 < 12s plus a
+service-queue stability check. Profiles are excluded. Coarse/refined rates use
+the same qualification as 300-second confirmations; an SLA-pass window with
+growing waiting queues is not accepted as sustained capacity.
+
+| Batch token budget | Auto KV blocks/rank | Highest confirmed nominal RPS | Logical tokens/s | TTFT P90 |
+| --- | ---: | ---: | ---: | ---: |
+| 12288 | 236 | 10 | 90,268 | 4.218s |
+| 8192 | 389 | 13 | 116,498 | 3.550s |
+
+Both retain GPU L1, 96GiB Host L2, stream restore, max_num_seqs=64, and the same
+model/daemon at gpu-memory-utilization=.152. Lowering the activation token
+budget lets native profiling increase KV from 1.71 to 2.82GiB/rank. This is a
+configuration-level gain, not a new kernel implementation. It should not be
+assumed optimal for uncached requests or other lengths.
+
+The final 8192 confirmation has 4095 successful requests, actual arrival
+12.7926 RPS, completion 12.7992 RPS, and a 305.097-second offered window.
+The adjacent 14 RPS trial has P90=9.295s but waiting rises (slope .1034 req/s),
+so its 123,017 completion tokens/s are not accepted. The highest validated
+point reaches 64.72% of the 180k target, leaving 63,502 tokens/s (35.28%).
+Resolution is one nominal RPS; this is finite-window evidence, not a global
+hardware peak or indefinite stability guarantee.
+
+The initial pooled-connection 8192 confirmation had two immediate HTTP transport
+errors and was excluded. The complete confirmation was repeated with AIPerf's
+`--connection-reuse-strategy never`, with zero errors and connection setup left
+in TTFT. The mechanism behind the earlier disconnects was not proven. The
+12 RPS coarse configuration comparison used pooled connections in both runs
+and identical ordered payloads except request IDs: P90 changed 20.706s -> 2.764s.
+
+At the final qualified point, mean batch size is 6054 tokens (73.90% of budget),
+P90/max 8190, and 32.71% of batches exceed 95% occupancy. The 12288 setting had
+mean 4065 and no such full batches even under overload. Thus input pressure was
+not the only constraint, and average batches are still not full.
+
+With nonshared prefixes, each request needs 13 restore blocks plus 5 continuation
+blocks. Those budgets are shared across all in-flight cohorts. Reservations are
+absent from the reported block-usage gauge. The original profile had 81 external
+allocation rejections; all had fewer than 13 free-after-reservation blocks.
+High-free local-hit rejections also point, by source exclusion rather than a
+direct branch trace, to Mamba's same-step cached-state guard. This does not prove
+that the guard can safely be removed.
+
+The final profile has roughly 4ms sampled copy/scatter intervals, all temporally
+covered by other forwards. Representative sampled model-stream shares are EP
+dispatch/combine 18.82%, Indexer 15.79%, MoE experts 14.82%, MLA 13.13%, KDA
+head exchange 8.00%, FlashKDA recurrence 3.46%, and 25.98% uninstrumented remainder.
+EP includes peer waits, expert work includes activation/quant/permutation, and
+these are stream intervals, not pure kernel utilization. Operator sampling
+raises CPU time in geometry-matched observations, so its timings only localize
+work; unprofiled windows determine capacity.
