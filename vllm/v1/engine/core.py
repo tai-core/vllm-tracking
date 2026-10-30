@@ -220,6 +220,15 @@ class EngineCore:
             and self.model_executor.supports_nonblocking_result_poll
             and self.batch_queue_size > 1
         )
+        self.independent_async_loads = (
+            self.progress_async_loads
+            and self.model_executor.initialize_async_kv_loads()
+        )
+        if self.progress_async_loads:
+            logger.info(
+                "Independent async KV load progress enabled: %s",
+                self.independent_async_loads,
+            )
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
         ) = None
@@ -688,6 +697,14 @@ class EngineCore:
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
         progress_loads = self.progress_async_loads
+        if progress_loads:
+            self.scheduler.progress_kv_lookups()
+        if getattr(self, "independent_async_loads", False):
+            load_output = self.model_executor.poll_async_kv_loads()
+            if load_output is not None:
+                errors = self.scheduler.update_async_kv_loads(load_output)
+                if errors:
+                    return errors, False
         queue_limit = self.batch_queue_size + int(progress_loads)
         assert len(batch_queue) <= queue_limit
         compute_batches = sum(
@@ -717,6 +734,15 @@ class EngineCore:
                     self._should_throttle_prefills()
                 )
             if scheduler_output is not None:
+                if getattr(self, "independent_async_loads", False):
+                    metadata = scheduler_output.kv_connector_metadata
+                    if metadata is not None:
+                        connector = self.scheduler.get_kv_connector()
+                        assert connector is not None
+                        normal, loads = connector.split_async_loads(metadata)
+                        scheduler_output.kv_connector_metadata = normal
+                        if loads is not None:
+                            self.model_executor.submit_async_kv_loads(loads)
                 with self.log_error_detail(scheduler_output):
                     exec_future = self.model_executor.execute_model(
                         scheduler_output, non_block=True

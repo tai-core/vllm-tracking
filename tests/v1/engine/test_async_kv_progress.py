@@ -9,12 +9,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, KVConnectorOutput
 
 
 def make_core():
     core = EngineCore.__new__(EngineCore)
     core.progress_async_loads = True
+    core.independent_async_loads = False
     core.batch_queue_size = 2
     core.batch_queue = deque(maxlen=3)
     core.scheduler = Mock()
@@ -74,6 +75,67 @@ def test_scheduler_without_load_only_support_still_retires_results(monkeypatch):
     assert core.step_with_batch_queue() == ({}, False)
     core.model_executor.execute_model.assert_not_called()
     assert len(core.batch_queue) == 1
+
+
+def test_lookup_progress_continues_when_all_rpc_slots_are_full(monkeypatch):
+    monkeypatch.setattr("vllm.v1.engine.core.time.sleep", lambda _: None)
+    core = make_core()
+    future = Future()
+    core.batch_queue.appendleft(
+        (future, SimpleNamespace(total_num_scheduled_tokens=0), future)
+    )
+    assert core.step_with_batch_queue() == (None, False)
+    core.scheduler.progress_kv_lookups.assert_called_once()
+    core.scheduler.schedule.assert_not_called()
+    core.scheduler.schedule_kv_loads.assert_not_called()
+
+
+def test_receive_completion_is_absorbed_while_forward_is_pending(monkeypatch):
+    monkeypatch.setattr("vllm.v1.engine.core.time.sleep", lambda _: None)
+    core = make_core()
+    core.independent_async_loads = True
+    core.scheduler.schedule_kv_loads.return_value = None
+    received = KVConnectorOutput(finished_recving={"restored"})
+    core.model_executor.poll_async_kv_loads.return_value = received
+    core.scheduler.update_async_kv_loads.return_value = {}
+    oldest = core.batch_queue[-1][0]
+    assert core.step_with_batch_queue() == (None, False)
+    core.scheduler.update_async_kv_loads.assert_called_once_with(received)
+    assert not oldest.done()
+    core.scheduler.update_from_output.assert_not_called()
+
+
+def test_restore_submission_uses_independent_metadata_before_compute_rpc(monkeypatch):
+    monkeypatch.setattr("vllm.v1.engine.core.time.sleep", lambda _: None)
+    core = make_core()
+    core.independent_async_loads = True
+    core.model_executor.poll_async_kv_loads.return_value = None
+    metadata, normal, loads = object(), object(), object()
+    output = core.scheduler.schedule_kv_loads.return_value
+    output.kv_connector_metadata = metadata
+    connector = core.scheduler.get_kv_connector.return_value
+    connector.split_async_loads.return_value = normal, loads
+    calls = []
+    core.model_executor.submit_async_kv_loads.side_effect = lambda value: calls.append(
+        ("loads", value)
+    )
+    core.model_executor.execute_model.side_effect = lambda value, **_: (
+        calls.append(("model", value.kv_connector_metadata)) or Future()
+    )
+    assert core.step_with_batch_queue() == (None, False)
+    assert calls == [("loads", loads), ("model", normal)]
+
+
+def test_control_failure_outputs_are_returned_without_retiring_forward():
+    core = make_core()
+    core.independent_async_loads = True
+    received = KVConnectorOutput(invalid_block_ids={7}, finished_recving={"r"})
+    core.model_executor.poll_async_kv_loads.return_value = received
+    errors = {0: object()}
+    core.scheduler.update_async_kv_loads.return_value = errors
+    assert core.step_with_batch_queue() == (errors, False)
+    assert len(core.batch_queue) == 2
+    core.model_executor.execute_model.assert_not_called()
 
 
 def test_control_head_retires_before_next_forward_or_grammar(monkeypatch):
