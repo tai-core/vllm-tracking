@@ -17,12 +17,15 @@ from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVConnectorMetadata,
     SupportsHMA,
     supports_hma,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
+    MultiKVConnectorAsyncMetadata,
+    MultiKVConnectorMetadata,
     MultiKVConnectorStats,
     MultiKVConnectorWorkerMetadata,
 )
@@ -891,6 +894,93 @@ Options:
   1. Add delegation in MultiConnector (preferred)
   2. Add to INHERITED_OK if the base implementation works correctly
 """)
+
+
+def test_lookup_progress_reaches_every_child_without_admission():
+    connector = MultiConnector.__new__(MultiConnector)
+    children = [MagicMock(spec_set=KVConnectorBase_V1) for _ in range(2)]
+    connector._connectors = children
+    connector.progress_lookups()
+    for child in children:
+        child.progress_lookups.assert_called_once_with()
+        child.get_num_new_matched_tokens.assert_not_called()
+        child.update_state_after_alloc.assert_not_called()
+
+
+def test_async_load_split_preserves_normal_metadata_and_child_indices():
+    connector = MultiConnector.__new__(MultiConnector)
+    children = [MagicMock(spec_set=KVConnectorBase_V1) for _ in range(2)]
+    connector._connectors = children
+    original = [KVConnectorMetadata(), KVConnectorMetadata()]
+    normal, asynchronous = KVConnectorMetadata(), KVConnectorMetadata()
+    children[0].split_async_loads.return_value = (original[0], None)
+    children[1].split_async_loads.return_value = (normal, asynchronous)
+    metadata = MultiKVConnectorMetadata(tuple(original), extra_async_saves={"r": 2})
+    forward, control = connector.split_async_loads(metadata)
+    assert isinstance(forward, MultiKVConnectorMetadata)
+    assert forward.metadata == (original[0], normal)
+    assert forward.extra_async_saves == {"r": 2}
+    assert metadata.metadata == tuple(original)
+    assert isinstance(control, MultiKVConnectorAsyncMetadata)
+    assert control.metadata == (None, asynchronous)
+    children[0].initialize_async_loads.return_value = False
+    children[1].initialize_async_loads.return_value = True
+    assert connector.initialize_async_loads()
+    children[1].start_async_loads.return_value = {"r"}
+    assert connector.start_async_loads(control) == {"r"}
+    children[0].start_async_loads.assert_not_called()
+    children[1].start_async_loads.assert_called_once_with(asynchronous)
+    for child in children:
+        child.bind_connector_metadata.assert_not_called()
+
+
+def test_async_load_poll_reports_errors_before_completion():
+    connector = MultiConnector.__new__(MultiConnector)
+    children = [MagicMock(spec_set=KVConnectorBase_V1) for _ in range(3)]
+    connector._connectors = children
+    for index, child in enumerate(children):
+        child.initialize_async_loads.return_value = index != 1
+    assert connector.initialize_async_loads()
+    children[0].poll_async_loads.side_effect = [
+        KVConnectorOutput(invalid_block_ids={7}),
+        KVConnectorOutput(finished_recving={"failed"}),
+        None,
+    ]
+    children[2].poll_async_loads.side_effect = [
+        None,
+        KVConnectorOutput(finished_recving={"other"}, invalid_block_ids={8}),
+        None,
+    ]
+    first = connector.poll_async_loads()
+    assert first.invalid_block_ids == {7}
+    assert not first.finished_recving
+    second = connector.poll_async_loads()
+    assert second.finished_recving == {"failed", "other"}
+    assert second.invalid_block_ids == {8}
+    assert connector.poll_async_loads() is None
+    children[1].poll_async_loads.assert_not_called()
+
+
+def test_unsupported_async_loads_preserve_ordinary_connector_path():
+    connector = MultiConnector.__new__(MultiConnector)
+    child = MagicMock(spec_set=KVConnectorBase_V1)
+    connector._connectors = [child]
+    metadata = KVConnectorMetadata()
+    child.split_async_loads.side_effect = lambda value: (
+        KVConnectorBase_V1.split_async_loads(child, value)
+    )
+    child.initialize_async_loads.return_value = (
+        KVConnectorBase_V1.initialize_async_loads(child)
+    )
+    forward, control = connector.split_async_loads(
+        MultiKVConnectorMetadata((metadata,))
+    )
+    assert forward.metadata == (metadata,)
+    assert control is None
+    assert not connector.initialize_async_loads()
+    assert connector.poll_async_loads() is None
+    with pytest.raises(NotImplementedError):
+        KVConnectorBase_V1.start_async_loads(child, metadata)
 
 
 def test_multi_connector_worker_metadata(mc):

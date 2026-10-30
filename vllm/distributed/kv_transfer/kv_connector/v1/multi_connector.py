@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -46,6 +46,11 @@ logger = init_logger(__name__)
 class MultiKVConnectorMetadata(KVConnectorMetadata):
     metadata: tuple[KVConnectorMetadata, ...]
     extra_async_saves: dict[str, int] | None = None
+
+
+@dataclass
+class MultiKVConnectorAsyncMetadata(KVConnectorMetadata):
+    metadata: tuple[KVConnectorMetadata | None, ...]
 
 
 @dataclass
@@ -202,6 +207,7 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         # a single connector to load.
         # Propagated from scheduler to worker side via the connector metadata.
         self._extra_async_saves: dict[str, int] = {}
+        self._async_load_connectors: list[int] = []
 
     @property
     def supports_divergent_local_hybrid_hits(self) -> bool:
@@ -287,6 +293,39 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     # ==============================
     # Worker-side methods
     # ==============================
+    def initialize_async_loads(self) -> bool:
+        self._async_load_connectors = [
+            i for i, c in enumerate(self._connectors) if c.initialize_async_loads()
+        ]
+        return bool(self._async_load_connectors)
+
+    def start_async_loads(self, metadata: KVConnectorMetadata) -> set[str]:
+        assert isinstance(metadata, MultiKVConnectorAsyncMetadata)
+        started: set[str] = set()
+        for i, (c, child_metadata) in enumerate(
+            zip(self._connectors, metadata.metadata, strict=True)
+        ):
+            if child_metadata is not None:
+                assert i in self._async_load_connectors
+                started.update(c.start_async_loads(child_metadata))
+        return started
+
+    def poll_async_loads(self) -> KVConnectorOutput | None:
+        finished_recving: set[str] = set()
+        invalid_block_ids: set[int] = set()
+        for i in self._async_load_connectors:
+            output = self._connectors[i].poll_async_loads()
+            if output is not None:
+                assert not output.finished_sending
+                finished_recving.update(output.finished_recving or ())
+                invalid_block_ids.update(output.invalid_block_ids)
+        if not finished_recving and not invalid_block_ids:
+            return None
+        return KVConnectorOutput(
+            finished_recving=finished_recving or None,
+            invalid_block_ids=invalid_block_ids,
+        )
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         for c in self._connectors:
             c.start_load_kv(forward_context, **kwargs)
@@ -424,6 +463,27 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def on_new_request(self, request: "Request") -> None:
         for c in self._connectors:
             c.on_new_request(request)
+
+    def progress_lookups(self) -> None:
+        for c in self._connectors:
+            c.progress_lookups()
+
+    def split_async_loads(
+        self, metadata: KVConnectorMetadata
+    ) -> tuple[KVConnectorMetadata, KVConnectorMetadata | None]:
+        assert isinstance(metadata, MultiKVConnectorMetadata)
+        normal_metadata: list[KVConnectorMetadata] = []
+        async_metadata: list[KVConnectorMetadata | None] = []
+        for c, child_metadata in zip(self._connectors, metadata.metadata, strict=True):
+            normal, asynchronous = c.split_async_loads(child_metadata)
+            normal_metadata.append(normal)
+            async_metadata.append(asynchronous)
+        return (
+            replace(metadata, metadata=tuple(normal_metadata)),
+            MultiKVConnectorAsyncMetadata(metadata=tuple(async_metadata))
+            if any(child is not None for child in async_metadata)
+            else None,
+        )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

@@ -530,6 +530,40 @@ class Scheduler(SchedulerInterface):
             return None
         return self.schedule(prefetch_only=True)
 
+    def progress_kv_lookups(self) -> None:
+        if self.connector is not None:
+            self.connector.progress_lookups()
+
+    def update_async_kv_loads(
+        self, output: KVConnectorOutput
+    ) -> dict[int, EngineCoreOutputs]:
+        outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+        if output.invalid_block_ids:
+            failed_req_ids = self._handle_invalid_blocks(output.invalid_block_ids, {})
+            if failed_req_ids and not self.recompute_kv_load_failures:
+                self._finish_requests_with_error(failed_req_ids, outputs)
+        self._update_from_kv_xfer_finished(output)
+        return {
+            client_index: EngineCoreOutputs(outputs=outs)
+            for client_index, outs in outputs.items()
+        }
+
+    def _finish_requests_with_error(
+        self,
+        request_ids: set[str],
+        outputs: dict[int, list[EngineCoreOutput]],
+    ) -> None:
+        for request in self.finish_requests(request_ids, RequestStatus.FINISHED_ERROR):
+            outputs[request.client_index].append(
+                EngineCoreOutput(
+                    request_id=request.request_id,
+                    new_token_ids=[],
+                    finish_reason=request.get_finished_reason(),
+                    events=request.take_events(),
+                    trace_headers=request.trace_headers,
+                )
+            )
+
     def schedule(
         self, throttle_prefills: bool = False, *, prefetch_only: bool = False
     ) -> SchedulerOutput:
@@ -2207,19 +2241,7 @@ class Scheduler(SchedulerInterface):
             error_req_ids.update(failed_kv_load_req_ids)
 
         if error_req_ids:
-            error_reqs = self.finish_requests(
-                error_req_ids, RequestStatus.FINISHED_ERROR
-            )
-            for request in error_reqs:
-                outputs[request.client_index].append(
-                    EngineCoreOutput(
-                        request_id=request.request_id,
-                        new_token_ids=[],
-                        finish_reason=request.get_finished_reason(),
-                        events=request.take_events(),
-                        trace_headers=request.trace_headers,
-                    )
-                )
+            self._finish_requests_with_error(error_req_ids, outputs)
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:

@@ -271,6 +271,30 @@ class KVConnectorBase_V1(ABC):
         """
         return self._connector_metadata is not None
 
+    def initialize_async_loads(self) -> bool:
+        """Opt into a separate worker control owner after cache registration.
+
+        A supported connector must isolate receive submission/completion from
+        its forward callbacks. Unsupported connectors retain the normal path.
+        """
+        return False
+
+    def start_async_loads(self, metadata: KVConnectorMetadata) -> set[str]:
+        """Submit private receive destinations without binding forward metadata.
+
+        Called only after initialize_async_loads succeeds. Return the request
+        IDs whose receive lifecycle is now owned by the control path.
+        """
+        raise NotImplementedError("Connector does not support independent async loads")
+
+    def poll_async_loads(self) -> KVConnectorOutput | None:
+        """Nonblockingly report receive completions to the control owner once.
+
+        Failed block IDs must be reported before or with finished_recving, so
+        the scheduler cannot admit a failed restore as usable KV.
+        """
+        return None
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """
         Initialize with the KV caches. Useful for pre-registering the
@@ -539,6 +563,25 @@ class KVConnectorBase_V1(ABC):
         bookkeeping. The default implementation is a no-op.
         """
         return
+
+    def progress_lookups(self) -> None:
+        """Poll outstanding scheduler-side lookups without waiting or admitting work.
+
+        Completed results must remain available to get_num_new_matched_tokens.
+        This callback runs on the scheduler thread even when no batch can be
+        scheduled. Connectors without asynchronous lookup progress do nothing.
+        """
+        return
+
+    def split_async_loads(
+        self, metadata: KVConnectorMetadata
+    ) -> tuple[KVConnectorMetadata, KVConnectorMetadata | None]:
+        """Separate independent receive work from normal scheduler metadata.
+
+        This scheduler-side operation must not mutate the original metadata or
+        depend on worker initialization. The default keeps all work on forward.
+        """
+        return metadata, None
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """

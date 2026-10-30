@@ -6456,3 +6456,132 @@ def test_restore_control_step_preserves_ready_then_schedules_next_chunk(
     out = scheduler.schedule()
     assert out.num_scheduled_tokens == {first.request_id: 16, second.request_id: 16}
     assert max(scheduler._recent_restore_batch_sizes) == 2
+
+
+def test_lookup_progress_bypasses_allocation_head_of_line(
+    restore_test_model, monkeypatch
+):
+    """A rejected admission must not prevent later lookup results becoming ready."""
+    scheduler = _create_restore_scheduler(
+        model=restore_test_model, max_num_seqs=4, max_num_batched_tokens=64
+    )
+    first, second = create_requests(num_requests=2, num_tokens=32)
+    for request in (first, second):
+        scheduler.add_request(request)
+    ready = {first.request_id}
+    connector = scheduler.connector
+    monkeypatch.setattr(
+        connector,
+        "get_num_new_matched_tokens",
+        lambda request, _: (16, True) if request.request_id in ready else (None, False),
+    )
+    monkeypatch.setattr(
+        connector, "progress_lookups", lambda: ready.add(second.request_id)
+    )
+    allocate = Mock(return_value=None)
+    monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_slots", allocate)
+    assert scheduler.schedule().total_num_scheduled_tokens == 0
+    assert connector.get_num_new_matched_tokens(second, 0) == (None, False)
+    calls = allocate.call_count
+    scheduler.progress_kv_lookups()
+    scheduler.progress_kv_lookups()
+    assert connector.get_num_new_matched_tokens(second, 0) == (16, True)
+    assert allocate.call_count == calls
+    assert all(r.status == RequestStatus.WAITING for r in (first, second))
+    assert not scheduler._inflight_prefills
+
+
+def test_lookup_progress_without_connector_does_not_schedule():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.connector = None
+    scheduler.progress_kv_lookups()
+
+
+def test_independent_restore_completion_preserves_model_step(restore_test_model):
+    scheduler = _create_restore_scheduler(
+        model=restore_test_model, max_num_seqs=4, max_num_batched_tokens=64
+    )
+    request = create_requests(num_requests=1, num_tokens=32)[0]
+    scheduler.add_request(request)
+    assert scheduler.schedule().total_num_scheduled_tokens == 0
+    previous_step = scheduler.processed_step_seq
+    assert (
+        scheduler.update_async_kv_loads(
+            KVConnectorOutput(finished_recving={request.request_id})
+        )
+        == {}
+    )
+    assert scheduler.processed_step_seq == previous_step
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request.request_id in scheduler.finished_recving_kv_req_ids
+    assert scheduler.schedule().num_scheduled_tokens == {request.request_id: 16}
+
+
+def test_independent_restore_failure_waits_for_completion_before_recompute(
+    restore_test_model, monkeypatch
+):
+    scheduler = _create_restore_scheduler(
+        model=restore_test_model, kv_load_failure_policy="recompute"
+    )
+    request = create_requests(num_requests=1, num_tokens=32)[0]
+    scheduler.add_request(request)
+    scheduler.schedule()
+    blocks = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    previous_step = scheduler.processed_step_seq
+    assert (
+        scheduler.update_async_kv_loads(
+            KVConnectorOutput(invalid_block_ids={blocks[0][0]})
+        )
+        == {}
+    )
+    assert request.request_id in scheduler.failed_recving_kv_req_ids
+    assert request.num_computed_tokens == 0
+    assert scheduler.schedule().total_num_scheduled_tokens == 0
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler.kv_cache_manager.get_block_ids(request.request_id) == blocks
+    scheduler.update_async_kv_loads(
+        KVConnectorOutput(finished_recving={request.request_id})
+    )
+    monkeypatch.setattr(
+        scheduler.connector, "get_num_new_matched_tokens", lambda *_: (0, False)
+    )
+    assert scheduler.schedule().num_scheduled_tokens == {request.request_id: 32}
+    assert scheduler.processed_step_seq == previous_step
+
+
+@pytest.mark.parametrize("finish_together", [False, True])
+def test_independent_restore_failure_returns_client_error(
+    restore_test_model, finish_together
+):
+    scheduler = _create_restore_scheduler(
+        model=restore_test_model, kv_load_failure_policy="fail"
+    )
+    request = create_requests(num_requests=1, num_tokens=32)[0]
+    request.client_index = 7
+    scheduler.add_request(request)
+    scheduler.schedule()
+    blocks = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    previous_step = scheduler.processed_step_seq
+    result = scheduler.update_async_kv_loads(
+        KVConnectorOutput(
+            invalid_block_ids={blocks[0][0]},
+            finished_recving={request.request_id} if finish_together else None,
+        )
+    )
+    assert result.keys() == {7}
+    error = result[7].outputs[0]
+    assert error.request_id == request.request_id
+    assert error.finish_reason == FinishReason.ERROR
+    assert error.new_token_ids == []
+    assert request.status == RequestStatus.FINISHED_ERROR
+    if not finish_together:
+        assert request.request_id in scheduler.requests
+        assert scheduler.kv_cache_manager.get_block_ids(request.request_id) == blocks
+        assert (
+            scheduler.update_async_kv_loads(
+                KVConnectorOutput(finished_recving={request.request_id})
+            )
+            == {}
+        )
+    assert request.request_id not in scheduler.requests
+    assert scheduler.processed_step_seq == previous_step

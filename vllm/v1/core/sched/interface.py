@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutputs
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.metrics.stats import SchedulerStats
-    from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+    from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
     from vllm.v1.request import Request, RequestStatus
     from vllm.v1.structured_output import StructuredOutputManager
 
@@ -57,6 +57,16 @@ class SchedulerInterface(ABC):
     def schedule_kv_loads(self) -> "SchedulerOutput | None":
         """Optionally admit asynchronous loads without scheduling model tokens."""
         return None
+
+    def progress_kv_lookups(self) -> None:
+        """Poll external cache lookups without allocating blocks or model tokens."""
+        return None
+
+    def update_async_kv_loads(
+        self, output: "KVConnectorOutput"
+    ) -> dict[int, "EngineCoreOutputs"]:
+        """Apply independent receive notifications without completing model work."""
+        raise NotImplementedError
 
     @abstractmethod
     def schedule(self, throttle_prefills: bool = False) -> "SchedulerOutput":
