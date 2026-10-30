@@ -217,6 +217,8 @@ class Scheduler(SchedulerInterface):
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
         self._restore_ready_at: dict[str, float] = {}
+        self._inflight_model_batches = 0
+        self._recent_restore_batch_sizes: deque[int] = deque(maxlen=16)
         transfer_config = vllm_config.kv_transfer_config
         self.async_load_prefetch = bool(
             self.connector is not None
@@ -520,8 +522,21 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+    def set_inflight_model_batches(self, count: int) -> None:
+        self._inflight_model_batches = count
+
+    def schedule_kv_loads(self) -> SchedulerOutput | None:
+        if not self.async_load_prefetch or not self.use_v2_model_runner:
+            return None
+        return self.schedule(prefetch_only=True)
+
+    def schedule(
+        self, throttle_prefills: bool = False, *, prefetch_only: bool = False
+    ) -> SchedulerOutput:
         self.current_step += 1
+        restored_candidates = (
+            self.finished_recving_kv_req_ids - self.failed_recving_kv_req_ids
+        )
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -540,7 +555,7 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
+        token_budget = 0 if prefetch_only else self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
         input_budget = self.scheduler_config.max_num_batched_tokens
@@ -826,7 +841,7 @@ class Scheduler(SchedulerInterface):
                 request_id = request.request_id
 
                 if (
-                    coalesce_restores
+                    (coalesce_restores or prefetch_only)
                     and request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
                     and request_id in self.finished_recving_kv_req_ids
                     and request_id not in self.failed_recving_kv_req_ids
@@ -1274,6 +1289,11 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+        restored_batch_size = len(
+            restored_candidates.intersection(num_scheduled_tokens)
+        )
+        if restored_batch_size:
+            self._recent_restore_batch_sizes.append(restored_batch_size)
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 
         assert token_budget >= 0
@@ -2878,29 +2898,37 @@ class Scheduler(SchedulerInterface):
     def _should_coalesce_async_restores(
         self, token_budget: int, has_running_work: bool
     ) -> bool:
-        """Collect a partial restored batch without blocking the scheduler thread."""
-        if self.async_load_batch_wait_s <= 0 or has_running_work or token_budget <= 0:
+        """Collect observed-size batches only behind useful in-flight compute."""
+        if (
+            self.async_load_batch_wait_s <= 0
+            or not self._inflight_model_batches
+            or has_running_work
+            or token_budget <= 0
+        ):
             return False
         ready_tokens = []
         ready_times = []
-        pending = False
         for request in self.skipped_waiting:
             if request.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
                 continue
             req_id = request.request_id
-            if req_id not in self.finished_recving_kv_req_ids:
-                pending = True
-            elif req_id not in self.failed_recving_kv_req_ids:
+            if (
+                req_id in self.finished_recving_kv_req_ids
+                and req_id not in self.failed_recving_kv_req_ids
+            ):
                 ready_tokens.append(
                     max(1, request.num_tokens - request.num_computed_tokens)
                 )
                 ready_times.append(self._restore_ready_at[req_id])
-        if not pending or not ready_tokens:
+        if not ready_tokens:
             return False
         # No further whole request would fit; do not hold a full batch.
         if sum(ready_tokens) + min(ready_tokens) > token_budget or len(
             ready_tokens
         ) >= self.max_num_running_reqs - len(self.running):
+            return False
+        target_size = max(self._recent_restore_batch_sizes, default=0)
+        if len(ready_tokens) >= target_size:
             return False
         return time.monotonic() - min(ready_times) < self.async_load_batch_wait_s
 

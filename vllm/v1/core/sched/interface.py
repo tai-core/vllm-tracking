@@ -50,6 +50,14 @@ class SchedulerInterface(ABC):
     ) -> None:
         raise NotImplementedError
 
+    def set_inflight_model_batches(self, count: int) -> None:
+        """Publish compute queue occupancy for optional restore admission policies."""
+        return None
+
+    def schedule_kv_loads(self) -> "SchedulerOutput | None":
+        """Optionally admit asynchronous loads without scheduling model tokens."""
+        return None
+
     @abstractmethod
     def schedule(self, throttle_prefills: bool = False) -> "SchedulerOutput":
         """Schedule the requests to process in this scheduling step.

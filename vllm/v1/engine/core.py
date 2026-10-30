@@ -208,12 +208,26 @@ class EngineCore:
         # schedule and execute batches, and is required by pipeline parallelism
         # to eliminate pipeline bubbles.
         self.batch_queue_size = vllm_config.max_concurrent_batches
+        transfer_config = vllm_config.kv_transfer_config
+        self.progress_async_loads = bool(
+            transfer_config is not None
+            and transfer_config.enable_async_load_prefetch
+            and vllm_config.scheduler_config.async_scheduling
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+            and vllm_config.parallel_config.data_parallel_size == 1
+            and vllm_config.use_v2_model_runner
+            and vllm_config.speculative_config is None
+            and self.model_executor.supports_nonblocking_result_poll
+            and self.batch_queue_size > 1
+        )
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
         ) = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
-            self.batch_queue = deque(maxlen=self.batch_queue_size)
+            self.batch_queue = deque(
+                maxlen=self.batch_queue_size + int(self.progress_async_loads)
+            )
 
         self.is_ec_consumer = (
             vllm_config.ec_transfer_config is None
@@ -661,6 +675,10 @@ class EngineCore:
         is full or no other requests can be scheduled, we block until the first
         batch in the job queue is finished.
         3. Update the scheduler from the output.
+
+        Async restore progress polls the oldest result instead of blocking and
+        permits one extra zero-token queue entry without increasing forward
+        concurrency. The outer loop can ingest requests between polls.
         """
 
         batch_queue = self.batch_queue
@@ -669,46 +687,69 @@ class EngineCore:
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
-        assert len(batch_queue) < self.batch_queue_size
+        progress_loads = self.progress_async_loads
+        queue_limit = self.batch_queue_size + int(progress_loads)
+        assert len(batch_queue) <= queue_limit
+        compute_batches = sum(
+            output.total_num_scheduled_tokens > 0 for _, output, _ in batch_queue
+        )
+        if progress_loads:
+            self.scheduler.set_inflight_model_batches(compute_batches)
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-            with self.log_error_detail(scheduler_output):
-                exec_future = self.model_executor.execute_model(
-                    scheduler_output, non_block=True
-                )
-            if self.is_ec_consumer:
-                model_executed = scheduler_output.total_num_scheduled_tokens > 0
-
-            if self.is_pooling_model or not model_executed:
-                # No sampling required (no requests scheduled).
-                future = cast(Future[ModelRunnerOutput], exec_future)
+        # Retire control replies before planning another forward. Otherwise a
+        # control entry could hide the preceding forward's grammar dependency.
+        retire_control_first = bool(
+            progress_loads
+            and batch_queue
+            and batch_queue[-1][1].total_num_scheduled_tokens == 0
+        )
+        if (
+            self.scheduler.has_requests()
+            and len(batch_queue) < queue_limit
+            and not retire_control_first
+        ):
+            if progress_loads and compute_batches >= self.batch_queue_size:
+                scheduler_output = self.scheduler.schedule_kv_loads()
             else:
-                if not scheduler_output.pending_structured_output_tokens:
-                    # We aren't waiting for any tokens, get any grammar output
-                    # and sample immediately.
-                    grammar_output = self.scheduler.get_grammar_bitmask(
-                        scheduler_output
+                scheduler_output = self.scheduler.schedule(
+                    self._should_throttle_prefills()
+                )
+            if scheduler_output is not None:
+                with self.log_error_detail(scheduler_output):
+                    exec_future = self.model_executor.execute_model(
+                        scheduler_output, non_block=True
                     )
-                    future = self.model_executor.sample_tokens(
-                        grammar_output, non_block=True
-                    )
-                else:
-                    # We need to defer sampling until we have processed the model output
-                    # from the prior step.
-                    deferred_scheduler_output = scheduler_output
+                if self.is_ec_consumer:
+                    model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
-            if not deferred_scheduler_output:
-                # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
-                if len(batch_queue) < self.batch_queue_size and (
-                    model_executed or self.scheduler.has_requests()
-                ):
-                    # Don't block on next worker response unless the queue is full
-                    # or there are no more requests to schedule.
-                    return None, model_executed
+                if self.is_pooling_model or not model_executed:
+                    # No sampling required (no requests scheduled).
+                    future = cast(Future[ModelRunnerOutput], exec_future)
+                else:
+                    if not scheduler_output.pending_structured_output_tokens:
+                        # We aren't waiting for any tokens, get any grammar output
+                        # and sample immediately.
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
+                    else:
+                        # Defer sampling until the prior step's output is processed.
+                        deferred_scheduler_output = scheduler_output
+
+                if not deferred_scheduler_output:
+                    # Add this step's future to the queue.
+                    batch_queue.appendleft((future, scheduler_output, exec_future))
+                    if len(batch_queue) < self.batch_queue_size and (
+                        model_executed or self.scheduler.has_requests()
+                    ):
+                        # Don't block on next worker response unless the queue is full
+                        # or there are no more requests to schedule.
+                        return None, model_executed
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
@@ -716,7 +757,17 @@ class EngineCore:
             # is non-empty.
             return None, False
 
-        # Block until the next result is available.
+        # A polling pass leaves input intake/lookup progress to the outer loop.
+        # Multiproc futures require poll(): done() alone does not receive replies.
+        if progress_loads and deferred_scheduler_output is None:
+            oldest = batch_queue[-1][0]
+            poll = getattr(oldest, "poll", None)
+            ready = poll() if callable(poll) else oldest.done()
+            if not ready:
+                time.sleep(0.001)
+                return None, model_executed
+
+        # Consume the oldest result in the original RPC order.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,

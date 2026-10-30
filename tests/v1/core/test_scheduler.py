@@ -6348,6 +6348,8 @@ def test_restore_completion_aware_batching(restore_test_model, monkeypatch, rele
         max_num_batched_tokens=32,
     )
     scheduler.async_load_batch_wait_s = 0.25
+    scheduler.set_inflight_model_batches(1)
+    scheduler._recent_restore_batch_sizes.append(2)
     requests = create_requests(num_requests=3, num_tokens=32)
     for request in requests:
         scheduler.add_request(request)
@@ -6396,3 +6398,61 @@ def test_restore_completion_aware_batching(restore_test_model, monkeypatch, rele
         assert out.total_num_scheduled_tokens > 0
         assert ready[0].status == RequestStatus.RUNNING
         assert ready[0].request_id not in scheduler._restore_ready_at
+
+
+def test_restore_batching_never_holds_idle_compute(restore_test_model):
+    scheduler = _create_restore_scheduler(
+        model=restore_test_model, max_num_seqs=4, max_num_batched_tokens=64
+    )
+    scheduler.async_load_batch_wait_s = 0.25
+    scheduler._recent_restore_batch_sizes.append(4)
+    requests = create_requests(num_requests=2, num_tokens=32)
+    for request in requests:
+        scheduler.add_request(request)
+    out = scheduler.schedule()
+    scheduler.update_from_output(
+        out,
+        dataclasses.replace(
+            EMPTY_MODEL_RUNNER_OUTPUT,
+            kv_connector_output=KVConnectorOutput(
+                finished_recving={requests[0].request_id}
+            ),
+        ),
+    )
+    scheduler.set_inflight_model_batches(0)
+    assert scheduler.schedule().num_scheduled_tokens == {requests[0].request_id: 16}
+
+
+def test_restore_control_step_preserves_ready_then_schedules_next_chunk(
+    restore_test_model,
+):
+    scheduler = _create_restore_scheduler(
+        model=restore_test_model, max_num_seqs=4, max_num_batched_tokens=64
+    )
+    scheduler.async_load_prefetch = True
+    scheduler.use_v2_model_runner = True
+    first, second = create_requests(num_requests=2, num_tokens=32)
+    scheduler.add_request(first)
+    out = scheduler.schedule()
+    scheduler.update_from_output(
+        out,
+        dataclasses.replace(
+            EMPTY_MODEL_RUNNER_OUTPUT,
+            kv_connector_output=KVConnectorOutput(finished_recving={first.request_id}),
+        ),
+    )
+    scheduler.add_request(second)
+    control = scheduler.schedule_kv_loads()
+    assert control.total_num_scheduled_tokens == 0
+    assert first.request_id in scheduler.finished_recving_kv_req_ids
+    assert second.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.update_from_output(
+        control,
+        dataclasses.replace(
+            EMPTY_MODEL_RUNNER_OUTPUT,
+            kv_connector_output=KVConnectorOutput(finished_recving={second.request_id}),
+        ),
+    )
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {first.request_id: 16, second.request_id: 16}
+    assert max(scheduler._recent_restore_batch_sizes) == 2

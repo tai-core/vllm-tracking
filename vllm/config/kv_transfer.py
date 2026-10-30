@@ -77,8 +77,9 @@ class KVTransferConfig:
     completion still uses finished_recving. Disabled by default."""
 
     async_load_batch_wait_ms: float = 0.0
-    """Maximum time to collect a batch of restored prefills while other restores
-    are in flight. A full batch, the last restore, and running work bypass the
+    """Maximum time to collect restored prefills behind in-flight model work.
+    The target is the largest of the last 16 actual restored-prefill batches.
+    Idle compute, an attained target, full batches and running work bypass the
     wait. Zero disables coalescing."""
 
     def compute_hash(self) -> str:
