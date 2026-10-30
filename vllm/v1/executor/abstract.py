@@ -13,6 +13,7 @@ from vllm.distributed.ec_transfer.ec_connector.utils import ECOutputAggregator
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
+    KVConnectorMetadata,
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -22,7 +23,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import ReconfigureDistributedRequest
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 if TYPE_CHECKING:
@@ -45,6 +46,16 @@ class Executor(ABC):
     uses_ray: bool = False  # whether the executor uses Ray for orchestration.
     supports_pp: bool = False  # whether the executor supports PP
     supports_nonblocking_result_poll: bool = False
+
+    def initialize_async_kv_loads(self) -> bool:
+        """Enable an independent restore control channel when supported."""
+        return False
+
+    def submit_async_kv_loads(self, metadata: KVConnectorMetadata) -> None:
+        raise NotImplementedError
+
+    def poll_async_kv_loads(self) -> KVConnectorOutput | None:
+        return None
 
     @staticmethod
     def get_class(vllm_config: VllmConfig) -> type["Executor"]:

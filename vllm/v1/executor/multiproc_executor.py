@@ -31,6 +31,7 @@ from vllm.distributed import destroy_distributed_environment, destroy_model_para
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.distributed.ec_transfer.ec_connector.utils import ECOutputAggregator
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_dp_group,
@@ -69,7 +70,12 @@ from vllm.utils.torch_utils import (
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
-from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    DraftTokenIds,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+)
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -235,6 +241,10 @@ class MultiprocExecutor(Executor):
                 if inherited_fds is not None:
                     inherited_fds.append(unready_worker_handle.death_writer.fileno())
                     inherited_fds.append(unready_worker_handle.ready_pipe.fileno())
+                    if unready_worker_handle.kv_control_pipe is not None:
+                        inherited_fds.append(
+                            unready_worker_handle.kv_control_pipe.fileno()
+                        )
 
             # Workers must be created before wait_for_ready to avoid
             # deadlock, since worker.init_device() does a device sync.
@@ -287,12 +297,72 @@ class MultiprocExecutor(Executor):
                 # Clean up the worker procs if there was a failure.
                 # Close death_writers first to signal workers to exit
                 for uw in unready_workers:
+                    if uw.kv_control_pipe is not None:
+                        uw.kv_control_pipe.close()
                     if uw.death_writer is not None:
                         uw.death_writer.close()
                         uw.death_writer = None
                 self._ensure_worker_termination([uw.proc for uw in unready_workers])
 
         self.output_rank = self._get_output_rank()
+
+    def initialize_async_kv_loads(self) -> bool:
+        if self.world_size != self.local_world_size or any(
+            w.kv_control_pipe is None for w in self.workers
+        ):
+            return False
+        supported = self.collective_rpc("initialize_async_kv_loads")
+        if not any(supported):
+            return False
+        if not all(supported):
+            raise RuntimeError("Async KV load support differs across workers")
+        self._kv_control_enabled = True
+        self._kv_recv_ranks: dict[str, set[int]] = {}
+        self._kv_control_error: str | None = None
+        return True
+
+    def submit_async_kv_loads(self, metadata: KVConnectorMetadata) -> None:
+        if not getattr(self, "_kv_control_enabled", False):
+            raise RuntimeError("Async KV control is not initialized")
+        if self._kv_control_error is not None:
+            raise RuntimeError(self._kv_control_error)
+        for worker in self.workers:
+            assert worker.kv_control_pipe is not None
+            worker.kv_control_pipe.send(metadata)
+
+    def poll_async_kv_loads(self) -> KVConnectorOutput | None:
+        if not getattr(self, "_kv_control_enabled", False):
+            return None
+        if self._kv_control_error is not None:
+            raise RuntimeError(self._kv_control_error)
+        finished: set[str] = set()
+        invalid_blocks: set[int] = set()
+        for worker in self.workers:
+            pipe = worker.kv_control_pipe
+            assert pipe is not None
+            while pipe.poll():
+                try:
+                    status, output = pipe.recv()
+                except EOFError as error:
+                    self._kv_control_error = f"KV control worker {worker.rank} exited"
+                    raise RuntimeError(self._kv_control_error) from error
+                if status == WorkerProc.ResponseStatus.FAILURE:
+                    self._kv_control_error = (
+                        f"KV control worker {worker.rank}: {output}"
+                    )
+                    raise RuntimeError(self._kv_control_error)
+                invalid_blocks.update(output.invalid_block_ids)
+                for request_id in output.finished_recving or ():
+                    ranks = self._kv_recv_ranks.setdefault(request_id, set())
+                    ranks.add(worker.rank)
+                    if len(ranks) == self.world_size:
+                        finished.add(request_id)
+                        del self._kv_recv_ranks[request_id]
+        if not finished and not invalid_blocks:
+            return None
+        return KVConnectorOutput(
+            finished_recving=finished or None, invalid_block_ids=invalid_blocks
+        )
 
     def get_response_mqs(self, unique_reply_rank: int = -1) -> list[MessageQueue]:
         assert unique_reply_rank >= -1 and unique_reply_rank < self.world_size, (
@@ -565,6 +635,9 @@ class MultiprocExecutor(Executor):
             # Make sure all the worker processes are terminated first.
             if workers := getattr(self, "workers", None):
                 for w in workers:
+                    if w.kv_control_pipe is not None:
+                        w.kv_control_pipe.close()
+                        w.kv_control_pipe = None
                     # Close death_writer to signal child processes to exit
                     if w.death_writer is not None:
                         w.death_writer.close()
@@ -620,6 +693,7 @@ class UnreadyWorkerProcHandle:
     rank: int
     ready_pipe: Connection
     death_writer: Connection | None = None
+    kv_control_pipe: Connection | None = None
 
 
 @dataclass
@@ -633,6 +707,7 @@ class WorkerProcHandle:
     # `peer_worker_response_mqs[i]`
     peer_worker_response_mqs: list[MessageQueue | None]
     death_writer: Connection | None = None
+    kv_control_pipe: Connection | None = None
 
     @classmethod
     def from_unready_handle(
@@ -647,6 +722,7 @@ class WorkerProcHandle:
             worker_response_mq=worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
             death_writer=unready_handle.death_writer,
+            kv_control_pipe=unready_handle.kv_control_pipe,
         )
 
 
@@ -770,9 +846,19 @@ class WorkerProc:
         ready_reader, ready_writer = context.Pipe(duplex=False)
         # Death pipe to let child detect parent process exit
         death_reader, death_writer = context.Pipe(duplex=False)
+        kv_parent = kv_child = None
+        kv_config = vllm_config.kv_transfer_config
+        if (
+            kv_config is not None
+            and kv_config.enable_async_load_prefetch
+            and vllm_config.parallel_config.nnodes_within_dp == 1
+        ):
+            kv_parent, kv_child = context.Pipe()
         if inherited_fds is not None:
             inherited_fds = inherited_fds.copy()
             inherited_fds.extend((ready_reader.fileno(), death_writer.fileno()))
+            if kv_parent is not None:
+                inherited_fds.append(kv_parent.fileno())
         process_kwargs = {
             "vllm_config": vllm_config,
             "local_rank": local_rank,
@@ -781,6 +867,7 @@ class WorkerProc:
             "input_shm_handle": input_shm_handle,
             "ready_pipe": ready_writer,
             "death_pipe": death_reader,
+            "kv_control_pipe": kv_child,
             "shared_worker_lock": shared_worker_lock,
             "is_driver_worker": is_driver_worker,
             # Have the worker close parent end of this worker's pipes too
@@ -803,9 +890,13 @@ class WorkerProc:
         # Close child ends of pipes here in the parent
         ready_writer.close()
         death_reader.close()
+        if kv_child is not None:
+            kv_child.close()
         # Keep death_writer open in parent - when parent exits,
         # death_reader in child will get EOFError
-        return UnreadyWorkerProcHandle(proc, rank, ready_reader, death_writer)
+        return UnreadyWorkerProcHandle(
+            proc, rank, ready_reader, death_writer, kv_parent
+        )
 
     @staticmethod
     def wait_for_response_handle_ready(
@@ -867,6 +958,10 @@ class WorkerProc:
         return cast(list[WorkerProcHandle], ready_proc_handles)
 
     def shutdown(self):
+        if stop := getattr(self, "_kv_control_stop", None):
+            stop.set()
+            self._kv_control_thread.join()
+            self._kv_control_pipe.close()
         if self.rpc_broadcast_mq is not None:
             self.rpc_broadcast_mq.shutdown()
         if self.worker_response_mq is not None:
@@ -941,6 +1036,7 @@ class WorkerProc:
         worker = None
         ready_writer = kwargs.pop("ready_pipe")
         death_pipe = kwargs.pop("death_pipe", None)
+        kv_control_pipe = kwargs.pop("kv_control_pipe", None)
 
         # Close inherited pipes from parent (incl. other worker pipes)
         # Explicitly passing in existing pipes and closing them makes the pipe
@@ -967,6 +1063,8 @@ class WorkerProc:
                 numa_utils.log_current_affinity_state(f"Worker_{worker.rank}")
 
             worker.monitor_death_pipe(death_pipe, shutdown_requested)
+            if kv_control_pipe is not None:
+                worker.start_kv_control_thread(kv_control_pipe)
 
             # Send READY once we know everything is loaded
             ready_writer.send(
@@ -1027,6 +1125,8 @@ class WorkerProc:
             # Clean up once worker exits busy loop
             if worker is not None:
                 worker.shutdown()
+            elif kv_control_pipe is not None:
+                kv_control_pipe.close()
 
     class ResponseStatus(Enum):
         SUCCESS = auto()
@@ -1078,6 +1178,49 @@ class WorkerProc:
         while True:
             output = self.async_output_queue.get()
             self.enqueue_output(output)
+
+    def start_kv_control_thread(self, connection: Connection) -> None:
+        self._kv_control_pipe = connection
+        self._kv_control_stop = threading.Event()
+        self._kv_control_thread = Thread(
+            target=self.kv_control_busy_loop, daemon=True, name="WorkerKVRestore"
+        )
+        self._kv_control_thread.start()
+
+    def kv_control_busy_loop(self) -> None:
+        pending: set[str] = set()
+        connection = self._kv_control_pipe
+        try:
+            if hasattr(self.worker, "device"):
+                current_platform.set_device(self.worker.device)
+            while not self._kv_control_stop.is_set():
+                if connection.poll(0.001 if pending else 0.1):
+                    metadata = connection.recv()
+                    pending.update(self.worker.start_async_kv_loads(metadata))
+                    del metadata
+                if not pending:
+                    continue
+                output = self.worker.poll_async_kv_loads()
+                if output is None:
+                    continue
+                finished = (output.finished_recving or set()) & pending
+                pending.difference_update(finished)
+                if finished or output.invalid_block_ids:
+                    connection.send(
+                        (
+                            self.ResponseStatus.SUCCESS,
+                            KVConnectorOutput(
+                                finished_recving=finished or None,
+                                invalid_block_ids=output.invalid_block_ids,
+                            ),
+                        )
+                    )
+        except EOFError:
+            return
+        except Exception as error:
+            logger.exception("Worker restore control failed")
+            with suppress(BrokenPipeError, OSError):
+                connection.send((self.ResponseStatus.FAILURE, str(error)))
 
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""

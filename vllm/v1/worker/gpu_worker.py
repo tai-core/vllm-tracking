@@ -38,6 +38,7 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
+    KVConnectorMetadata,
 )
 from vllm.distributed.parallel_state import (
     Handle,
@@ -79,6 +80,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     DraftTokenIds,
+    KVConnectorOutput,
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
@@ -1108,6 +1110,28 @@ class Worker(WorkerBase):
                 ]
             )
         return self.profiler.annotate_context_manager(annotation)
+
+    def initialize_async_kv_loads(self) -> bool:
+        if not self.use_v2_model_runner or not has_kv_transfer_group():
+            return False
+        if not get_kv_transfer_group().initialize_async_loads():
+            return False
+        # Cache initialization precedes this RPC. Later asynchronous loads write
+        # private allocator-owned pages; Core retains them until receive finishes.
+        initialized = torch.cuda.Event()
+        initialized.record()
+        self._async_load_stream = torch.cuda.Stream(device=self.device)
+        self._async_load_stream.wait_event(initialized)
+        return True
+
+    @torch.inference_mode()
+    def start_async_kv_loads(self, metadata: KVConnectorMetadata) -> set[str]:
+        with torch.cuda.stream(self._async_load_stream):
+            return get_kv_transfer_group().start_async_loads(metadata)
+
+    def poll_async_kv_loads(self) -> KVConnectorOutput | None:
+        with torch.cuda.stream(self._async_load_stream):
+            return get_kv_transfer_group().poll_async_loads()
 
     @torch.inference_mode()
     @with_gpu_sync_check

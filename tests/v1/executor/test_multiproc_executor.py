@@ -276,3 +276,258 @@ def test_poll_without_readiness_callback_fails_instead_of_spinning():
     with pytest.raises(RuntimeError, match="no non-blocking readiness callback"):
         future.poll()
     assert future.result() == 7
+
+
+def _kv_control_executor(connections):
+    return SimpleNamespace(
+        world_size=len(connections),
+        local_world_size=len(connections),
+        workers=[
+            SimpleNamespace(rank=rank, kv_control_pipe=pipe)
+            for rank, pipe in enumerate(connections)
+        ],
+        _kv_control_enabled=True,
+        _kv_recv_ranks={},
+        _kv_control_error=None,
+    )
+
+
+def test_restore_control_requires_all_cp8_ranks_without_duplicate_credit():
+    """Control completion must not enter the normal ordered RPC reply stream."""
+    import multiprocessing
+
+    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+    from vllm.v1.outputs import KVConnectorOutput
+
+    pairs = [multiprocessing.Pipe() for _ in range(8)]
+    executor = _kv_control_executor([parent for parent, _ in pairs])
+    try:
+        for _, child in pairs[:-1]:
+            child.send(
+                (
+                    WorkerProc.ResponseStatus.SUCCESS,
+                    KVConnectorOutput(finished_recving={"req"}),
+                )
+            )
+        assert MultiprocExecutor.poll_async_kv_loads(executor) is None
+        pairs[0][1].send(
+            (
+                WorkerProc.ResponseStatus.SUCCESS,
+                KVConnectorOutput(finished_recving={"req"}, invalid_block_ids={3}),
+            )
+        )
+        output = MultiprocExecutor.poll_async_kv_loads(executor)
+        assert output.finished_recving is None
+        assert output.invalid_block_ids == {3}
+        pairs[-1][1].send(
+            (
+                WorkerProc.ResponseStatus.SUCCESS,
+                KVConnectorOutput(finished_recving={"req"}),
+            )
+        )
+        assert MultiprocExecutor.poll_async_kv_loads(executor).finished_recving == {
+            "req"
+        }
+        assert executor._kv_recv_ranks == {}
+        assert MultiprocExecutor.poll_async_kv_loads(executor) is None
+    finally:
+        for pair in pairs:
+            for pipe in pair:
+                pipe.close()
+
+
+def test_restore_control_failure_remains_terminal():
+    import multiprocessing
+
+    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+    parent, child = multiprocessing.Pipe()
+    executor = _kv_control_executor([parent])
+    try:
+        child.send((WorkerProc.ResponseStatus.FAILURE, "restore failed"))
+        for _ in range(2):
+            with pytest.raises(
+                RuntimeError, match="KV control worker 0: restore failed"
+            ):
+                MultiprocExecutor.poll_async_kv_loads(executor)
+        with pytest.raises(RuntimeError, match="restore failed"):
+            MultiprocExecutor.submit_async_kv_loads(executor, object())
+    finally:
+        parent.close()
+        child.close()
+
+
+def test_restore_control_progresses_while_forward_rpc_is_blocked():
+    import multiprocessing
+    import threading
+
+    from vllm.v1.outputs import KVConnectorOutput
+
+    parent, child = multiprocessing.Pipe()
+    forward_entered, release_forward = threading.Event(), threading.Event()
+    submitted = []
+    responses = []
+
+    def forward():
+        forward_entered.set()
+        assert release_forward.wait(5)
+        return "forward result"
+
+    def submit(metadata):
+        submitted.append(metadata)
+        return {"req"}
+
+    worker: Any = WorkerProc.__new__(WorkerProc)
+    worker.rank = 0
+    worker.worker = SimpleNamespace(
+        forward=forward,
+        start_async_kv_loads=submit,
+        poll_async_kv_loads=lambda: KVConnectorOutput(finished_recving={"req"}),
+    )
+    worker.handle_output = responses.append
+    worker.start_kv_control_thread(child)
+    main = threading.Thread(
+        target=worker._execute_worker_rpc, args=(("forward", (), {}, None),)
+    )
+    main.start()
+    try:
+        assert forward_entered.wait(5)
+        parent.send("restore metadata")
+        assert parent.poll(5)
+        status, output = parent.recv()
+        assert status == WorkerProc.ResponseStatus.SUCCESS
+        assert output.finished_recving == {"req"}
+        assert submitted == ["restore metadata"]
+        assert responses == []
+        assert main.is_alive()
+    finally:
+        release_forward.set()
+        main.join(5)
+        worker._kv_control_stop.set()
+        worker._kv_control_thread.join(5)
+        parent.close()
+        child.close()
+    assert responses == ["forward result"]
+    assert not worker._kv_control_thread.is_alive()
+
+
+def test_restore_control_owner_waits_for_load_and_exits_on_parent_eof():
+    import multiprocessing
+    from unittest.mock import Mock
+
+    parent, child = multiprocessing.Pipe()
+    worker: Any = WorkerProc.__new__(WorkerProc)
+    worker.worker = SimpleNamespace(
+        start_async_kv_loads=Mock(), poll_async_kv_loads=Mock()
+    )
+    worker.start_kv_control_thread(child)
+    parent.close()
+    worker._kv_control_thread.join(5)
+    child.close()
+    assert not worker._kv_control_thread.is_alive()
+    worker.worker.start_async_kv_loads.assert_not_called()
+    worker.worker.poll_async_kv_loads.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "support, expected", [([False] * 8, False), ([True] * 8, True)]
+)
+def test_initialize_restore_control_requires_uniform_worker_support(support, expected):
+    from unittest.mock import Mock
+
+    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+    executor = _kv_control_executor([object()] * 8)
+    executor.collective_rpc = Mock(return_value=support)
+    assert MultiprocExecutor.initialize_async_kv_loads(executor) is expected
+    executor.collective_rpc.assert_called_once_with("initialize_async_kv_loads")
+    executor.collective_rpc.return_value = [True, *([False] * 7)]
+    with pytest.raises(RuntimeError, match="differs across workers"):
+        MultiprocExecutor.initialize_async_kv_loads(executor)
+
+
+def test_restore_control_worker_exception_does_not_use_rpc_reply_queue():
+    import multiprocessing
+    from unittest.mock import Mock
+
+    parent, child = multiprocessing.Pipe()
+    worker: Any = WorkerProc.__new__(WorkerProc)
+    worker.worker = SimpleNamespace(
+        start_async_kv_loads=Mock(side_effect=RuntimeError("restore submission failed"))
+    )
+    worker.handle_output = Mock()
+    worker.start_kv_control_thread(child)
+    try:
+        parent.send("metadata")
+        assert parent.poll(5)
+        status, error = parent.recv()
+        assert status == WorkerProc.ResponseStatus.FAILURE
+        assert error == "restore submission failed"
+        worker._kv_control_thread.join(5)
+        assert not worker._kv_control_thread.is_alive()
+        worker.handle_output.assert_not_called()
+    finally:
+        worker._kv_control_stop.set()
+        worker._kv_control_thread.join(5)
+        parent.close()
+        child.close()
+
+
+def test_worker_shutdown_stops_control_before_destroying_device(monkeypatch):
+    import multiprocessing
+    from unittest.mock import Mock
+
+    from vllm.v1.executor import multiproc_executor as module
+
+    parent, child = multiprocessing.Pipe()
+    worker: Any = WorkerProc.__new__(WorkerProc)
+    worker.worker = SimpleNamespace(shutdown=Mock())
+    worker.rpc_broadcast_mq = Mock()
+    worker.worker_response_mq = Mock()
+    worker.start_kv_control_thread(child)
+
+    def destroy():
+        assert not worker._kv_control_thread.is_alive()
+        assert child.closed
+
+    monkeypatch.setattr(module, "destroy_model_parallel", destroy)
+    monkeypatch.setattr(module, "destroy_distributed_environment", destroy)
+    try:
+        worker.shutdown()
+        worker.worker.shutdown.assert_called_once_with()
+    finally:
+        parent.close()
+        child.close()
+
+
+def test_restore_control_preserves_pending_across_empty_polls():
+    import multiprocessing
+    from unittest.mock import Mock
+
+    from vllm.v1.outputs import KVConnectorOutput
+
+    parent, child = multiprocessing.Pipe()
+    worker: Any = WorkerProc.__new__(WorkerProc)
+    poll = Mock(
+        side_effect=[None, None, None, KVConnectorOutput(finished_recving={"req"})]
+    )
+    worker.worker = SimpleNamespace(
+        start_async_kv_loads=Mock(return_value={"req"}),
+        poll_async_kv_loads=poll,
+    )
+    worker.start_kv_control_thread(child)
+    try:
+        parent.send("metadata")
+        assert parent.poll(5)
+        status, output = parent.recv()
+        assert status == WorkerProc.ResponseStatus.SUCCESS
+        assert output.finished_recving == {"req"}
+        assert poll.call_count == 4
+        worker.worker.start_async_kv_loads.assert_called_once_with("metadata")
+        assert worker._kv_control_thread.is_alive()
+        assert not parent.poll()
+    finally:
+        worker._kv_control_stop.set()
+        worker._kv_control_thread.join(5)
+        parent.close()
+        child.close()

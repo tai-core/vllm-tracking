@@ -3,7 +3,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -14,6 +14,35 @@ from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
+
+
+def test_async_load_stream_waits_for_cache_initialization(monkeypatch):
+    worker = SimpleNamespace(use_v2_model_runner=True, device="cuda:3")
+    connector, event, stream = Mock(), Mock(), Mock()
+    connector.initialize_async_loads.return_value = True
+    monkeypatch.setattr(gpu_worker, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(gpu_worker, "get_kv_transfer_group", lambda: connector)
+    monkeypatch.setattr(gpu_worker.torch.cuda, "Event", lambda: event)
+    make_stream = Mock(return_value=stream)
+    monkeypatch.setattr(gpu_worker.torch.cuda, "Stream", make_stream)
+    assert gpu_worker.Worker.initialize_async_kv_loads(worker)
+    event.record.assert_called_once_with()
+    make_stream.assert_called_once_with(device="cuda:3")
+    stream.wait_event.assert_called_once_with(event)
+    event.synchronize.assert_not_called()
+    assert worker._async_load_stream is stream
+
+
+def test_unsupported_connector_does_not_create_control_stream(monkeypatch):
+    worker = SimpleNamespace(use_v2_model_runner=True)
+    connector, create_event = Mock(), Mock()
+    connector.initialize_async_loads.return_value = False
+    monkeypatch.setattr(gpu_worker, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(gpu_worker, "get_kv_transfer_group", lambda: connector)
+    monkeypatch.setattr(gpu_worker.torch.cuda, "Event", create_event)
+    assert not gpu_worker.Worker.initialize_async_kv_loads(worker)
+    create_event.assert_not_called()
+
 
 # Startup-plan persistence (vllm/v1/worker/startup_plan.py), applied and
 # saved by Worker.determine_available_memory / compile_or_warm_up_model.
