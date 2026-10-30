@@ -44,6 +44,7 @@ class Executor(ABC):
 
     uses_ray: bool = False  # whether the executor uses Ray for orchestration.
     supports_pp: bool = False  # whether the executor supports PP
+    supports_nonblocking_result_poll: bool = False
 
     @staticmethod
     def get_class(vllm_config: VllmConfig) -> type["Executor"]:

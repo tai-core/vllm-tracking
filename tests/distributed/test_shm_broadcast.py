@@ -778,3 +778,58 @@ def test_remote_subscribe_addr_unique_concurrent_writers(
 
     for q in queues:
         q.remote_socket.close(linger=0)
+
+
+@pytest.mark.parametrize("overflow", [False, True])
+def test_is_ready_does_not_consume_shared_memory(overflow):
+    from contextlib import nullcontext
+
+    metadata = bytearray([0, 0])
+    data = bytearray([int(overflow)])
+    reader = MessageQueue.__new__(MessageQueue)
+    reader.shutting_down = False
+    reader._is_local_reader = True
+    reader._is_remote_reader = False
+    reader.current_idx = 0
+    reader.local_reader_rank = 0
+    reader.buffer = SimpleNamespace(
+        get_metadata=lambda index: nullcontext(metadata),
+        get_data=lambda index: nullcontext(data),
+    )
+    reader.local_socket = mock.Mock()
+    reader.local_socket.poll.return_value = 0
+
+    assert not reader.is_ready()
+    metadata[0] = 1
+    assert reader.is_ready() is (not overflow)
+    assert metadata == bytearray([1, 0])
+    assert reader.current_idx == 0
+    reader.local_socket.poll.return_value = 1
+    assert reader.is_ready()
+    assert reader.is_ready()
+    assert metadata == bytearray([1, 0])
+    assert reader.current_idx == 0
+    reader.local_socket.recv_multipart.assert_not_called()
+    if overflow:
+        reader.local_socket.poll.assert_called_with(timeout=0)
+    else:
+        reader.local_socket.poll.assert_not_called()
+    metadata[1] = 1
+    assert not reader.is_ready()
+
+
+def test_remote_is_ready_polls_without_receiving_and_honors_shutdown():
+    reader = MessageQueue.__new__(MessageQueue)
+    reader.shutting_down = False
+    reader._is_local_reader = False
+    reader._is_remote_reader = True
+    reader.remote_socket = mock.Mock()
+    reader.remote_socket.poll.return_value = 0
+    assert not reader.is_ready()
+    reader.remote_socket.poll.return_value = 1
+    assert reader.is_ready()
+    reader.remote_socket.poll.assert_called_with(timeout=0)
+    reader.remote_socket.recv_multipart.assert_not_called()
+    reader.shutting_down = True
+    with pytest.raises(RuntimeError, match="cancelled"):
+        reader.is_ready()

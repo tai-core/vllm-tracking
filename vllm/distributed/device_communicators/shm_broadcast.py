@@ -879,6 +879,25 @@ class MessageQueue:
         if self.n_remote_reader > 0:
             self.remote_socket.send_multipart(all_buffers, copy=False)
 
+    def is_ready(self) -> bool:
+        """Check whether the next message can be read without consuming it."""
+        if self.shutting_down:
+            raise RuntimeError("cancelled")
+        if self._is_local_reader:
+            with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
+                memory_fence()
+                read_flag = metadata_buffer[self.local_reader_rank + 1]
+                written_flag = metadata_buffer[0]
+                if not written_flag or read_flag:
+                    return False
+                with self.buffer.get_data(self.current_idx) as buf:
+                    if buf[0] == 1:
+                        return bool(self.local_socket.poll(timeout=0))
+                    return True
+        if self._is_remote_reader:
+            return bool(self.remote_socket.poll(timeout=0))
+        raise RuntimeError("Only readers can check readiness")
+
     def dequeue(
         self,
         timeout: float | None = None,

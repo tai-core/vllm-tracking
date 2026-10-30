@@ -81,12 +81,40 @@ class FutureWrapper(Future):
         futures_queue: deque["FutureWrapper"],
         get_response: Callable[[], Any],
         aggregate: Callable = lambda x: x,
+        is_ready: Callable[[], bool] | None = None,
     ):
         self.futures_queue = futures_queue
         self.get_response = get_response
         self.aggregate = aggregate
+        self.is_ready = is_ready
         super().__init__()
         self.futures_queue.appendleft(self)
+
+    def poll(self) -> bool:
+        """Resolve ready responses in FIFO order without waiting for workers."""
+        while not self.done():
+            future = self.futures_queue[-1]
+            if future.is_ready is None:
+                raise RuntimeError("RPC future has no non-blocking readiness callback")
+            try:
+                if not future.is_ready():
+                    break
+            except Exception as e:
+                self.futures_queue.pop()
+                with suppress(InvalidStateError):
+                    future.set_exception(e)
+            else:
+                self.futures_queue.pop()
+                future._wait_for_response()
+            if not future.cancelled() and (error := future.exception()) is not None:
+                # A failed RPC can leave unread replies. Later RPCs cannot safely
+                # consume these queues; propagate the terminal error instead.
+                while self.futures_queue:
+                    pending = self.futures_queue.pop()
+                    with suppress(InvalidStateError):
+                        pending.set_exception(error)
+                break
+        return self.done()
 
     def result(self, timeout=None):
         if timeout is not None:
@@ -110,6 +138,7 @@ class FutureWrapper(Future):
 
 class MultiprocExecutor(Executor):
     supports_pp: bool = True
+    supports_nonblocking_result_poll: bool = True
 
     def __init__(self, vllm_config: VllmConfig, monitor_workers: bool = True):
         self.monitor_workers = monitor_workers
@@ -423,26 +452,50 @@ class MultiprocExecutor(Executor):
         if output_rank is not None:
             response_mqs = (response_mqs[output_rank],)
 
-        def get_response():
-            responses = []
-            for mq in response_mqs:
-                dequeue_timeout = (
-                    None if deadline is None else max(0.0, deadline - time.monotonic())
+        responses: dict[int, Any] = {}
+
+        def read_response(rank: int, timeout: float | None):
+            try:
+                status, result = response_mqs[rank].dequeue(timeout=timeout)
+            except TimeoutError as e:
+                raise TimeoutError(f"RPC call to {method} timed out.") from e
+            if status != WorkerProc.ResponseStatus.SUCCESS:
+                raise RuntimeError(
+                    f"Worker failed with error '{result}', please check the"
+                    " stack trace above for the root cause"
                 )
-                try:
-                    status, result = mq.dequeue(timeout=dequeue_timeout)
-                except TimeoutError as e:
-                    raise TimeoutError(f"RPC call to {method} timed out.") from e
-                if status != WorkerProc.ResponseStatus.SUCCESS:
-                    raise RuntimeError(
-                        f"Worker failed with error '{result}', please check the"
-                        " stack trace above for the root cause"
+            responses[rank] = result
+
+        def get_response():
+            for rank in range(len(response_mqs)):
+                if rank not in responses:
+                    dequeue_timeout = (
+                        None
+                        if deadline is None
+                        else max(0.0, deadline - time.monotonic())
                     )
-                responses.append(result)
-            return responses[0] if output_rank is not None else responses
+                    read_response(rank, dequeue_timeout)
+            return (
+                responses[0]
+                if output_rank is not None
+                else [responses[rank] for rank in range(len(response_mqs))]
+            )
+
+        def is_ready() -> bool:
+            for rank, mq in enumerate(response_mqs):
+                if rank not in responses and mq.is_ready():
+                    read_response(rank, 0.0)
+            if len(responses) == len(response_mqs):
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"RPC call to {method} timed out.")
+            return False
 
         future = FutureWrapper(
-            self.futures_queue, get_response=get_response, aggregate=aggregate
+            self.futures_queue,
+            get_response=get_response,
+            aggregate=aggregate,
+            is_ready=is_ready,
         )
 
         return future if non_block else future.result()
