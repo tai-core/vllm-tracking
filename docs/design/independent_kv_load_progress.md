@@ -64,3 +64,47 @@ were contiguous and agreed across ranks, and all 48 physical page aliases were
 verified. Full-vocabulary total variation was at most 0.007588; all six top1
 outputs agreed. These synchronized numerical runs are excluded from performance
 measurements. Node08 was not used.
+
+## Matched timing and profile
+
+The primary comparison reuses `continuousrestore20261030b` at 9 RPS. Ordered
+input payloads match after excluding request IDs: 945 issued requests and 812
+measurement requests. Both use 9102 input tokens (8192 cached, 910 new), GPU L1
+plus 96GiB Host L2, 236 automatically sized KV blocks/rank, max batch tokens
+12288, CP8+EP8, and the same persistent weights daemon.
+
+| Metric | Prior candidate | Independent progress |
+| --- | ---: | ---: |
+| Actual offered RPS | 9.480953 | 9.480941 |
+| Logical completion tokens/s | 85,546 | 85,971 |
+| TTFT P50 | 2306.3ms | 1715.5ms |
+| TTFT P90 | 3154.7ms | 2198.4ms |
+| TTFT P99 | 3725.7ms | 2537.7ms |
+| Mean server waiting | 18.22 | 9.53 |
+
+These are single finite windows. P90 improves 30.31%; throughput is essentially
+unchanged at the offered-load ceiling, not a peak-capacity result. The candidate
+has 18 more complete-prefix equivalents served from GPU L1, so this is not a
+fixed-L2-hit-ratio restore microbenchmark. Both runs pass source and queue-trend
+checks with zero preemptions.
+
+A separate 30-second profile observes the following P50 delays:
+
+| Interval | Before | After |
+| --- | ---: | ---: |
+| Admission to lookup actually ready | 959.61ms | 8.96ms |
+| KV allocation to first Worker restore submit | 361.53ms | 10.56ms |
+| Last sampled restore GPU phase to all-rank observation | 367.30ms | 5.82ms |
+| All-rank observation to Core receive | 13.78ms | 3.71ms |
+
+The candidate has 234 complete measurement restore chains and 56 native GPU
+samples. Lookup completion uses its own marker; its later scheduling lookup is
+not treated as the first completion. Sampled copy/scatter union is 3.88ms P50,
+with 98.5% temporal overlap with other-request forward stream spans. Intervals
+are not additive, GPU anchors are approximate, and temporal overlap is not a
+causal savings estimate.
+
+Remaining waits are visible: lookup-ready to allocation is 348ms P50, and ready
+requests can still wait behind model batches. The new control send costs 12.35ms
+wall / 7.81ms thread CPU P50 per control batch. This reduces waiting; it does not
+claim zero cache overhead or 180k logical tokens/s capacity.
