@@ -166,77 +166,88 @@ these are stream intervals, not pure kernel utilization. Operator sampling
 raises CPU time in geometry-matched observations, so its timings only localize
 work; unprofiled windows determine capacity.
 
+## Fixed-KV capacity at an 8192-token batch cap
 
-## Fixed-KV expansion at an 8192-token batch cap
+The November 1 trials retain the same model/cache bundle, CP8+EP8, GPU L1,
+96GiB Host L2, stream restore, HTTP connection policy and existing node07
+weights daemon. Node08 is not accessed. Explicit KV sizing keeps the startup
+profile forward but bypasses automatic KV sizing. AIPerf uses Poisson arrivals,
+without a client concurrency cap, and qualification requires TTFT P90 < 12s
+and no sustained waiting/backlog growth. Input is 9102 tokens: 8192 cached and
+910 newly computed; the reported logical throughput includes the cached input.
 
-The November 1 experiment reuses the final 8192 baseline, code bundle,
-CP8+EP8, L1/L2, stream restore and HTTP connection policy. It changes only
-KV capacity, using explicit `--kv-cache-memory-bytes` in 512MiB steps.
-The startup profile forward still runs; automatic KV sizing is bypassed.
-The existing node07 weights daemon is retained and node08 is not accessed.
+| KV setting/rank | Blocks | Highest qualified nominal RPS observed | Logical tokens/s | Input tokens/min | TTFT P90 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Auto baseline, 3,025,017,816 bytes | 389 | 13 | 116,498 | 6,989,901 | 3.550s |
+| Explicit +512MiB, 3,561,888,728 bytes | 458 | 14 | 124,503 | 7,470,204 | 4.133s |
+| Explicit +1GiB, 4,098,759,640 bytes | 528 | 15 | 133,083 | 7,985,010 | 6.589s |
 
-Before each sweep, an open-loop 20RPS pressure window must produce at least
-three real 8190-token batches, pass request/source checks, and retain at
-least 1GiB sampled free memory on each GPU. Memory is sampled every 200ms,
-so this establishes workload-specific observed headroom, not an instantaneous
-worst-case guarantee. Further expansion requires enough observed margin for
-the next 512MiB step. The pressure window and separate profile are excluded
-from the capacity claim.
+The +512MiB 14RPS window has 4410/4410 successful requests. Its adjacent
+15RPS trial fails with P90=13.292s and growing waiting queues. At matched
+14RPS, full-batch share improves from the auto baseline's 43.52% to 52.33%.
+The minimum sampled free HBM in the +512MiB run is 1.761627GiB.
 
-| KV setting per rank | Blocks | Highest qualified nominal RPS | Logical tokens/s | TTFT P90 |
-| --- | ---: | ---: | ---: | ---: |
-| Auto baseline, 3,025,017,816 bytes | 389 | 13 | 116,498 | 3.550s |
-| Explicit +512MiB, 3,561,888,728 bytes | 458 | 14 | 124,503 | 4.133s |
-| Explicit +1GiB, 4,098,759,640 bytes | 528 | Not swept: memory gate failed | — | — |
+The initial +1GiB pressure run completes 700/700 requests and 72 full
+8190-token batches. It was stopped by an experimental 1GiB free-HBM floor:
+two sampling streams observe minima of 0.964802 and 0.929420GiB. That floor
+was an experiment policy, not a hardware limit or an observed OOM. The
+operator then removes the floor and reuses this full-batch evidence to run
+the same +1GiB configuration through the SLA sweep; HBM monitoring remains.
 
-The +512MiB point has 4410/4410 successful requests, actual arrival 13.717814
-and completion 13.678686 RPS over 306.170 seconds. Waiting falls from 30.24 to
-20.05 between window halves. Throughput is 6.87% above the prior qualified
-peak. At the same 13 RPS offered load, P90 improves from 3.550s to 2.694s; throughput
-is offered-load limited. At 15 RPS, P90 reaches 13.292s and waiting grows, so
-129,355 logical tokens/s is rejected as capacity.
+In that continuation, 14RPS qualifies at 124,593 logical tokens/s and P90
+3.338s. The completed 15RPS window has 4725/4725 successful requests, actual
+arrival/completion 14.631025/14.621346 RPS over 307.427s, and P90=6.588838s.
+Waiting decreases between window halves, with slope -0.10055 requests/s.
+This is 6.89% above the +512MiB qualified throughput and 14.24% above the
+auto baseline. Computed throughput is 13,305 tokens/s; logical throughput
+reaches 73.94% of the 180k target.
 
-At 14 RPS, the mean batch grows from 6688 to 6832 tokens and full-batch share grows from
-43.52% to 52.33%; the prior 14 RPS window was unstable. This improvement does
-not hold at every offered rate: mean batch at 13 RPS is slightly smaller.
-The capacity comparison uses single finite windows, with a fresh pressure
-warmup and unique suffix tokens; it is not an exact-payload causal experiment.
+The operator stops the higher-rate scan to resize Host L2. Therefore 133,083
+logical tokens/s is a qualified finite-window lower bound, not a located
+peak. The interrupted point contributes no capacity result. The raw runner
+summary retains its interrupted RUNNING label; the explicit outcome is
+recorded in `experiments/kv-plus1g-openloop-20261101/interrupted-analysis.json`.
+The stopped owner cleans up its test API, load generator and old L2 servers,
+while retaining the existing weights daemon.
 
-The +512MiB memory gate records 61 full batches. All 8 ranks register 458
-blocks and 334MiB connector overhead; the minimum sampled free memory over
-the complete run is 1.761627GiB. L1 plus L2 hit tokens equal 4410*8192, and
-computed tokens equal 4410*910. No model, kernel or cache protocol changed.
-Run artifacts: `kvplus512m20261101-external`; local analysis:
-`experiments/kv-expansion-20261101/kvplus512m20261101/analysis.json`.
+The source code is unchanged. Comparisons are finite windows with the same
+request geometry and unique suffixes, not exact-payload causal experiments.
+The functional numerical and next-chunk evidence remains the previously
+validated bundle. Profiles are excluded from capacity. A separate +512MiB
+profile still points to allocation/admission and ready-to-schedule waits;
+restore intervals mostly overlap other forwards and are not additive idle.
+
+## Host L2 at 80% of available memory
+
+After stopping the sweep, eight persistent Host-L2 servers replace the old
+96GiB test pool. Their capacity is computed once at startup:
+
+```text
+effective_available = min(host MemAvailable, cgroup memory.max - memory.current)
+per_server = floor(0.8 * effective_available / 8 / 64MiB) * 64MiB
+```
+
+The container limit is 768GiB. Its startup current usage is
+43,468,255,232 bytes, leaving 781,165,465,600 bytes (about 727.52GiB), which
+is tighter than host MemAvailable. Rounding each server down to the allocator's
+64MiB unit gives **72.75GiB per server, 582GiB total**, or 6.0625 times the
+old Host-L2 capacity. GPU L1 continues to share the model's GPU KV pool;
+Host L2 is separate system memory.
+
+The server's internal flag is `--l1-size-gb 72.75`; despite that name it
+configures this Host-L2 tier. The same functional bundle, 8192-token cache
+chunks, separate object groups and rank/port mapping are retained. The
+allocator's lazy mode registers memory in the background up to its configured
+capacity; it is not growth driven only by cache requests.
+
+The L2-only owner is `/runstate/l2available80-20261101/controller.py`; its
+receipt and per-server logs are in the same directory. It keeps only the
+cache services running, without starting a model API or benchmark. The
+582GiB pool has no throughput result yet; the table above used 96GiB Host L2.
 
 
-The +1GiB candidate completes all 700 pressure requests and records 72 full
-batches, but fails the declared headroom floor. Its gate sampler observes
-0.964802GiB minimum free; the independent whole-run sampler observes
-0.929420GiB during the same pressure interval. The sampling phases differ,
-which is why neither is described as an instantaneous peak guarantee.
-All eight ranks register 528 blocks and the same 334MiB connector increment.
-The capacity sweep is intentionally not started. No throughput capacity is
-claimed from this short overload window, and no further 512MiB step is tried.
-
-The retained recommendation is therefore +512MiB for this workload: 124,503
-logical tokens/s, or 69.17% of the 180k target, with 55,497 tokens/s remaining.
-This is the tested 512MiB grid under the 1GiB sampled-headroom rule, not a
-claim that hardware cannot allocate any additional memory. Both runs clean
-up their owned processes and retain the original daemon. GPU L1 shares the
-runtime KV pool; Host L2 remains a separate 96GiB host-memory pool.
-
-A separate +512MiB profile at 14RPS has 289 complete external-restore chains.
-Using the actual lookup-completion marker, lookup-ready to page allocation
-is 1020ms P50, while ready to scheduling is 524ms. Submit to all-rank query
-is 106ms P50 and is largely temporally covered by other forwards; the last
-sampled GPU restore phase to query is 5.91ms P50. These intervals are not
-additive idle time. The older profile was at 13RPS, so the difference cannot
-be attributed solely to KV capacity. Allocation/admission and batch scheduling
-remain the next areas to investigate; this experiment changes neither.
-
-Validation: 34 benchmark qualification, observer and memory-gate tests pass;
-source, cache-token counts, all-rank registration, batch traces and sampled
-HBM are independently reviewed. The functional source is unchanged from the
-previously validated numerical/continuation bundle. The result does not add
-a new numerical-equivalence claim for the expanded-pool workload.
+All eight new L2 servers complete registration of 74496MiB each with zero
+pin-memory failures, and all eight PING requests succeed. After registration,
+container usage is about 624.23GiB of 768GiB, while host MemAvailable is about
+327.58GiB. The original weights daemon PID and start time are unchanged.
+The L2-only services are intentionally left running; no benchmark is resumed.
