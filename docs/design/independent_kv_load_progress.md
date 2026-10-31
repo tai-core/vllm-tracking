@@ -122,9 +122,11 @@ growing waiting queues is not accepted as sustained capacity.
 | 8192 | 389 | 13 | 116,498 | 3.550s |
 
 Both retain GPU L1, 96GiB Host L2, stream restore, max_num_seqs=64, and the same
-model/daemon at gpu-memory-utilization=.152. Lowering the activation token
-budget lets native profiling increase KV from 1.71 to 2.82GiB/rank. This is a
-configuration-level gain, not a new kernel implementation. It should not be
+model/daemon at gpu-memory-utilization=.152. Lowering the batch token cap
+lets native profiling increase KV from 1.71 to 2.82GiB/rank. The 1134MiB
+increase comprises 1058MiB less retained non-KV consumption and 76MiB less
+transient headroom; it is not solely a reduction in peak activations. This is
+a configuration-level gain, not a new kernel implementation. It should not be
 assumed optimal for uncached requests or other lengths.
 
 The final 8192 confirmation has 4095 successful requests, actual arrival
@@ -163,3 +165,78 @@ EP includes peer waits, expert work includes activation/quant/permutation, and
 these are stream intervals, not pure kernel utilization. Operator sampling
 raises CPU time in geometry-matched observations, so its timings only localize
 work; unprofiled windows determine capacity.
+
+
+## Fixed-KV expansion at an 8192-token batch cap
+
+The November 1 experiment reuses the final 8192 baseline, code bundle,
+CP8+EP8, L1/L2, stream restore and HTTP connection policy. It changes only
+KV capacity, using explicit `--kv-cache-memory-bytes` in 512MiB steps.
+The startup profile forward still runs; automatic KV sizing is bypassed.
+The existing node07 weights daemon is retained and node08 is not accessed.
+
+Before each sweep, an open-loop 20RPS pressure window must produce at least
+three real 8190-token batches, pass request/source checks, and retain at
+least 1GiB sampled free memory on each GPU. Memory is sampled every 200ms,
+so this establishes workload-specific observed headroom, not an instantaneous
+worst-case guarantee. Further expansion requires enough observed margin for
+the next 512MiB step. The pressure window and separate profile are excluded
+from the capacity claim.
+
+| KV setting per rank | Blocks | Highest qualified nominal RPS | Logical tokens/s | TTFT P90 |
+| --- | ---: | ---: | ---: | ---: |
+| Auto baseline, 3,025,017,816 bytes | 389 | 13 | 116,498 | 3.550s |
+| Explicit +512MiB, 3,561,888,728 bytes | 458 | 14 | 124,503 | 4.133s |
+| Explicit +1GiB, 4,098,759,640 bytes | 528 | Not swept: memory gate failed | — | — |
+
+The +512MiB point has 4410/4410 successful requests, actual arrival 13.717814
+and completion 13.678686 RPS over 306.170 seconds. Waiting falls from 30.24 to
+20.05 between window halves. Throughput is 6.87% above the prior qualified
+peak. At the same 13 RPS offered load, P90 improves from 3.550s to 2.694s; throughput
+is offered-load limited. At 15 RPS, P90 reaches 13.292s and waiting grows, so
+129,355 logical tokens/s is rejected as capacity.
+
+At 14 RPS, the mean batch grows from 6688 to 6832 tokens and full-batch share grows from
+43.52% to 52.33%; the prior 14 RPS window was unstable. This improvement does
+not hold at every offered rate: mean batch at 13 RPS is slightly smaller.
+The capacity comparison uses single finite windows, with a fresh pressure
+warmup and unique suffix tokens; it is not an exact-payload causal experiment.
+
+The +512MiB memory gate records 61 full batches. All 8 ranks register 458
+blocks and 334MiB connector overhead; the minimum sampled free memory over
+the complete run is 1.761627GiB. L1 plus L2 hit tokens equal 4410*8192, and
+computed tokens equal 4410*910. No model, kernel or cache protocol changed.
+Run artifacts: `kvplus512m20261101-external`; local analysis:
+`experiments/kv-expansion-20261101/kvplus512m20261101/analysis.json`.
+
+
+The +1GiB candidate completes all 700 pressure requests and records 72 full
+batches, but fails the declared headroom floor. Its gate sampler observes
+0.964802GiB minimum free; the independent whole-run sampler observes
+0.929420GiB during the same pressure interval. The sampling phases differ,
+which is why neither is described as an instantaneous peak guarantee.
+All eight ranks register 528 blocks and the same 334MiB connector increment.
+The capacity sweep is intentionally not started. No throughput capacity is
+claimed from this short overload window, and no further 512MiB step is tried.
+
+The retained recommendation is therefore +512MiB for this workload: 124,503
+logical tokens/s, or 69.17% of the 180k target, with 55,497 tokens/s remaining.
+This is the tested 512MiB grid under the 1GiB sampled-headroom rule, not a
+claim that hardware cannot allocate any additional memory. Both runs clean
+up their owned processes and retain the original daemon. GPU L1 shares the
+runtime KV pool; Host L2 remains a separate 96GiB host-memory pool.
+
+A separate +512MiB profile at 14RPS has 289 complete external-restore chains.
+Using the actual lookup-completion marker, lookup-ready to page allocation
+is 1020ms P50, while ready to scheduling is 524ms. Submit to all-rank query
+is 106ms P50 and is largely temporally covered by other forwards; the last
+sampled GPU restore phase to query is 5.91ms P50. These intervals are not
+additive idle time. The older profile was at 13RPS, so the difference cannot
+be attributed solely to KV capacity. Allocation/admission and batch scheduling
+remain the next areas to investigate; this experiment changes neither.
+
+Validation: 34 benchmark qualification, observer and memory-gate tests pass;
+source, cache-token counts, all-rank registration, batch traces and sampled
+HBM are independently reviewed. The functional source is unchanged from the
+previously validated numerical/continuation bundle. The result does not add
+a new numerical-equivalence claim for the expanded-pool workload.
