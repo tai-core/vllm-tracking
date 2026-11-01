@@ -126,9 +126,11 @@ operator-probe batches, cached work used 28 batches of 8190 tokens; cold work us
 |---|---:|---:|
 | CPU forward wall |68.504µs|60.819µs|
 | CPU thread time |57.759µs|56.847µs|
-| Actual model GPU activity union |91.048µs|81.981µs|
+| Rank0 model-process GPU activity union |91.048µs|81.981µs|
 
-GPU activity includes collective waits, not just useful FLOPs. Summed kernel
+CPU/GPU costs describe the rank0 model process, normalized by global new tokens.
+They do not include the L2 server processes' GPU activity. GPU activity includes
+collective waits, not just useful FLOPs. Summed kernel
 categories per token were dominated by collectives (39.326/33.863µs), GEMM
 (23.843/21.968µs), and MLA (8.245/4.816µs); FlashKDA was 2.309/5.889µs. Category
 durations can overlap and must not be added to the GPU-union metric. MLA nonzero
@@ -137,7 +139,7 @@ and 4-byte DtoH counts were zero in both captures.
 The hot profile linked all 284 measurement requests to HTTP, with 203 complete
 external-restore chains; 81 requests lacked external stages and were not assigned
 zero restore time. Submit→all-rank-ready wall P50 was 113.814ms; overlap with real
-forward GPU activity had P50 92.409ms and uncovered time P50 15.806ms. Ready→first
+rank0 forward GPU activity had P50 92.409ms and uncovered time P50 15.806ms. Ready→first
 actual forward had P50 1472.605ms, overlap P50 1381.495ms and uncovered P50 90.361ms.
 These are separate percentiles, so they do not add. Uncovered time is not an
 estimate of causal cache tax. The hot 14 RPS profile was above the final qualified
