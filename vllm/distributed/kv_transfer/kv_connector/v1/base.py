@@ -573,6 +573,14 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def requires_worker_step(self, metadata: KVConnectorMetadata) -> bool:
+        """Whether normal metadata needs worker callbacks, including completion polls.
+
+        Only connectors whose independent control path owns all pending work
+        may return False for an empty step. Unknown connectors keep callbacks.
+        """
+        return True
+
     def split_async_loads(
         self, metadata: KVConnectorMetadata
     ) -> tuple[KVConnectorMetadata, KVConnectorMetadata | None]:

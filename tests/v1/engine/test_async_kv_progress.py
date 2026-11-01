@@ -8,6 +8,9 @@ from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, KVConnectorOutput
 
@@ -21,9 +24,7 @@ def make_core():
     core.scheduler = Mock()
     core.scheduler.has_requests.return_value = True
     core.scheduler.update_from_output.return_value = {}
-    core.scheduler.schedule_kv_loads.return_value = SimpleNamespace(
-        total_num_scheduled_tokens=0, pending_structured_output_tokens=False
-    )
+    core.scheduler.schedule_kv_loads.return_value = SchedulerOutput.make_empty()
     core.model_executor = Mock()
     core.model_executor.execute_model.return_value = Future()
     core.is_ec_consumer = True
@@ -175,3 +176,91 @@ def test_control_head_retires_before_next_forward_or_grammar(monkeypatch):
     core.model_executor.sample_tokens.return_value = Future()
     core.step_with_batch_queue()
     core.scheduler.get_grammar_bitmask.assert_called_once_with(next_out)
+
+
+def independent_core():
+    core = make_core()
+    core.independent_async_loads = True
+    core.model_executor.poll_async_kv_loads.return_value = None
+    connector = core.scheduler.get_kv_connector.return_value
+    connector.requires_worker_step.return_value = False
+    normal, loads = object(), object()
+    connector.split_async_loads.return_value = normal, loads
+    output = core.scheduler.schedule_kv_loads.return_value
+    output.kv_connector_metadata = object()
+    core.scheduler.schedule.return_value = output
+    return core, output, loads
+
+
+def test_empty_restore_steps_submit_loads_without_using_model_fifo(monkeypatch):
+    monkeypatch.setattr("vllm.v1.engine.core.time.sleep", lambda _: None)
+    core, output, loads = independent_core()
+    local_outputs = {0: object()}
+    core.scheduler.update_from_output.return_value = local_outputs
+    oldest = core.batch_queue[-1][0]
+    for _ in range(3):
+        assert core.step_with_batch_queue() == (local_outputs, False)
+        assert len(core.batch_queue) == 2
+    core.model_executor.submit_async_kv_loads.assert_called_with(loads)
+    core.model_executor.execute_model.assert_not_called()
+    core.scheduler.update_from_output.assert_called_with(
+        output, EMPTY_MODEL_RUNNER_OUTPUT
+    )
+    # Repeated local stats/errors must not starve a newly completed forward.
+    old_output = core.batch_queue[-1][1]
+    oldest.set_result(EMPTY_MODEL_RUNNER_OUTPUT)
+    assert core.step_with_batch_queue() == (local_outputs, False)
+    assert len(core.batch_queue) == 1
+    core.scheduler.update_from_output.assert_called_with(
+        old_output, EMPTY_MODEL_RUNNER_OUTPUT
+    )
+
+
+def test_empty_restore_without_model_batches_delivers_local_outputs():
+    core, output, _ = independent_core()
+    core.batch_queue.clear()
+    local_outputs = {0: object()}
+    core.scheduler.update_from_output.return_value = local_outputs
+    assert core.step_with_batch_queue() == (local_outputs, False)
+    core.scheduler.update_from_output.assert_called_once_with(
+        output, EMPTY_MODEL_RUNNER_OUTPUT
+    )
+    core.model_executor.execute_model.assert_not_called()
+    assert not core.batch_queue
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("finished_req_ids", {"finished"}),
+        ("preempted_req_ids", {"preempted"}),
+        ("free_encoder_mm_hashes", ["hash"]),
+        ("scheduled_new_reqs", [object()]),
+        ("scheduled_cached_reqs", SimpleNamespace(req_ids=["cached"])),
+        ("scheduled_encoder_inputs", {"r": [0]}),
+        ("new_block_ids_to_zero", [1]),
+        ("kv_cache_block_copies", [object()]),
+        ("has_sync_kv_loads", True),
+        ("ec_connector_metadata", object()),
+        ("ec_manager_metadata", object()),
+        ("scheduled_spec_decode_tokens", {"r": [1]}),
+        ("pending_structured_output_tokens", True),
+        ("has_structured_output_requests", True),
+    ],
+)
+def test_zero_token_worker_updates_are_not_discarded(monkeypatch, field, value):
+    monkeypatch.setattr("vllm.v1.engine.core.time.sleep", lambda _: None)
+    core, output, _ = independent_core()
+    setattr(output, field, value)
+    assert core.step_with_batch_queue() == (None, False)
+    core.model_executor.execute_model.assert_called_once_with(output, non_block=True)
+    assert len(core.batch_queue) == 3
+
+
+def test_connector_work_keeps_zero_token_rpc(monkeypatch):
+    monkeypatch.setattr("vllm.v1.engine.core.time.sleep", lambda _: None)
+    core, output, _ = independent_core()
+    connector = core.scheduler.get_kv_connector.return_value
+    connector.requires_worker_step.return_value = True
+    core.step_with_batch_queue()
+    core.model_executor.execute_model.assert_called_once_with(output, non_block=True)

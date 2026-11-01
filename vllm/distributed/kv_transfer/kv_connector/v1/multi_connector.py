@@ -468,6 +468,15 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         for c in self._connectors:
             c.progress_lookups()
 
+    def requires_worker_step(self, metadata: KVConnectorMetadata) -> bool:
+        assert isinstance(metadata, MultiKVConnectorMetadata)
+        return bool(metadata.extra_async_saves) or any(
+            connector.requires_worker_step(child)
+            for connector, child in zip(
+                self._connectors, metadata.metadata, strict=True
+            )
+        )
+
     def split_async_loads(
         self, metadata: KVConnectorMetadata
     ) -> tuple[KVConnectorMetadata, KVConnectorMetadata | None]:

@@ -1236,3 +1236,19 @@ def test_multi_connector_mixed_hma_disables_hybrid_kv_cache(monkeypatch):
             assert mc._all_support_hma is False
         finally:
             llm.llm_engine.engine_core.shutdown()
+
+
+def test_worker_step_requires_all_children_to_opt_out():
+    connector = MultiConnector.__new__(MultiConnector)
+    children = [MagicMock(spec_set=KVConnectorBase_V1) for _ in range(2)]
+    connector._connectors = children
+    metadata = MultiKVConnectorMetadata((KVConnectorMetadata(), KVConnectorMetadata()))
+    assert KVConnectorBase_V1.requires_worker_step(children[0], metadata.metadata[0])
+    for child in children:
+        child.requires_worker_step.return_value = False
+    assert not connector.requires_worker_step(metadata)
+    children[1].requires_worker_step.return_value = True
+    assert connector.requires_worker_step(metadata)
+    children[1].requires_worker_step.return_value = False
+    metadata.extra_async_saves = {"request": 1}
+    assert connector.requires_worker_step(metadata)
