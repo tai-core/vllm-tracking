@@ -174,7 +174,7 @@ def _resolve_kda_prefill_backend(
         try:
             import flash_kda  # noqa: F401
 
-            _ = torch.ops.flash_kda.fwd
+            _ = flash_kda.fwd
         except (ImportError, AttributeError) as exc:
             if backend == "flashkda":
                 raise RuntimeError(
@@ -460,7 +460,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             if current_platform.device_type == "musa":
                 import flash_kda  # noqa: F401
 
-                flashkda_ops = torch.ops.flash_kda
+                flashkda_ops = flash_kda
             else:
                 import vllm._flashkda_C  # noqa: F401
 
@@ -526,11 +526,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         if out is None:
             out = workspace_out[:, : q.shape[1]]
         # FlashKDA hardcodes dense q/k/v/g strides; beta may be row-strided.
-        flashkda_ops = (
-            torch.ops.flash_kda
-            if current_platform.device_type == "musa"
-            else torch.ops._flashkda_C
-        )
+        if current_platform.device_type == "musa":
+            import flash_kda as flashkda_ops
+        else:
+            flashkda_ops = torch.ops._flashkda_C
         flashkda_ops.fwd(
             q.contiguous(),
             k.contiguous(),
@@ -539,15 +538,15 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             beta,
             self.head_dim**-0.5,
             out,
-            workspace,
-            self.A_log.view(-1),
-            self.dt_bias.view(-1, self.head_dim),
-            self.kda_lower_bound,
-            initial_state.contiguous(),
-            final_state,
-            cu_seqlens.contiguous(),
-            checkpoint_state,
-            checkpoint.checkpoint_offsets.contiguous()
+            workspace=workspace,
+            A_log=self.A_log.view(-1),
+            dt_bias=self.dt_bias.view(-1, self.head_dim),
+            lower_bound=self.kda_lower_bound,
+            initial_state=initial_state.contiguous(),
+            final_state=final_state,
+            cu_seqlens=cu_seqlens.contiguous(),
+            checkpoint_state=checkpoint_state,
+            checkpoint_offsets=checkpoint.checkpoint_offsets.contiguous()
             if checkpoint is not None
             else None,
         )
