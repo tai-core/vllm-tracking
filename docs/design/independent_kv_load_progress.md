@@ -251,3 +251,60 @@ pin-memory failures, and all eight PING requests succeed. After registration,
 container usage is about 624.23GiB of 768GiB, while host MemAvailable is about
 327.58GiB. The original weights daemon PID and start time are unchanged.
 The L2-only services are intentionally left running; no benchmark is resumed.
+
+
+## Open-loop validation with the persistent 582GiB L2
+
+A subsequent sweep borrows the running eight L2 servers instead of restarting
+or owning them. Pre/postflight validates the original daemon processes and the
+specific L2 owner/server identities; cleanup covers only this run's API and
+FakeD processes. The L2 pool remains 582GiB and all existing data is retained.
+
+HBM inspection shows 10.33–10.52GiB free per card before the API starts, about
+0.9GiB less than with the old 96GiB L2. This run therefore uses 3,561,888,728
+KV bytes per rank (458 blocks), with batch cap 8192. The explicit-KV startup
+utilization setting is .14. No 1GiB headroom gate is imposed. The minimum
+sampled free HBM over pressure and measured loads is 0.827728GiB; no OOM or
+illegal-access error is observed.
+
+The first attempt is invalid: rank 6 briefly enters degraded mode during seed
+requests and skips stores, although HTTP seeding succeeds. This leaves some
+prefixes absent only on server 30734, causing cold fallback during the pressure
+window. That run contributes no capacity result. The retry reads all 64 prefixes
+on all 8 servers while the seed API's layouts remain registered, repairs only
+missing slots 1–11, then verifies all 512 entries before measurements. One repair
+round suffices. This is a benchmark preparation fix, not a change to LMCache's
+fail-open availability policy. Probe locks and sessions are released.
+
+| Host L2 | GPU KV blocks/rank | Qualified nominal RPS | Input TPM | TTFT P90 |
+| --- | ---: | ---: | ---: | ---: |
+| 96GiB, matched KV baseline | 458 | 14 | 7,470,204 | 4.133s |
+| 582GiB, persistent pool | 458 | 14 | 7,473,773 | 6.297s |
+
+The 582GiB point completes 4410/4410 requests over 306.170 seconds, with actual
+arrival/completion 13.717817/13.685221RPS. Every request accounts for 8192 cached
+and 910 computed tokens. Waiting decreases between window halves (slope
+-0.20715 requests/s). The adjacent 15RPS point completes 4725/4725 requests but
+fails P90=14.167825s and has growing waiting (slope+0.35703 requests/s).
+Its throughput is excluded. Thus the measured qualified result is 124,563
+logical tokens/s, or 7,473,773 input tokens/min; computed throughput is 747,213
+new tokens/min.
+
+At the qualified point, mean batch size is 6917 tokens and 56.70% of batches
+reach 8190 tokens. The matched-KV throughput differs only +0.0478% from the old
+96GiB result: this 64-prefix working set shows no throughput gain from the
+larger Host-L2 capacity. P90 is higher in this single window; that alone does
+not establish a causal regression. The earlier 7,985,010TPM used 528 GPU blocks
+and is not a matched-KV comparison.
+
+This remains a finite-window, one-nominal-RPS-grid result, not a global hardware
+maximum. Thirty qualification, memory-gate and prefix-readiness tests pass;
+independent review checks source counts, the 512-entry matrix, batch data,
+HBM and cleanup. The immutable functional bundle remains unchanged. Persistent
+L2 servers have no per-run profile overlay, so absent server-side events must
+not be interpreted as zero overhead. Both failed and successful owners retain
+the original weights daemon and L2 servers; node08 is untouched.
+
+Artifacts: `experiments/l2-582-openloop-retry-20261101/result.json`,
+`sweep-analysis.json`, `memory-readiness.json` and `output/`; the invalid first
+attempt is retained separately in `experiments/l2-582-openloop-20261101/`.
