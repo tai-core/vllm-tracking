@@ -243,7 +243,8 @@ capacity; it is not growth driven only by cache requests.
 The L2-only owner is `/runstate/l2available80-20261101/controller.py`; its
 receipt and per-server logs are in the same directory. It keeps only the
 cache services running, without starting a model API or benchmark. The
-582GiB pool has no throughput result yet; the table above used 96GiB Host L2.
+table above predates this enlargement and used 96GiB Host L2. The following
+section records the subsequent 582GiB validation.
 
 
 All eight new L2 servers complete registration of 74496MiB each with zero
@@ -308,3 +309,16 @@ the original weights daemon and L2 servers; node08 is untouched.
 Artifacts: `experiments/l2-582-openloop-retry-20261101/result.json`,
 `sweep-analysis.json`, `memory-readiness.json` and `output/`; the invalid first
 attempt is retained separately in `experiments/l2-582-openloop-20261101/`.
+
+
+The validated model-start settings for this persistent L2 are:
+
+```text
+--max-num-batched-tokens 8192
+--kv-cache-memory-bytes 3561888728
+--gpu-memory-utilization 0.14
+```
+
+Reuse the existing eight L2 endpoints and retain GPU prefix caching and stream
+restore. The earlier explicit +1GiB KV setting was measured with 96GiB L2;
+it is not the memory configuration validated in this 582GiB sweep.
