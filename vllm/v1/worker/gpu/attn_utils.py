@@ -416,6 +416,30 @@ def init_kv_cache(
     block_tables: "BlockTables | None" = None,
     attn_groups: Iterable[AttentionGroup] = (),
 ) -> dict[str, Any]:
+    from vllm.v1.pcp.allocation import (
+        bind_pcp_pages,
+        make_pcp_physical_config,
+        plan_pcp_page_workspace,
+    )
+
+    pcp_sharded = kv_cache_config.pcp_layout is not None
+    physical_config = (
+        make_pcp_physical_config(
+            vllm_config,
+            kv_cache_config,
+        )
+        if pcp_sharded
+        else kv_cache_config
+    )
+    if pcp_sharded:
+        # Validate the engine's resolved physical cache/workspace budget.
+        plan_pcp_page_workspace(
+            vllm_config,
+            kv_cache_config,
+            physical_config,
+            kv_cache_config.pcp_layout.size,
+            use_ipc=device.type == "musa",
+        )
     allocation_context = kv_cache_allocation_context or nullcontext()
     with allocation_context:
         if vllm_config.attention_config.hisparse_config is not None:
@@ -430,7 +454,7 @@ def init_kv_cache(
             )
         else:
             kv_caches = allocate_kv_cache(
-                kv_cache_config,
+                physical_config,
                 device,
                 vllm_config.cache_config.get_resolved_kv_cache_layout(),
                 kernel_block_sizes,
@@ -452,6 +476,14 @@ def init_kv_cache(
         num_attn_module,
         kv_cache_groups=kv_cache_config.kv_cache_groups,
     )
+    if pcp_sharded:
+        bind_pcp_pages(
+            vllm_config,
+            kv_cache_config,
+            physical_config,
+            forward_context,
+            kv_caches,
+        )
     return kv_caches
 
 

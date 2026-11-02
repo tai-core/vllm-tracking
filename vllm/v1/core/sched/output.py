@@ -300,6 +300,8 @@ class SchedulerOutput:
 
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
+    # Parallel to copies: independent state pools can reuse the same block IDs.
+    kv_cache_block_copy_group_ids: list[int] | None = None
 
     # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None

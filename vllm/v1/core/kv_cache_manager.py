@@ -390,18 +390,19 @@ class KVCacheManager:
         Mamba pool returns ``None`` (scheduler backpressure) instead of
         raising from ``BlockPool.get_new_blocks``.
         """
-        for pool, required_blocks in (
-            self.coordinator.get_num_blocks_to_allocate_by_pool(
-                request_id=request_id,
-                num_tokens=num_tokens,
-                new_computed_blocks=new_computed_blocks,
-                num_encoder_tokens=num_encoder_tokens,
-                total_computed_tokens=total_computed_tokens,
-                num_local_computed_tokens=num_local_computed_tokens,
-                num_tokens_main_model=num_tokens_main_model,
-                apply_admission_cap=apply_admission_cap,
-                prefill_end=prefill_end,
-            )
+        for (
+            pool,
+            required_blocks,
+        ) in self.coordinator.get_num_blocks_to_allocate_by_pool(
+            request_id=request_id,
+            num_tokens=num_tokens,
+            new_computed_blocks=new_computed_blocks,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=total_computed_tokens,
+            num_local_computed_tokens=num_local_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+            apply_admission_cap=apply_admission_cap,
+            prefill_end=prefill_end,
         ):
             # Reserved blocks and the watermark protect requests in the main
             # attention pool.  Dedicated Mamba pools have their own capacity
@@ -913,8 +914,11 @@ class KVCacheManager:
     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
         """Drain pending copies and return their retained endpoints."""
         pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
-        for mgr in self.coordinator.single_type_managers:
-            pending_copies.extend(mgr.take_pending_cow_copies())
+        self._last_cow_group_ids = []
+        for group_id, mgr in enumerate(self.coordinator.single_type_managers):
+            group_copies = mgr.take_pending_cow_copies()
+            pending_copies.extend(group_copies)
+            self._last_cow_group_ids.extend([group_id] * len(group_copies))
         copies = [
             KVCacheBlockCopy(
                 src_block_id=source_block.block_id,
@@ -924,6 +928,12 @@ class KVCacheManager:
         ]
         retained_blocks = [block for pair in pending_copies for block in pair]
         return copies, retained_blocks
+
+    def take_kv_cache_copy_group_ids(self) -> list[int]:
+        """Group identity for the most recently drained CoW endpoint list."""
+        group_ids = getattr(self, "_last_cow_group_ids", [])
+        self._last_cow_group_ids = []
+        return group_ids
 
     def take_boundary_state_offloads(
         self,

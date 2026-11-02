@@ -876,9 +876,7 @@ def test_gathered_slots_preserve_multiple_group_strides(device_type):
             pytest.skip(f"{device_type} is unavailable")
     device = torch.device(device_type)
     manager = PCPManager(8, 0, device, shard_decode_requests=True)
-    manager._padded_gather_idx = torch.tensor(
-        [0, 4, 1, 3, 2, 0, 0, 0], device=device
-    )
+    manager._padded_gather_idx = torch.tensor([0, 4, 1, 3, 2, 0, 0, 0], device=device)
     manager._gathered_kv_write_mask = torch.tensor(
         [True] * 5 + [False] * 3, device=device
     )
@@ -892,3 +890,128 @@ def test_gathered_slots_preserve_multiple_group_strides(device_type):
     assert result.data_ptr() == storage.data_ptr()
     assert result.stride() == storage.stride()
     assert bool((storage[:, 8:] == -99).all())
+
+
+@pytest.mark.parametrize("size", [1, 2, 8])
+@pytest.mark.parametrize("prefix", [0, 1, 63, 64, 127])
+def test_page_aligned_prefill_dispatch_matches_real_layout(monkeypatch, size, prefix):
+    from vllm.v1.pcp.layout import PCPPageLayout
+
+    monkeypatch.setattr(pcp_manager_module, "async_tensor_h2d", _copy_to_cpu)
+    manager = PCPManager(
+        pcp_world_size=size,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        shard_decode_requests=True,
+        page_layout=PCPPageLayout(size, 64, 4),
+    )
+    lengths = np.asarray([65, 1025, 1], dtype=np.int32)
+    starts = np.asarray([prefix, prefix + 4, 0], dtype=np.int32)
+    prefills = np.asarray([True, True, False])
+    offsets = np.concatenate(([0], np.cumsum(lengths))).astype(np.int32)
+    segments, counts = manager._build_batch_layout(lengths, starts, prefills, offsets)
+    assert manager.get_num_tokens_for_dispatch(lengths, prefills, starts) == max(counts)
+    visited = []
+    for rank_segments in segments:
+        for segment in rank_segments:
+            visited.extend(
+                range(segment.global_batch_slice.start, segment.global_batch_slice.stop)
+            )
+    assert sorted(visited) == list(range(int(lengths.sum())))
+    assert manager.token_layout.valid_mask.sum().item() == int(lengths.sum())
+
+
+@pytest.mark.parametrize("rows", [[], [1, 3], [1, 2], [0, 1, 2, 3]])
+def test_selective_pcp_gather_preserves_order_without_full_token_exchange(
+    monkeypatch, rows
+):
+    from vllm.v1.worker.gpu.pcp_manager import PCPTokenLayout
+
+    global_values = torch.arange(12).reshape(4, 3)
+    restore = torch.tensor([0, 2, 3, 1])
+    local_values = global_values[[0, 3]]
+    selected_rows = torch.tensor(rows, dtype=torch.int64)
+    sources = restore[selected_rows]
+    owners = sources // 2
+    selections = [torch.nonzero(owners == rank, as_tuple=True)[0] for rank in range(2)]
+    width = max((indices.numel() for indices in selections), default=0)
+
+    def gather(staging, dim=0):
+        expected_local = torch.zeros(width, 3, dtype=global_values.dtype)
+        expected_local[: selections[0].numel()] = global_values[
+            selected_rows[selections[0]]
+        ]
+        torch.testing.assert_close(staging, expected_local)
+        remote = torch.zeros_like(staging)
+        remote[: selections[1].numel()] = global_values[selected_rows[selections[1]]]
+        return torch.cat((staging, remote))
+
+    monkeypatch.setattr(
+        pcp_manager_module,
+        "get_pcp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=2, all_gather=gather),
+    )
+    layout = PCPTokenLayout(
+        4, 2, restore, torch.tensor([0, 3, 1, 2]), torch.ones(4, dtype=torch.bool)
+    )
+    torch.testing.assert_close(
+        layout.gather_rows(local_values, selected_rows), global_values[selected_rows]
+    )
+
+
+def test_selected_row_plan_reuses_geometry_but_not_values_or_forward_lifetime(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from vllm.forward_context import override_forward_context
+    from vllm.v1.worker.gpu import pcp_manager
+
+    group = SimpleNamespace(
+        world_size=1, rank_in_group=0, all_gather=lambda tensor, dim=0: tensor.clone()
+    )
+    monkeypatch.setattr(pcp_manager, "get_pcp_group", lambda: group)
+    layout = pcp_manager.PCPTokenLayout(
+        4, 4, torch.arange(4), torch.arange(4), torch.ones(4, dtype=torch.bool)
+    )
+    values = torch.arange(24).reshape(4, 2, 3)
+    rows = torch.tensor([3, 0])
+    with override_forward_context(SimpleNamespace()):
+        torch.testing.assert_close(
+            layout.gather_rows(values, rows, plan_key="tail"), values[rows]
+        )
+        torch.testing.assert_close(
+            layout.gather_rows(values + 100, rows, plan_key="tail"),
+            (values + 100)[rows],
+        )
+    # A new forward may reuse the layout object and key with different rows.
+    rows = torch.tensor([1, 2])
+    with override_forward_context(SimpleNamespace()):
+        torch.testing.assert_close(
+            layout.gather_rows(values, rows, plan_key="tail"), values[rows]
+        )
+
+
+def test_pool_aligned_8k_batch_has_no_padding_and_restores_global_order(monkeypatch):
+    from vllm.v1.pcp.layout import PCPPageLayout
+
+    monkeypatch.setattr(pcp_manager_module, "async_tensor_h2d", _copy_to_cpu)
+    manager = PCPManager(
+        pcp_world_size=8,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        shard_decode_requests=True,
+        page_layout=PCPPageLayout(8, 768, 4),
+    )
+    lengths = np.asarray([512, 7680], dtype=np.int32)
+    starts = np.asarray([7680, 0], dtype=np.int32)
+    prefills = np.asarray([True, True])
+    offsets = np.asarray([0, 512, 8192], dtype=np.int32)
+    segments, counts = manager._build_batch_layout(lengths, starts, prefills, offsets)
+    assert counts == [1024] * 8
+    layout = manager.token_layout
+    assert layout.local_padded_num_tokens == 1024
+    assert layout.valid_mask.all()
+    global_rows = torch.arange(8192)
+    expanded = global_rows[layout.expand_idx]
+    torch.testing.assert_close(expanded[layout.restore_idx], global_rows)

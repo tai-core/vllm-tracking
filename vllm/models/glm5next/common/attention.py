@@ -76,6 +76,32 @@ def _pad_indexer_heads(x: torch.Tensor, pad: int) -> torch.Tensor:
     return torch.cat([x, x.new_zeros(x.shape[0], pad, *x.shape[2:])], dim=1)
 
 
+def glm_pcp_cache_spec(vllm_config, pool_tokens, *, ownership_group=None):
+    """Declare GLM's supported prefill cache placement at the model boundary."""
+    from vllm.config import CUDAGraphMode
+    from vllm.config.kda_parallel import kda_tp_over_pcp
+    from vllm.v1.kv_cache_interface import PCPCacheSpec
+
+    parallel = vllm_config.parallel_config
+    if parallel.prefill_context_parallel_size <= 1:
+        return None
+    if parallel.tensor_parallel_size != 1 or parallel.decode_context_parallel_size != 1:
+        raise ValueError("GLM PCP page sharding requires TP1 and DCP1")
+    if not kda_tp_over_pcp(vllm_config):
+        raise ValueError("GLM PCP sharding requires KDA TP over the PCP group")
+    if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+        raise ValueError("GLM PCP sharding currently requires eager execution")
+    if vllm_config.speculative_config is not None:
+        raise ValueError("GLM PCP sharded speculative state is not supported yet")
+    if vllm_config.attention_config.hisparse_config is not None:
+        raise ValueError("GLM PCP native pools cannot be combined with HiSparse")
+    if vllm_config.kv_transfer_config is not None:
+        raise ValueError(
+            "GLM PCP sharded transport is not wired to live connectors yet"
+        )
+    return PCPCacheSpec(pool_tokens, ownership_group)
+
+
 class Glm5NextIndexerCache(DeepseekV32IndexerCache):
     """Indexer K cache that stores kpool-compressed entries.
 
@@ -116,7 +142,15 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         # ``tokens_per_state`` is the KV-spec representation of kpool
         # compression in the current cache-layout API.
         assert isinstance(spec, MLAAttentionSpec)
-        return replace(spec, tokens_per_state=self._index_kpool)
+        return replace(
+            spec,
+            tokens_per_state=self._index_kpool,
+            pcp=glm_pcp_cache_spec(
+                vllm_config,
+                self._index_kpool,
+                ownership_group="indexed_attention",
+            ),
+        )
 
     def get_attn_backend(self):
         return Glm5NextIndexerBackend
@@ -168,6 +202,7 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
             f"tail ring ({ring})"
         )
         return CircularBufferSpec(
+            pcp=glm_pcp_cache_spec(vllm_config, self._index_kpool),
             block_size=ring,
             num_kv_heads=2,
             head_size=self.head_dim,
@@ -566,6 +601,11 @@ class Glm5NextMLAAttention(nn.Module):
             prefix,
             skip_topk=False,
             fuse_qkv_rmsnorm=True,
+        )
+        self.mla_attn.mla_attn.pcp_cache_spec = glm_pcp_cache_spec(
+            vllm_config,
+            config.index_kpool or 1,
+            ownership_group="indexed_attention",
         )
 
     def forward(

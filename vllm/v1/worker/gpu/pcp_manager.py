@@ -12,6 +12,8 @@ from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID, get_dcp_local_seq_lens
+from vllm.v1.pcp.layout import PCPPageLayout
+from vllm.v1.pcp.plan import get_pcp_plan_cache
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
@@ -42,6 +44,7 @@ class PCPTokenLayout:
     restore_idx: torch.Tensor
     expand_idx: torch.Tensor
     valid_mask: torch.Tensor
+    has_partial_pools: bool = True
 
     @classmethod
     def replicated(cls, is_padding: torch.Tensor, world_size: int) -> "PCPTokenLayout":
@@ -60,6 +63,49 @@ class PCPTokenLayout:
             raise ValueError("PCP input does not match the scheduled local layout")
         gathered = get_pcp_group().all_gather(hidden, dim=0)
         return gathered[self.restore_idx]
+
+    def gather_rows(
+        self, hidden: torch.Tensor, global_rows: torch.Tensor, *, plan_key=None
+    ) -> torch.Tensor:
+        """Gather an identical selected-row list on every rank, not all tokens.
+
+        A plan_key declares that the row selection is immutable within this
+        forward. Only its routing is cached; every call exchanges fresh values.
+        """
+        if hidden.shape[0] != self.local_padded_num_tokens:
+            raise ValueError("PCP input does not match the scheduled local layout")
+        if global_rows.numel() == 0:
+            return hidden.new_empty((0, *hidden.shape[1:]))
+        group = get_pcp_group()
+        plans = get_pcp_plan_cache(plan_key)
+        cache_key = ("gather_rows", id(self), id(group), plan_key)
+        cached = plans.get(cache_key) if plans is not None else None
+        if cached is None:
+            sources = self.restore_idx[global_rows]
+            owners = sources // self.local_padded_num_tokens
+            selected = [
+                torch.nonzero(owners == rank, as_tuple=True)[0]
+                for rank in range(group.world_size)
+            ]
+            width = max(indices.numel() for indices in selected)
+            local = selected[group.rank_in_group]
+            offsets = sources[local] % self.local_padded_num_tokens
+            if plans is not None:
+                # Keep metadata alive; layer values are always exchanged anew.
+                plans[cache_key] = (self, global_rows, selected, width, local, offsets)
+        else:
+            _, original_rows, selected, width, local, offsets = cached
+            if original_rows.numel() != global_rows.numel():
+                raise RuntimeError("PCP gather row plan changed within one forward")
+        staging = hidden.new_zeros((width, *hidden.shape[1:]))
+        staging[: local.numel()] = hidden[offsets]
+        gathered = group.all_gather(staging, dim=0).view(
+            group.world_size, width, *hidden.shape[1:]
+        )
+        output = hidden.new_empty((global_rows.numel(), *hidden.shape[1:]))
+        for rank, indices in enumerate(selected):
+            output[indices] = gathered[rank, : indices.numel()]
+        return output
 
     def reduce_scatter_to_local(self, partial: torch.Tensor) -> torch.Tensor:
         if partial.shape[0] != self.global_num_tokens:
@@ -91,6 +137,7 @@ class PCPManager:
         dcp_world_size: int = 1,
         dcp_rank: int = 0,
         cp_interleave: int = 1,
+        page_layout: PCPPageLayout | None = None,
     ) -> None:
         self.pcp_world_size = pcp_world_size
         self.pcp_rank = pcp_rank
@@ -98,6 +145,9 @@ class PCPManager:
         self.dcp_world_size = dcp_world_size
         self.dcp_rank = dcp_rank
         self.cp_interleave = cp_interleave
+        self.page_layout = page_layout
+        if page_layout is not None and page_layout.size != pcp_world_size:
+            raise ValueError("PCP page layout does not match the process group")
         self.shard_decode_requests = shard_decode_requests
 
         self._global_batch: InputBatch | None = None
@@ -175,8 +225,7 @@ class PCPManager:
             )
         # MM PCP is validated only for GLM-5.3-Flash without M-RoPE.
         if supports_mm_inputs and (
-            getattr(model_config.hf_text_config, "model_type", None)
-            != "glm5_next_text"
+            getattr(model_config.hf_text_config, "model_type", None) != "glm5_next_text"
             or model_config.uses_mrope
         ):
             raise NotImplementedError("MRV2 PCP does not support MM inputs yet.")
@@ -278,6 +327,7 @@ class PCPManager:
         rank: int,
         num_scheduled_tokens: np.ndarray,
         is_prefilling: np.ndarray,
+        num_computed_tokens: np.ndarray | None = None,
     ) -> Iterator[tuple[int, int, int]]:
         """Yield ``(request index, query offset, length)`` for one PCP rank.
 
@@ -297,6 +347,18 @@ class PCPManager:
         for global_batch_req_idx, num_tokens in enumerate(num_scheduled_tokens):
             query_len = int(num_tokens)
             if query_len == 0:
+                continue
+            if self.page_layout is not None and is_prefilling[global_batch_req_idx]:
+                if num_computed_tokens is None:
+                    raise ValueError("Pool-aligned PCP requires request prefix lengths")
+                start = int(num_computed_tokens[global_batch_req_idx])
+                for span in self.page_layout.split_query(start, query_len):
+                    if span.compute_rank == rank:
+                        yield (
+                            global_batch_req_idx,
+                            span.start - start,
+                            span.stop - span.start,
+                        )
                 continue
             chunk_indices: tuple[int, ...]
             if not replicated[global_batch_req_idx]:
@@ -328,11 +390,12 @@ class PCPManager:
         num_scheduled_tokens: np.ndarray,
         is_prefilling: np.ndarray,
         query_start_loc_np: np.ndarray,
+        num_computed_tokens: np.ndarray | None = None,
     ) -> list[RankSegment]:
         rank_segments = []
         rank_offset = 0
         for global_batch_req_idx, chunk_offset, chunk_len in self._iter_rank_chunks(
-            rank, num_scheduled_tokens, is_prefilling
+            rank, num_scheduled_tokens, is_prefilling, num_computed_tokens
         ):
             global_batch_start = int(query_start_loc_np[global_batch_req_idx])
             chunk_start = global_batch_start + chunk_offset
@@ -363,6 +426,7 @@ class PCPManager:
                 num_scheduled_tokens,
                 is_prefilling,
                 query_start_loc_np,
+                num_computed_tokens,
             )
             num_rank_tokens = sum(segment.num_tokens for segment in segments)
             segments_by_rank.append(segments)
@@ -436,6 +500,11 @@ class PCPManager:
             restore_idx=self._hidden_restore_idx,
             expand_idx=self._padded_gather_idx,
             valid_mask=async_tensor_h2d(valid_mask, device=self.device),
+            has_partial_pools=(
+                bool(np.any(num_computed_tokens % self.page_layout.pool_tokens))
+                if self.page_layout is not None
+                else True
+            ),
         )
         return segments_by_rank, per_rank_num_tokens
 
@@ -443,13 +512,14 @@ class PCPManager:
         self,
         num_scheduled_tokens: np.ndarray,
         is_prefilling: np.ndarray,
+        num_computed_tokens: np.ndarray | None = None,
     ) -> int:
         """Return the largest real rank-local batch before graph padding."""
         return max(
             sum(
                 chunk_len
                 for _, _, chunk_len in self._iter_rank_chunks(
-                    rank, num_scheduled_tokens, is_prefilling
+                    rank, num_scheduled_tokens, is_prefilling, num_computed_tokens
                 )
             )
             for rank in range(self.pcp_world_size)
@@ -784,7 +854,8 @@ class PCPManager:
         assert self._global_batch_slot_mappings is not None
         batch = self.global_batch
         tables = self._block_tables.gather_block_tables(
-            batch.idx_mapping, batch.num_reqs_after_padding
+            batch.idx_mapping,
+            batch.num_reqs_after_padding,
         )
         return batch, tables, self._global_batch_slot_mappings[:, : batch.num_tokens]
 
@@ -899,6 +970,7 @@ def maybe_build_pcp_manager(
     supports_mm_inputs: bool,
     block_tables: BlockTables,
     cls: type[PCPManager] = PCPManager,
+    page_layout: PCPPageLayout | None = None,
 ) -> PCPManager | None:
     parallel_config = vllm_config.parallel_config
     pcp_size = parallel_config.prefill_context_parallel_size
@@ -922,4 +994,5 @@ def maybe_build_pcp_manager(
         dcp_world_size=dcp_size,
         dcp_rank=dcp_rank,
         cp_interleave=parallel_config.cp_kv_cache_interleave_size,
+        page_layout=page_layout,
     )

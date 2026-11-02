@@ -1393,6 +1393,10 @@ class GroupCoordinator:
         return self.device_communicator.recv(size, dtype, src)
 
     def destroy(self):
+        for pool in reversed(getattr(self, "_pcp_native_pools", [])):
+            pool.close()
+        if hasattr(self, "_pcp_native_pools"):
+            del self._pcp_native_pools
         pcp_collectives = getattr(self, "_kda_pcp_collectives", None)
         if pcp_collectives is not None:
             pcp_collectives.close()
@@ -1966,6 +1970,7 @@ def init_distributed_environment(
                 OptimizationFeature,
                 resolve_optimization_contract,
             )
+
             contract = resolve_optimization_contract(config)
             needs_glm_pp_eager_mccl = (
                 contract.prefers(OptimizationFeature.GLM5_EAGER_MCCL_INIT)

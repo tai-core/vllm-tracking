@@ -102,7 +102,9 @@ def test_kpool_decode_topk_backend_never_auto_selects_aiter_under_full_cudagraph
 
 
 @pytest.mark.parametrize("local_tokens", [0, 1])
-def test_pcp_kpool_writes_global_pools_and_scores_local_rows(monkeypatch, local_tokens):
+def test_pcp_kpool_compresses_local_rows_and_scores_local_rows(
+    monkeypatch, local_tokens
+):
     from types import SimpleNamespace
 
     from vllm.models.glm5next.nvidia import sparse_indexer as indexer
@@ -122,7 +124,10 @@ def test_pcp_kpool_writes_global_pools_and_scores_local_rows(monkeypatch, local_
     layout = SimpleNamespace(
         restore_idx=restore,
         global_num_tokens=8,
+        local_padded_num_tokens=1,
+        expand_idx=torch.zeros(8, dtype=torch.int64),
         gather_to_global=lambda tensor: values[id(tensor)],
+        gather_rows=lambda tensor, rows: values[id(tensor)][rows],
     )
     slots = torch.arange(8)
     meta = SimpleNamespace(
@@ -144,9 +149,17 @@ def test_pcp_kpool_writes_global_pools_and_scores_local_rows(monkeypatch, local_
             attn_metadata={"k": meta, "tail": tail}, pcp_token_layout=layout
         ),
     )
+    monkeypatch.setattr(
+        indexer, "get_pcp_group", lambda: SimpleNamespace(rank_in_group=0)
+    )
+    monkeypatch.setattr(
+        indexer,
+        "complete_boundary_pools",
+        lambda *args, **kwargs: torch.zeros(8, dtype=torch.bool),
+    )
     writes, seeds = [], []
     monkeypatch.setattr(
-        indexer, "_kpool_compress_insert", lambda *args, **kwargs: writes.append(args)
+        indexer, "compress_pcp_pools", lambda *args, **kwargs: writes.append(args)
     )
     monkeypatch.setattr(
         indexer.kpool_ops, "kpool_seed_tail_cache", lambda *args: seeds.append(args)
@@ -180,12 +193,12 @@ def test_pcp_kpool_writes_global_pools_and_scores_local_rows(monkeypatch, local_
         compress_ape=torch.empty(4, 128),
         index_kpool=4,
         positions=local_positions,
-        tail_kv_cache=torch.empty(0),
+        tail_kv_cache=torch.empty(4, 2, 4, 128),
         tail_prefix="tail",
     )
-    torch.testing.assert_close(writes[0][0], global_k)
-    torch.testing.assert_close(writes[0][1], global_gate)
-    torch.testing.assert_close(writes[0][4], slots[restore])
+    torch.testing.assert_close(writes[0][0], local_k)
+    torch.testing.assert_close(writes[0][1], local_gate)
+    torch.testing.assert_close(writes[0][4], slots[:1])
     torch.testing.assert_close(seeds[0][3], tail.slot_mapping)
     if local_tokens:
         assert result[0, :5].tolist() == [0, 1, 2, 3, -1]

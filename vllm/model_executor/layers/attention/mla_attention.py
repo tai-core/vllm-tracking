@@ -779,6 +779,75 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         cache = self.hisparse_cache
         if slot_mapping is None or (cache is not None and cache.dummy_batch):
             return
+        pcp_pages = getattr(self, "pcp_pages", None)
+        if pcp_pages is not None and attn_metadata is not None:
+            from vllm.forward_context import is_forward_context_available
+
+            if is_forward_context_available():
+                layout = get_forward_context().pcp_token_layout
+                if layout is not None:
+                    # Quantize each producer's rows once, then reuse those exact
+                    # bytes for attention composition and unique-owner storage.
+                    count = kv_c_normed.shape[0]
+                    rows = kv_cache.shape[1]
+                    reader = getattr(pcp_pages, "ipc_reader", None)
+                    packed = (
+                        reader.current_mla_buffer(kv_cache, count)
+                        if reader is not None
+                        else None
+                    )
+                    if packed is None:
+                        packed = torch.empty(
+                            (max(1, (count + rows - 1) // rows), *kv_cache.shape[1:]),
+                            dtype=kv_cache.dtype,
+                            device=kv_cache.device,
+                        )
+                    from vllm.v1.pcp.plan import get_pcp_plan_cache
+
+                    plans = get_pcp_plan_cache()
+                    plan_key = (
+                        "mla_slots",
+                        id(layout),
+                        id(attn_metadata),
+                        id(pcp_pages.group),
+                        count,
+                    )
+                    cached_slots = plans.get(plan_key)
+                    if cached_slots is None:
+                        start = pcp_pages.group.rank_in_group * count
+                        valid = layout.valid_mask[start : start + count]
+                        local_slots = torch.where(
+                            valid, torch.arange(count, device=kv_cache.device), -1
+                        )
+                        logical_slots = slot_mapping[layout.restore_idx]
+                        plans[plan_key] = (
+                            layout,
+                            attn_metadata,
+                            slot_mapping,
+                            local_slots,
+                            logical_slots,
+                        )
+                    else:
+                        _, _, _, local_slots, logical_slots = cached_slots
+                    self.impl.do_kv_cache_update(
+                        kv_c_normed,
+                        k_pe,
+                        packed,
+                        local_slots,
+                        kv_cache_dtype,
+                        k_scale,
+                    )
+                    encoded = packed.view(torch.uint8).reshape(
+                        packed.shape[0] * rows, -1
+                    )[:count]
+                    pcp_pages.compose_current(
+                        attn_metadata,
+                        logical_slots,
+                        encoded,
+                        sources=layout.restore_idx,
+                        source_width=count,
+                    )
+                    return
         kv_c_normed, k_pe, slot_mapping = maybe_gather_mla_latent_cache_inputs(
             kv_c_normed,
             k_pe,
@@ -788,6 +857,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             pcp_shard_decode_requests=self.pcp_shard_decode_requests,
         )
         assert slot_mapping is not None
+        pcp_pages = getattr(self, "pcp_pages", None)
+        if pcp_pages is not None:
+            # The global current rows have one producer each. Only the page
+            # owner writes them into its smaller physical pool.
+            slot_mapping = pcp_pages.write_slots(slot_mapping, kv_cache.shape[1])
         if cache is not None:
             kv_cache, slot_mapping, num_rows = cache.write_target(
                 kv_c_normed.shape[0], slot_mapping.numel()
@@ -898,6 +972,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         q_dcp_replicated: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
+
+        pcp_pages = getattr(self, "pcp_pages", None)
+        if pcp_pages is not None and attn_metadata is not None:
+            kv_cache, attn_metadata = pcp_pages.materialize(attn_metadata)
 
         quant_key = _detect_output_quant_key(
             output, output_scale, output_block_scale, self.num_heads * self.v_head_dim
@@ -1352,6 +1430,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.kv_cache_dtype, vllm_config.model_config
         )
         common_kwargs = dict(
+            pcp=getattr(self, "pcp_cache_spec", None),
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             max_tp_shards=1,

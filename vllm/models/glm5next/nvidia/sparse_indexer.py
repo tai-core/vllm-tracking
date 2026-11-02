@@ -7,7 +7,7 @@ import torch
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config_or_none
-from vllm.distributed import get_dcp_group
+from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
@@ -28,6 +28,11 @@ from vllm.models.glm5next.common.sparse_indexer import (
     kv_cache_as_quant_view,
 )
 from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
+from vllm.models.glm5next.nvidia.pcp_kpool import (
+    complete_boundary_pools,
+    compress_local_pools,
+    current_pool_descriptors,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import has_deep_gemm
 from vllm.utils.import_utils import has_cutedsl
@@ -39,6 +44,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.pcp.plan import get_pcp_plan_cache
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_cuda_alike():
@@ -200,56 +206,153 @@ def sparse_attn_indexer_kpool(
 
     layout = get_forward_context().pcp_token_layout
     if layout is not None:
-        # Cache replicas need complete pools in request order, while Q/scoring
-        # stay on the local PCP rows. Tail metadata uses the global batch.
+        # Complete pools are compressed once on their pool-aligned producer rank.
+        # Tail updates still consume request-ordered rows; Q/scoring stay local.
         assert dcp_world_size == 1 and index_kpool > 1
         assert gate_score is not None and compress_ape is not None
         assert positions is not None and tail_prefix is not None
         assert tail_kv_cache is not None and not skip_k_cache_insert
-        global_k = layout.gather_to_global(k)
-        global_gate = layout.gather_to_global(gate_score)
-        global_positions = layout.gather_to_global(positions)
-        global_slots = slot_mapping[layout.restore_idx]
+        bound_layers = getattr(get_forward_context(), "no_compile_layers", {})
+        index_pages = getattr(bound_layers.get(k_cache_prefix), "pcp_pages", None)
+        tail_pages = getattr(
+            bound_layers.get(_resolve_layer_name(tail_prefix)), "pcp_pages", None
+        )
         tail_meta = attn_metadata[_resolve_layer_name(tail_prefix)]
         global_decodes = tail_meta.num_decode_tokens
         assert global_decodes == tail_meta.num_decodes, (
             "K-pool PCP cache writes currently require one token per decode request"
         )
-        if global_decodes:
-            dec = slice(0, global_decodes)
-            kpool_ops.kpool_decode_update_and_maybe_write_cache_batched(
-                kv_cache,
-                tail_kv_cache,
-                tail_meta.slot_mapping[dec, None],
-                global_k[dec, None, :],
-                global_gate[dec, None, :],
-                compress_ape,
-                global_slots[dec, None],
-                global_positions[dec, None].to(torch.int32),
-                index_kpool,
-                head_dim,
-                round_scale=(scale_fmt is not None),
+        # Only the last pool of each request is needed to seed its tail.
+        # Complete pools are encoded locally and never gather raw K/gate.
+        tail_slots = tail_meta.slot_mapping[: layout.global_num_tokens]
+        ring = tail_kv_cache.shape[2]
+        plans = get_pcp_plan_cache()
+        row_key = (id(layout), id(tail_meta), index_kpool, ring)
+        cached_rows = plans.get(("tail_rows", row_key))
+        if cached_rows is None:
+            ahead = torch.full_like(tail_slots, -1)
+            if tail_slots.numel() > index_kpool:
+                ahead[:-index_kpool] = tail_slots[index_kpool:]
+            keep = (tail_slots >= 0) & (
+                (ahead < 0) | (tail_slots // ring != ahead // ring)
             )
-        pre = slice(global_decodes, layout.global_num_tokens)
-        _kpool_compress_insert(
-            global_k[pre],
-            global_gate[pre],
-            compress_ape,
-            kv_cache,
-            global_slots[pre],
-            index_kpool,
-            head_dim,
-            round_scale=(scale_fmt is not None),
+            keep[:global_decodes] = True
+            tail_rows = torch.nonzero(keep, as_tuple=True)[0]
+            plans[("tail_rows", row_key)] = (layout, tail_meta, tail_rows)
+        else:
+            _, _, tail_rows = cached_rows
+        slot_key = ("index_slots", row_key, id(attn_metadata_narrowed))
+        cached_slots = plans.get(slot_key)
+        if cached_slots is None:
+            global_slots = slot_mapping[layout.restore_idx]
+            seed_slots = tail_slots[tail_rows]
+            plans[slot_key] = (
+                attn_metadata_narrowed,
+                global_slots,
+                seed_slots,
+            )
+        else:
+            _, global_slots, seed_slots = cached_slots
+        packed_tail = layout.gather_rows(
+            torch.stack((k, gate_score), dim=1),
+            tail_rows,
+            plan_key=("tail", row_key),
         )
+        # The seed kernel expects contiguous token rows for both inputs.
+        global_k, global_gate = packed_tail.transpose(0, 1).contiguous().unbind(0)
+        cp_group = get_pcp_group()
+        request_positions = getattr(tail_meta, "positions", None)
+        if request_positions is None:
+            request_positions = layout.gather_rows(
+                positions,
+                torch.arange(layout.global_num_tokens, device=positions.device),
+            )
+        else:
+            request_positions = request_positions[: layout.global_num_tokens]
+        boundary_rows, boundary_slots, boundary_encoded = complete_boundary_pools(
+            k,
+            gate_score,
+            compress_ape,
+            request_positions,
+            global_slots,
+            tail_slots,
+            layout,
+            kv_cache,
+            tail_kv_cache,
+            index_pages,
+            tail_pages,
+            index_kpool,
+            cp_group,
+            round_scale=(scale_fmt is not None),
+            plan_key=(row_key, id(attn_metadata_narrowed)),
+            return_compressed=True,
+        )
+        pre = slice(0, tail_rows.numel())
+        local_start = cp_group.rank_in_group * layout.local_padded_num_tokens
+        local_key = ("index_local_slots", slot_key, local_start, k.shape[0])
+        cached_local = plans.get(local_key)
+        if cached_local is None:
+            local_slots = slot_mapping[local_start : local_start + k.shape[0]].clone()
+            local_slots[:num_decode_tokens] = -1
+            local_global_rows = layout.expand_idx[
+                local_start : local_start + k.shape[0]
+            ]
+            local_slots.masked_fill_(boundary_rows[local_global_rows], -1)
+            request_ids = torch.div(
+                tail_slots[local_global_rows], ring, rounding_mode="floor"
+            )
+            plans[local_key] = (local_slots, request_ids)
+        else:
+            local_slots, request_ids = cached_local
+        pool_slots, pool_encoded = compress_local_pools(
+            k,
+            gate_score,
+            compress_ape,
+            local_slots,
+            index_kpool,
+            kv_cache.shape[1],
+            round_scale=(scale_fmt is not None),
+            plan_key=(
+                id(attn_metadata_narrowed),
+                id(tail_meta),
+                local_start,
+                k.shape[0],
+                index_kpool,
+            ),
+            positions=positions,
+            request_ids=request_ids,
+        )
+        if tail_pages is not None:
+            seed_slots = tail_pages.write_slots(seed_slots, ring)
         kpool_ops.kpool_seed_tail_cache(
             tail_kv_cache,
             global_k[pre],
             global_gate[pre],
-            tail_meta.slot_mapping[pre],
+            seed_slots,
             index_kpool,
             head_dim,
         )
         skip_k_cache_insert = True
+        if index_pages is None:
+            raise RuntimeError("PCP current index composition requires bound pages")
+        produced_slots = torch.cat((boundary_slots, pool_slots))
+        produced_rows = torch.cat((boundary_encoded, pool_encoded))
+        current_slots, producer_width, producer_rows = current_pool_descriptors(
+            produced_slots,
+            cp_group,
+            plan_key=("index_current", row_key, id(attn_metadata_narrowed)),
+        )
+        index_pages.compose_current(
+            attn_metadata_narrowed,
+            current_slots,
+            produced_rows,
+            head_bytes=head_dim,
+            sources=producer_rows,
+            source_width=max(1, producer_width),
+        )
+        kv_cache, attn_metadata_narrowed = index_pages.materialize(
+            attn_metadata_narrowed
+        )
 
     # During speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens. Truncate k to avoid

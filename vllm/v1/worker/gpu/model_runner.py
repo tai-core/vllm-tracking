@@ -721,6 +721,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.supports_mm_inputs,
             self.block_tables,
             cls=self.pcp_manager_cls,
+            page_layout=self.kv_cache_config.pcp_layout,
         )
         self.ubatch_runner = maybe_build_ubatch_runner(
             self.vllm_config,
@@ -804,6 +805,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
+        self.pcp_cache_maintenance = next(
+            (
+                layer.pcp_maintenance
+                for layer in self.compilation_config.static_forward_context.values()
+                if hasattr(layer, "pcp_maintenance")
+            ),
+            None,
+        )
         self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
@@ -818,6 +827,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
+        self.pcp_cache_maintenance = next(
+            (
+                layer.pcp_maintenance
+                for layer in self.compilation_config.static_forward_context.values()
+                if hasattr(layer, "pcp_maintenance")
+            ),
+            None,
+        )
+        if self.pcp_cache_maintenance is not None:
+            self.kv_block_zeroer = None
+            return
         self.kv_block_zeroer = KVBlockZeroer(
             self.device,
             attn_groups_iter=(g for groups in self.attn_groups for g in groups),
@@ -1275,17 +1295,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
-            assert self.kv_block_zeroer is not None
-            self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            maintenance = getattr(self, "pcp_cache_maintenance", None)
+            if maintenance is not None:
+                maintenance.zero_blocks(scheduler_output.new_block_ids_to_zero)
+            else:
+                assert self.kv_block_zeroer is not None
+                self.kv_block_zeroer.zero_block_ids(
+                    scheduler_output.new_block_ids_to_zero
+                )
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
-            copy_kv_cache_blocks_inplace(
-                self.kv_caches,
-                self.kv_cache_config.num_blocks,
-                scheduler_output.kv_cache_block_copies,
-            )
+            maintenance = getattr(self, "pcp_cache_maintenance", None)
+            if maintenance is not None:
+                from vllm.v1.pcp.allocation import apply_pcp_block_copies
+
+                apply_pcp_block_copies(
+                    self.kv_cache_config,
+                    self.compilation_config.static_forward_context,
+                    maintenance,
+                    scheduler_output.kv_cache_block_copies,
+                    scheduler_output.kv_cache_block_copy_group_ids,
+                )
+            else:
+                copy_kv_cache_blocks_inplace(
+                    self.kv_caches,
+                    self.kv_cache_config.num_blocks,
+                    scheduler_output.kv_cache_block_copies,
+                )
 
     def gather_batch_req_state(
         self, scheduler_output: SchedulerOutput, dummy_run: bool
@@ -1831,6 +1869,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_toks = self.pcp_manager.get_num_tokens_for_dispatch(
                     batch_req_state.num_scheduled_tokens,
                     batch_req_state.is_prefilling_np,
+                    batch_req_state.num_computed_prefill_tokens_np,
                 )
 
         num_active_loras = 0

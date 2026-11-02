@@ -1052,8 +1052,27 @@ class Worker(WorkerBase):
                 100 * diff / max(cuda_graph_memory_bytes, 1),
             )
 
-        if self.cache_config.kv_cache_memory_bytes is None and hasattr(
-            self, "peak_activation_memory"
+        pcp_budget = getattr(
+            getattr(self.model_runner, "kv_cache_config", None),
+            "pcp_memory_budget_bytes",
+            None,
+        )
+        if pcp_budget is not None:
+            # The engine uses the smallest rank's physical budget, including
+            # bounded workspace. A rank-local full-cache recommendation would
+            # bypass that constraint and is not the allocated cache size.
+            logger.info(
+                "PCP physical cache/workspace budget for this group: %s GiB; "
+                "rank-local profiled availability: %s GiB.",
+                format_gib(pcp_budget),
+                format_gib(
+                    getattr(self, "available_kv_cache_memory_bytes", pcp_budget)
+                ),
+            )
+        if (
+            pcp_budget is None
+            and self.cache_config.kv_cache_memory_bytes is None
+            and hasattr(self, "peak_activation_memory")
         ):
             # Suggests optimal kv cache memory size if we rely on
             # memory_profiling to guess the kv cache memory size which
