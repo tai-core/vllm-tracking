@@ -9,7 +9,7 @@ import time
 from collections import defaultdict
 from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Final
 
@@ -22,6 +22,11 @@ from huggingface_hub.utils import httpx
 
 from vllm import envs
 from vllm.config import VllmConfig
+from vllm.config.kda_parallel import (
+    get_kda_layer_tp,
+    kda_mamba_shared_pool,
+    kda_tp_over_dp,
+)
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
     TransferTopology,
@@ -44,6 +49,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
 )
 from vllm.distributed.parallel_state import (
+    get_dp_group,
+    get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -113,6 +120,8 @@ class TransferRegion:
     shared_group_ids: tuple[int, ...] = ()
     # Byte offset of this view from the start of its block row.
     row_offset: int = 0
+    # Unpadded state/KV bytes at the start of each physical block.
+    content_len: int | None = None
 
 
 def _block_ids_for_region(
@@ -169,6 +178,7 @@ def _expand_transfer_regions(
     group_indices: list[int] | None = None,
     shared_group_ids: list[tuple[int, ...]] | None = None,
     row_offsets: list[int] | None = None,
+    content_lens: list[int] | None = None,
 ) -> list[TransferRegion]:
     """Expand registered KV tensors into the regions transferred by Mooncake."""
     assert (
@@ -198,6 +208,9 @@ def _expand_transfer_regions(
     if row_offsets is None:
         row_offsets = [-1] * len(layer_names)
     assert len(row_offsets) == len(layer_names)
+    if content_lens is None:
+        content_lens = kv_block_lens
+    assert len(content_lens) == len(layer_names)
     regions: list[TransferRegion] = []
     for (
         base_addr,
@@ -208,6 +221,7 @@ def _expand_transfer_regions(
         group_index,
         region_groups,
         row_offset,
+        content_len,
     ) in zip(
         base_addrs,
         block_lens,
@@ -217,6 +231,7 @@ def _expand_transfer_regions(
         group_indices,
         shared_group_ids,
         row_offsets,
+        content_lens,
     ):
         regions.append(
             TransferRegion(
@@ -228,6 +243,7 @@ def _expand_transfer_regions(
                 group_index=group_index,
                 shared_group_ids=region_groups,
                 row_offset=row_offset,
+                content_len=content_len,
             )
         )
     return regions
@@ -288,6 +304,36 @@ def _compute_sender_transfer_plan(
     )
 
 
+def _compute_kda_dp_sender_transfer_plan(
+    local_kda_rank: int,
+    local_kda_size: int,
+    remote_kda_rank: int,
+    remote_kda_size: int,
+    local_kv_block_len: int,
+    remote_kv_block_len: int,
+) -> tuple[bool, int, int, int]:
+    """Map one KDA head shard without changing ordinary-attention topology."""
+    if local_kda_size != remote_kda_size:
+        raise ValueError(
+            "Mooncake KDA-over-DP requires matching producer/consumer KDA sizes, "
+            f"got {local_kda_size} and {remote_kda_size}."
+        )
+    if not (0 <= local_kda_rank < local_kda_size) or not (
+        0 <= remote_kda_rank < remote_kda_size
+    ):
+        raise ValueError(
+            "Mooncake KDA rank is outside its group: "
+            f"local={local_kda_rank}/{local_kda_size}, "
+            f"remote={remote_kda_rank}/{remote_kda_size}."
+        )
+    if local_kv_block_len != remote_kv_block_len:
+        raise ValueError(
+            "Mooncake KDA state schema mismatch: "
+            f"local={local_kv_block_len}, remote={remote_kv_block_len}."
+        )
+    return local_kda_rank == remote_kda_rank, 0, 0, local_kv_block_len
+
+
 def _can_coalesce_block_transfers(
     local_region_block_len: int,
     remote_region_block_len: int,
@@ -311,6 +357,7 @@ def _validate_asymmetric_region_lengths(
     remote_tp_size: int,
     producer_cache_replicated: bool,
     total_num_kv_heads: int | None = None,
+    skip_region_indices: set[int] | None = None,
 ) -> str | None:
     """Validate transfer-region metadata for a fixed producer/consumer pair.
 
@@ -335,6 +382,8 @@ def _validate_asymmetric_region_lengths(
     for idx, (local_region, remote_region) in enumerate(
         zip(local_regions, remote_regions)
     ):
+        if skip_region_indices is not None and idx in skip_region_indices:
+            continue
         if tp_ratio == 1:
             if local_region.kv_block_len != remote_region.kv_block_len:
                 return (
@@ -478,6 +527,8 @@ def _coalesce_contiguous_transfer_regions(
             prev.group_index == nxt.group_index
             and prev.shared_group_ids == nxt.shared_group_ids
             and prev.block_len == nxt.block_len
+            and (prev.content_len or prev.kv_block_len) == prev.kv_block_len
+            and (nxt.content_len or nxt.kv_block_len) == nxt.kv_block_len
             and prev.base_addr + prev.kv_block_len <= nxt.base_addr
             and nxt.base_addr + nxt.kv_block_len
             <= run_start.base_addr + run_start.block_len
@@ -493,6 +544,7 @@ def _coalesce_contiguous_transfer_regions(
             group_index=region.group_index,
             shared_group_ids=region.shared_group_ids,
             row_offset=region.row_offset,
+            content_len=kv_block_len,
         )
 
     def promote(
@@ -613,6 +665,7 @@ class MooncakeXferMetadata(
     block_lens: list[int]
     kv_block_lens: list[int]
     registered_layer_names: list[str] = msgspec.field(default_factory=list)
+    registered_content_lens: list[int] = msgspec.field(default_factory=list)
     registered_layer_indices: list[int] = msgspec.field(default_factory=list)
     registered_group_indices: list[int] = msgspec.field(default_factory=list)
     # Parallel to registered regions. Each entry is the groups that share
@@ -621,6 +674,8 @@ class MooncakeXferMetadata(
     # Byte offset of each registered view from its block row. -1 means the
     # peer did not send the field, so the run must not be promoted.
     registered_row_offsets: list[int] = msgspec.field(default_factory=list)
+    remote_kda_tp_size: int = 0
+    remote_kda_tp_rank: int = -1
     remote_pp_size: int = 1
 
 
@@ -1178,6 +1233,11 @@ class MooncakeConnectorWorker:
         if TransferEngine is None:
             logger.error("Mooncake is not available")
             raise RuntimeError("Mooncake is not available")
+        if kda_tp_over_dp(vllm_config) and not kda_mamba_shared_pool(vllm_config):
+            raise ValueError(
+                "Mooncake KDA-over-DP requires --kda-mamba-shared-pool so every "
+                "consumer rank can address the owner's state slot."
+            )
         logger.info("Initializing Mooncake Transfer Engine worker %s", engine_id)
 
         self.vllm_config = vllm_config
@@ -1230,6 +1290,7 @@ class MooncakeConnectorWorker:
         self.tp_size = get_tensor_model_parallel_world_size()
         self.block_len_per_layer: list[int] = []
         self.kv_block_len_per_layer: list[int] = []
+        self.content_len_per_layer: list[int] = []
         self.registered_layer_names: list[str] = []
         self.registered_layer_indices: list[int] = []
         self.registered_group_indices: list[int] = []
@@ -1252,6 +1313,22 @@ class MooncakeConnectorWorker:
         self.dp_rank = dp_local_rank if parallel_config.local_engines_only else dp_rank
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.pp_rank = get_pp_group().rank_in_group
+        self.kda_layer_tp = get_kda_layer_tp(vllm_config)
+        self.kda_layer_rank = (
+            get_ep_group().rank_in_group
+            if kda_tp_over_dp(vllm_config)
+            else self.tp_rank
+        )
+        self.kda_dp_shared_pool = kda_mamba_shared_pool(vllm_config)
+        self.advertised_kda_tp_size = (
+            self.kda_layer_tp if self.kda_dp_shared_pool else 0
+        )
+        self.advertised_kda_tp_rank = (
+            self.kda_layer_rank if self.kda_dp_shared_pool else -1
+        )
+        self._dp_req_owners: dict[TransferId, tuple[int, ReqId]] = {}
+        self._dp_completed_reqs: set[TransferId] = set()
+        self._dp_failed_reqs: set[TransferId] = set()
 
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[str, torch.Tensor] = {}
@@ -1544,6 +1621,11 @@ class MooncakeConnectorWorker:
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
             return
+        kda_dp_region_indices = {
+            idx
+            for idx, region in enumerate(local_regions)
+            if self._uses_kda_dp_topology(region.layer_name, meta.remote_kda_tp_size)
+        }
         validation_err = _validate_asymmetric_region_lengths(
             local_regions=local_regions,
             remote_regions=remote_regions,
@@ -1555,7 +1637,12 @@ class MooncakeConnectorWorker:
                 if self.use_mla or self.kv_cache_config.has_mamba_layers
                 else self.transfer_topo.total_num_kv_heads
             ),
+            skip_region_indices=kda_dp_region_indices,
         )
+        if validation_err is None:
+            validation_err = self._validate_kda_dp_regions(
+                local_regions, remote_regions, meta
+            )
         if validation_err is not None:
             response = MooncakeXferResponse(
                 status=MooncakeXferResponseStatus.ERROR,
@@ -1624,7 +1711,10 @@ class MooncakeConnectorWorker:
                     send_meta.sending += 1
                     if not send_meta.need_send:
                         self.resolve_need_send(
-                            send_meta, remote_tp_ranks, meta.remote_pp_size
+                            send_meta,
+                            remote_tp_ranks,
+                            meta.remote_pp_size,
+                            meta.remote_kda_tp_size,
                         )
                     ready_reqs.append((d_req_id, send_meta))
                 else:
@@ -1702,9 +1792,12 @@ class MooncakeConnectorWorker:
         send_meta: SendBlockMeta,
         remote_tp_ranks: list[int],
         remote_pp_size: int = 1,
+        remote_kda_tp_size: int = 0,
     ):
-        # Prepare for heterogeneous TP (one P pairs to multiple D)
-        send_meta.need_send = len(remote_tp_ranks)
+        # KDA-over-DP needs every consumer rank to receive its own state shard.
+        # Ordinary attention still only goes to the request owner, but the
+        # producer lease must remain held until every KDA consumer has arrived.
+        send_meta.need_send = remote_kda_tp_size or len(remote_tp_ranks)
         if remote_pp_size > 1 and remote_pp_size != self.pp_size:
             # Each consumer PP stage pulls every producer stage, including
             # peers with no shared layers.
@@ -1742,6 +1835,39 @@ class MooncakeConnectorWorker:
             else group
             for i, group in enumerate(block_ids)
         ]
+
+    def _uses_kda_dp_topology(self, layer_name: str, remote_kda_tp_size: int) -> bool:
+        return remote_kda_tp_size > 0 and isinstance(
+            self._layer_specs.get(layer_name), MambaSpec
+        )
+
+    def _validate_kda_dp_regions(
+        self,
+        local_regions: list[TransferRegion],
+        remote_regions: list[TransferRegion],
+        agent_meta: MooncakeXferMetadata,
+    ) -> str | None:
+        for local_region, remote_region in zip(local_regions, remote_regions):
+            if not self._uses_kda_dp_topology(
+                local_region.layer_name, agent_meta.remote_kda_tp_size
+            ):
+                continue
+            try:
+                _compute_kda_dp_sender_transfer_plan(
+                    local_kda_rank=self.kda_layer_rank,
+                    local_kda_size=self.kda_layer_tp,
+                    remote_kda_rank=agent_meta.remote_kda_tp_rank,
+                    remote_kda_size=agent_meta.remote_kda_tp_size,
+                    local_kv_block_len=(
+                        local_region.content_len or local_region.kv_block_len
+                    ),
+                    remote_kv_block_len=(
+                        remote_region.content_len or remote_region.kv_block_len
+                    ),
+                )
+            except ValueError as exc:
+                return str(exc)
+        return None
 
     async def _build_transfer_params(
         self,
@@ -1864,17 +1990,38 @@ class MooncakeConnectorWorker:
                 group_local_block_ids, group_remote_block_ids = (
                     group_concurrent_contiguous(local_block_ids, remote_block_ids)
                 )
-                (
-                    should_transfer,
-                    src_region_offset,
-                    dst_region_offset,
-                    transfer_len,
-                ) = self._get_sender_transfer_plan(
-                    local_kv_block_len=local_region.kv_block_len,
-                    remote_kv_block_len=remote_region.kv_block_len,
-                    remote_tp_rank=agent_meta.remote_tp_rank,
-                    remote_tp_size=agent_meta.remote_tp_size,
-                )
+                if self._uses_kda_dp_topology(
+                    local_region.layer_name, agent_meta.remote_kda_tp_size
+                ):
+                    (
+                        should_transfer,
+                        src_region_offset,
+                        dst_region_offset,
+                        transfer_len,
+                    ) = _compute_kda_dp_sender_transfer_plan(
+                        local_kda_rank=self.kda_layer_rank,
+                        local_kda_size=self.kda_layer_tp,
+                        remote_kda_rank=agent_meta.remote_kda_tp_rank,
+                        remote_kda_size=agent_meta.remote_kda_tp_size,
+                        local_kv_block_len=(
+                            local_region.content_len or local_region.kv_block_len
+                        ),
+                        remote_kv_block_len=(
+                            remote_region.content_len or remote_region.kv_block_len
+                        ),
+                    )
+                else:
+                    (
+                        should_transfer,
+                        src_region_offset,
+                        dst_region_offset,
+                        transfer_len,
+                    ) = self._get_sender_transfer_plan(
+                        local_kv_block_len=local_region.kv_block_len,
+                        remote_kv_block_len=remote_region.kv_block_len,
+                        remote_tp_rank=agent_meta.remote_tp_rank,
+                        remote_tp_size=agent_meta.remote_tp_size,
+                    )
                 if not should_transfer:
                     # Replicated KV cache: only one producer rank in the TP group
                     # needs to send the actual bytes for this paired decoder rank.
@@ -1986,6 +2133,7 @@ class MooncakeConnectorWorker:
         seen_storage_ptrs: set[int] = set()
         self.block_len_per_layer = []
         self.kv_block_len_per_layer = []
+        self.content_len_per_layer = []
         self.registered_layer_names = []
         self.registered_layer_indices = []
         self.registered_group_indices = []
@@ -2104,6 +2252,7 @@ class MooncakeConnectorWorker:
                 region_base_addresses.append(view_addr)
                 self.block_len_per_layer.append(block_stride)
                 self.kv_block_len_per_layer.append(kv_block_len)
+                self.content_len_per_layer.append(kv_block_len)
                 self.registered_layer_names.append(layer_name)
                 self.registered_layer_indices.append(layer_index)
                 self.registered_group_indices.append(group_index)
@@ -2149,6 +2298,11 @@ class MooncakeConnectorWorker:
                     )
                 self.block_len_per_layer.append(block_len)
                 self.kv_block_len_per_layer.append(kv_block_len)
+                self.content_len_per_layer.append(
+                    layer_spec.real_page_size_bytes
+                    if isinstance(layer_spec, MambaSpec)
+                    else kv_block_len
+                )
                 self.registered_layer_names.append(layer_name)
                 self.registered_layer_indices.append(layer_index)
                 self.registered_group_indices.append(group_index)
@@ -2278,6 +2432,50 @@ class MooncakeConnectorWorker:
 
         return finished_sending_reqs or None, finished_recving_reqs or None
 
+    def _get_dp_transfer_results(
+        self,
+        finished_sending_reqs: set[str] | None,
+        finished_recving_reqs: set[str] | None,
+        failed_recving_reqs: set[str],
+    ) -> KVConnectorTransferResults:
+        self._dp_completed_reqs.update(finished_recving_reqs or ())
+        self._dp_failed_reqs.update(failed_recving_reqs)
+        self._dp_completed_reqs.difference_update(self._dp_failed_reqs)
+        dp_group = get_dp_group()
+        gathered: list[tuple[set[TransferId], set[TransferId]] | None] = [
+            None
+        ] * dp_group.world_size
+        torch.distributed.all_gather_object(
+            gathered,
+            (self._dp_completed_reqs, self._dp_failed_reqs),
+            group=dp_group.cpu_group,
+        )
+        assert all(item is not None for item in gathered)
+        packets = [item for item in gathered if item is not None]
+        ready = set(packets[0][0])
+        for completed, _failed in packets[1:]:
+            ready.intersection_update(completed)
+        failed = set().union(*(failed for _completed, failed in packets))
+        ready.difference_update(failed)
+
+        owner_finished: set[ReqId] = set()
+        owner_failed: set[ReqId] = set()
+        for transfer_id in ready | failed:
+            owner_rank, owner_req_id = self._dp_req_owners.pop(transfer_id)
+            if owner_rank != self.dp_rank:
+                continue
+            if transfer_id in failed:
+                owner_failed.add(owner_req_id)
+            else:
+                owner_finished.add(owner_req_id)
+        self._dp_completed_reqs.difference_update(ready | failed)
+        self._dp_failed_reqs.difference_update(ready | failed)
+        return KVConnectorTransferResults(
+            finished_sending=set(finished_sending_reqs or ()),
+            finished_recving=owner_finished,
+            failed_recving=owner_failed,
+        )
+
     def get_transfer_results(self) -> KVConnectorTransferResults:
         """Get transfers that completed on this specific worker, including
         requests whose remote KV load failed.
@@ -2294,6 +2492,12 @@ class MooncakeConnectorWorker:
             except queue.Empty:
                 break
 
+        if self.kda_dp_shared_pool:
+            return self._get_dp_transfer_results(
+                finished_sending_reqs,
+                finished_recving_reqs,
+                failed_recving_reqs,
+            )
         return KVConnectorTransferResults(
             finished_sending=set(finished_sending_reqs or ()),
             finished_recving=set(finished_recving_reqs or ()),
@@ -2318,6 +2522,8 @@ class MooncakeConnectorWorker:
             remote_port=self.rpc_port,
             remote_tp_size=self.tp_size,
             remote_tp_rank=self.tp_rank,
+            remote_kda_tp_size=self.advertised_kda_tp_size,
+            remote_kda_tp_rank=self.advertised_kda_tp_rank,
             remote_pp_size=self.pp_size,
             req_blocks={
                 req_id: (pull_meta.transfer_id, pull_meta.local_block_ids)
@@ -2327,6 +2533,7 @@ class MooncakeConnectorWorker:
             block_lens=self.block_len_per_layer,
             kv_block_lens=self.kv_block_len_per_layer,
             registered_layer_names=self.registered_layer_names,
+            registered_content_lens=self.content_len_per_layer,
             registered_layer_indices=self.registered_layer_indices,
             registered_group_indices=self.registered_group_indices,
             registered_shared_group_ids=[
@@ -2588,7 +2795,75 @@ class MooncakeConnectorWorker:
             if send_meta:
                 assert not send_meta.ready.is_set()
 
+    def _kda_only_block_ids(self, block_ids: list[list[int]]) -> list[list[int]]:
+        def is_mamba_group(group_spec) -> bool:
+            spec = group_spec.kv_cache_spec
+            if isinstance(spec, MambaSpec):
+                return True
+            layer_specs = getattr(spec, "kv_cache_specs", {})
+            return bool(layer_specs) and all(
+                isinstance(layer_spec, MambaSpec) for layer_spec in layer_specs.values()
+            )
+
+        return [
+            list(group) if is_mamba_group(group_spec) else []
+            for group, group_spec in zip(
+                block_ids, self.kv_cache_config.transfer_groups, strict=True
+            )
+        ]
+
+    def _merge_dp_pull_reqs(
+        self,
+        metadata: MooncakeConnectorMetadata,
+        gathered: list[list[tuple[EngineId, ReqId, PullReqMeta]]],
+    ) -> MooncakeConnectorMetadata:
+        merged = MooncakeConnectorMetadata()
+        merged.reqs_to_send = metadata.reqs_to_send
+        merged.reqs_not_processed = metadata.reqs_not_processed
+        for owner_rank, entries in enumerate(gathered):
+            for _engine_id, _req_id, pull_meta in entries:
+                transfer_id = pull_meta.transfer_id
+                owner = (owner_rank, pull_meta.d_req_id)
+                previous = self._dp_req_owners.get(transfer_id)
+                if previous is not None and previous != owner:
+                    raise ValueError(
+                        f"Duplicate Mooncake DP transfer id {transfer_id}: "
+                        f"{previous} vs {owner}."
+                    )
+                self._dp_req_owners[transfer_id] = owner
+                local_block_ids = pull_meta.local_block_ids
+                if owner_rank != self.dp_rank and local_block_ids:
+                    local_block_ids = self._kda_only_block_ids(local_block_ids)
+                fanout_meta = replace(
+                    pull_meta,
+                    d_req_id=transfer_id,
+                    local_block_ids=local_block_ids,
+                )
+                merged.reqs_to_recv[fanout_meta.remote_engine_id][transfer_id] = (
+                    fanout_meta
+                )
+        return merged
+
+    def _fanout_dp_metadata(
+        self, metadata: MooncakeConnectorMetadata
+    ) -> MooncakeConnectorMetadata:
+        local_reqs = [
+            (engine_id, req_id, pull_meta)
+            for engine_id in sorted(metadata.reqs_to_recv)
+            for req_id, pull_meta in sorted(metadata.reqs_to_recv[engine_id].items())
+        ]
+        dp_group = get_dp_group()
+        gathered: list[list[tuple[EngineId, ReqId, PullReqMeta]]] = [
+            [] for _ in range(dp_group.world_size)
+        ]
+        torch.distributed.all_gather_object(
+            gathered, local_reqs, group=dp_group.cpu_group
+        )
+        return self._merge_dp_pull_reqs(metadata, gathered)
+
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
+        if self.kda_dp_shared_pool:
+            metadata = self._fanout_dp_metadata(metadata)
         if not self.is_kv_producer and metadata.reqs_to_recv:
             asyncio.run_coroutine_threadsafe(
                 self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop
@@ -2621,6 +2896,7 @@ class MooncakeConnectorWorker:
             tuple(meta.kv_caches_base_addr),
             tuple(meta.block_lens),
             tuple(meta.kv_block_lens),
+            tuple(meta.registered_content_lens),
             tuple(meta.registered_layer_names),
             tuple(meta.registered_layer_indices),
             tuple(meta.registered_group_indices),
@@ -2665,6 +2941,7 @@ class MooncakeConnectorWorker:
             self.registered_group_indices,
             shared_groups,
             local_rows,
+            self.content_len_per_layer,
         )
         remote_shared_groups = [
             tuple(groups) for groups in meta.registered_shared_group_ids
@@ -2685,6 +2962,7 @@ class MooncakeConnectorWorker:
             meta.registered_group_indices,
             remote_shared,
             remote_row_offsets,
+            meta.registered_content_lens,
         )
         pre_align_local = local_regions
         pre_align_remote = remote_regions
@@ -2764,6 +3042,7 @@ class MooncakeConnectorWorker:
         group_indices: list[int] | None = None,
         shared_group_ids: list[tuple[int, ...]] | None = None,
         row_offsets: list[int] | None = None,
+        content_lens: list[int] | None = None,
     ) -> list[TransferRegion]:
         if not group_indices:
             group_indices = [
@@ -2779,6 +3058,7 @@ class MooncakeConnectorWorker:
             group_indices=group_indices,
             shared_group_ids=shared_group_ids,
             row_offsets=row_offsets,
+            content_lens=content_lens,
         )
 
     def _get_sender_transfer_plan(

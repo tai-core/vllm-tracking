@@ -3,12 +3,13 @@
 """Backend for GatedDeltaNet attention."""
 
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
+from vllm.config.kda_parallel import kda_tp_over_dp
 from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointBuilder,
     MambaPrefillCheckpointMetadata,
@@ -90,6 +91,22 @@ class GDNAttentionMetadata:
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
 
+    # KDA-over-DP metadata is attached after the common metadata is built.
+    kda_dp_plan: Any | None = None
+    kda_dp_dummy: bool = False
+
+    if TYPE_CHECKING:
+        # These remain dynamic at runtime so replace() keeps dropping them.
+        recoverssm_commit: Any | None = None
+        _kda_global_metadata: Any | None = None
+        _kda_dp_plan: Any | None = None
+        _kda_dp_order: torch.Tensor | None = None
+        _kda_dp_num_valid: torch.Tensor | None = None
+        _kda_dp_prefill_num_valid: torch.Tensor | None = None
+        _kda_dp_spec_num_valid: torch.Tensor | None = None
+        _kda_dp_spec_group: Any | None = None
+        _kda_dp_spec_rows: int | None = None
+
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec
@@ -163,6 +180,59 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        if kda_tp_over_dp(self.vllm_config):
+            # Persistent buffers for the gathered batch: the captured graph
+            # reads these addresses, so every step rewrites their contents
+            # rather than handing out fresh tensors.
+            from vllm.config.kda_parallel import (
+                get_kda_request_windows,
+                kda_dp_compact_decode,
+            )
+
+            k = get_kda_request_windows(self.vllm_config)
+            self.dp_global_state_indices = torch.zeros(
+                k * self.decode_cudagraph_max_bs * max(1, self.num_spec + 1),
+                dtype=torch.int32,
+                device=device,
+            )
+            self.dp_global_qsl = torch.arange(
+                k * self.decode_cudagraph_max_bs + 1,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.dp_global_spec_token_indx = torch.empty(
+                k * self.decode_cudagraph_max_bs,
+                dtype=torch.int64,
+                device=device,
+            )
+            self.dp_global_spec_accepted = torch.empty(
+                k * self.decode_cudagraph_max_bs,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.dp_global_spec_num_valid = torch.empty(
+                1, dtype=torch.int32, device=device
+            )
+            if kda_dp_compact_decode(self.vllm_config):
+                self.dp_global_order = torch.empty(
+                    k * self.decode_cudagraph_max_bs,
+                    dtype=torch.int64,
+                    device=device,
+                )
+                self.dp_global_num_valid = torch.empty(
+                    1, dtype=torch.int32, device=device
+                )
+            else:
+                self.dp_global_order = None
+                self.dp_global_num_valid = None
+        else:
+            self.dp_global_state_indices = None
+            self.dp_global_qsl = None
+            self.dp_global_order = None
+            self.dp_global_num_valid = None
+            self.dp_global_spec_token_indx = None
+            self.dp_global_spec_accepted = None
+            self.dp_global_spec_num_valid = None
         self.spec_sequence_masks: torch.Tensor = torch.empty(
             (self.decode_cudagraph_max_bs,),
             dtype=torch.bool,
@@ -646,6 +716,29 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
+        if kda_tp_over_dp(self.vllm_config):
+            # Globalise here, outside graph capture: every rank holds a head
+            # slice of every request, so the KDA kernels must see the whole
+            # gathered batch. Doing the collectives and host-side expansion
+            # in the builder keeps the KDA forward itself capturable.
+            attn_metadata.kda_dp_plan = m.kda_dp_plan
+            attn_metadata.kda_dp_dummy = m.kda_dp_dummy
+            from vllm.models.glm5next.common.kda import (
+                globalize_gdn_metadata_for_dp_config,
+            )
+
+            attn_metadata = globalize_gdn_metadata_for_dp_config(
+                self.vllm_config,
+                self.kv_cache_spec,
+                attn_metadata,
+                self.dp_global_state_indices,
+                self.dp_global_qsl,
+                self.dp_global_order,
+                self.dp_global_num_valid,
+                self.dp_global_spec_token_indx,
+                self.dp_global_spec_accepted,
+                self.dp_global_spec_num_valid,
+            )
         return attn_metadata
 
     def _stage_spec_decode(
@@ -725,13 +818,36 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_indices = self.non_spec_state_indices_tensor[:batch_size]
             non_spec_indices[m.num_decodes :].fill_(NULL_BLOCK_ID)
 
-        return replace(
+        result = replace(
             m,
             spec_state_indices_tensor=spec_indices,
             non_spec_state_indices_tensor=non_spec_indices,
             prefill_state_indices=prefill_indices,
             checkpoint=checkpoint,
         )
+        if kda_tp_over_dp(self.vllm_config):
+            # replace() drops the custom _kda_global_metadata attribute, and
+            # the gathered indices change every step, so rebuild them into the
+            # same persistent buffers the graph captured.
+            if plan := getattr(m, "_kda_dp_plan", None):
+                result.kda_dp_plan = plan
+            from vllm.models.glm5next.common.kda import (
+                globalize_gdn_metadata_for_dp_config,
+            )
+
+            result = globalize_gdn_metadata_for_dp_config(
+                self.vllm_config,
+                self.kv_cache_spec,
+                result,
+                self.dp_global_state_indices,
+                self.dp_global_qsl,
+                self.dp_global_order,
+                self.dp_global_num_valid,
+                self.dp_global_spec_token_indx,
+                self.dp_global_spec_accepted,
+                self.dp_global_spec_num_valid,
+            )
+        return result
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata

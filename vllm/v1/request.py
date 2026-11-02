@@ -80,6 +80,7 @@ class Request:
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
         kv_hints: KvHintsEnvelope | None = None,
+        mamba_slot: int | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -240,6 +241,10 @@ class Request:
         # the scheduler so the connector's request_finished hook runs.
         self.abort_immediately = abort_immediately
 
+        # Global Mamba state slot granted by the front-end at admission time;
+        # None when state block ids are window-local or statically leased.
+        self.mamba_slot = mamba_slot
+
     @classmethod
     def from_engine_core_request(
         cls,
@@ -267,6 +272,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            mamba_slot=request.mamba_slot,
         )
 
     def append_output_token_ids(

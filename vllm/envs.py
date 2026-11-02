@@ -2278,6 +2278,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each op additionally checks its own shape / dtype constraints and falls
     # back to the eager path when they do not hold.
     "VLLM_ENABLE_HPC_OPS": lambda: bool(int(os.getenv("VLLM_ENABLE_HPC_OPS", "0"))),
+    # Share KDA-over-DP batch metadata through an asynchronous per-step plan.
+    "VLLM_KDA_DP_BATCH_PLAN": lambda: bool(
+        int(os.getenv("VLLM_KDA_DP_BATCH_PLAN", "1"))
+    ),
     # Whether to skip version suffix when building package
     "VLLM_SKIP_VERSION_SUFFIX": lambda: bool(
         int(os.getenv("VLLM_SKIP_VERSION_SUFFIX", "0"))

@@ -13,12 +13,14 @@ from unittest.mock import patch
 import pytest
 
 from vllm.config import LoadConfig, SpeculativeConfig
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 
 @dataclass
 class _AttentionConfig:
     backend: str | None = None
+    use_non_causal: bool = False
 
 
 @dataclass
@@ -98,3 +100,19 @@ def test_override_does_not_mutate_the_target_config():
     cfg = _config("FLASHINFER", "TRITON_ATTN")
     _capture_draft_config(cfg)
     assert cfg.attention_config.backend == "FLASHINFER"
+
+
+def test_dflash_metadata_uses_draft_kv_cache_dtype():
+    cfg = _config("FLASH_ATTN", None)
+    cfg.cache_config.cache_dtype = "fp8_ds_mla"
+    cfg.speculative_config.kv_cache_dtype = "auto"
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.vllm_config = cfg
+    speculator.speculative_config = cfg.speculative_config
+    speculator.requires_non_causal = True
+
+    used = speculator.attn_vllm_config
+
+    assert used.cache_config.cache_dtype == "auto"
+    assert used.attention_config.use_non_causal is True
+    assert cfg.cache_config.cache_dtype == "fp8_ds_mla"

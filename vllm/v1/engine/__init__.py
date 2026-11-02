@@ -160,6 +160,10 @@ class EngineCoreRequest(
     session_id: str | None = None
     kv_hints: KvHintsEnvelope | None = None
 
+    # Global Mamba state slot granted by the front-end's DP load balancer when
+    # the KDA state pool is addressed globally. None keeps static/window ids.
+    mamba_slot: int | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""
@@ -274,6 +278,10 @@ class EngineCoreOutputs(
 
     utility_output: UtilityOutput | None = None
     finished_requests: set[str] | None = None
+
+    # Global Mamba state slots whose blocks have actually been freed, returned
+    # to the front-end's lease allocator (per client_index).
+    released_mamba_slots: list[int] | None = None
 
     # In DP case, used to signal that the current wave of requests
     # has finished and the engines are paused.

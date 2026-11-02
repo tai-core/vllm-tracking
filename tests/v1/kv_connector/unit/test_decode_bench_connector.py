@@ -6,6 +6,8 @@ Tests the functionality of the DecodeBenchConnector which fills KV cache
 with dummy values for decode performance benchmarking.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -16,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector import (
     DecodeBenchConnector,
     DecodeBenchConnectorMetadata,
+    DecodeBenchConnectorScheduler,
 )
 from vllm.forward_context import ForwardContext
 from vllm.platforms import current_platform
@@ -156,6 +159,109 @@ class DecodeBenchTestRunner:
         self.scheduler.update_from_output(scheduler_output, model_runner_output)
 
         return scheduler_output, kv_connector_metadata
+
+
+def test_decode_bench_connector_marks_all_cache_groups_loaded():
+    """Synthetic decode state must not trigger prefix replay prefill."""
+    from types import SimpleNamespace
+
+    connector = object.__new__(DecodeBenchConnector)
+    connector.connector_scheduler = SimpleNamespace(
+        kv_cache_groups=[object(), object()]
+    )
+
+    loaded = connector.get_loaded_kv_cache_group_ids(SimpleNamespace())
+
+    assert loaded == (0, 1)
+
+
+def test_decode_bench_connector_restores_preempted_request():
+    """A preempted request gets synthetic KV instead of a prompt replay."""
+    from types import SimpleNamespace
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector import (
+        DecodeBenchConnectorScheduler,
+    )
+
+    scheduler = object.__new__(DecodeBenchConnectorScheduler)
+    scheduler._filled_requests = {"request"}
+    request = SimpleNamespace(request_id="request", num_tokens=101)
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (100, False)
+
+
+def test_decode_bench_dp_state_fill_reaches_non_owner_rank(monkeypatch):
+    """A remote request resets this rank's Mamba slice, not its attention KV."""
+    from types import SimpleNamespace
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector import (
+        DecodeBenchConnectorWorker,
+    )
+
+    worker = object.__new__(DecodeBenchConnectorWorker)
+    worker._dp_global_state_group_ids = {1}
+    worker._zero_fill_group_ids = set()
+    worker._fp8_dtypes = {}
+    worker.fill_mean = 0.015
+    worker.fill_std = 0.0
+    worker.kv_caches = {
+        "attention": torch.full((4, 2), -1.0),
+        "mamba": torch.full((4, 4), 7.0),
+    }
+    worker.group_to_layers = {0: ["attention"], 1: ["mamba"]}
+    dp_group = SimpleNamespace(world_size=2, rank_in_group=0, cpu_group=object())
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_dp_group", lambda: dp_group
+    )
+
+    def all_gather_object(gathered, local, group):
+        assert group is dp_group.cpu_group
+        assert local == []
+        gathered[0] = local
+        gathered[1] = [("remote", 1, [3], 17)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    worker.start_fill_kv(DecodeBenchConnectorMetadata(reqs_to_fill={}))
+
+    assert torch.all(worker.kv_caches["attention"] == -1.0)
+    assert torch.all(worker.kv_caches["mamba"][3] == 0.015)
+    assert torch.all(worker.kv_caches["mamba"][:3] == 7.0)
+
+
+def test_decode_bench_dp_state_fill_bypasses_startup_skip():
+    """DP Mamba state must be refilled even with startup_fill enabled."""
+    scheduler = DecodeBenchConnectorScheduler.__new__(DecodeBenchConnectorScheduler)
+    scheduler._startup_fill_group_ids = {1}
+    scheduler._dp_global_state_group_ids = {1}
+    scheduler.startup_fill = True
+    scheduler.kv_cache_groups = [
+        SimpleNamespace(
+            kv_cache_spec=FullAttentionSpec(
+                block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+            )
+        ),
+        SimpleNamespace(
+            kv_cache_spec=MambaSpec(
+                block_size=32, shapes=((4,), (4,)), dtypes=(torch.float32,) * 2
+            )
+        ),
+    ]
+    scheduler.group_block_sizes = (16, 32)
+    scheduler._filled_requests = set()
+    scheduler._pending_fills = {}
+    request = SimpleNamespace(request_id="request", num_tokens=18)
+    blocks = KVCacheBlocks(
+        (
+            [KVCacheBlock(block_id=1), KVCacheBlock(block_id=2)],
+            [KVCacheBlock(block_id=3)],
+        )
+    )
+
+    scheduler.update_state_after_alloc(request, blocks, 17)
+    metadata = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+
+    assert isinstance(metadata, DecodeBenchConnectorMetadata)
+    assert metadata.reqs_to_fill["request"] == (([1, 2], [3]), 17)
 
 
 def test_decode_bench_connector_basic():
@@ -558,7 +664,7 @@ def test_decode_bench_connector_uses_per_group_dcp_block_sizes():
 
 
 def test_decode_bench_connector_no_refill():
-    """Test that DecodeBenchConnector only fills once per request."""
+    """Running requests do not refill KV, but preempted requests restore it."""
     block_size = 16
     num_gpu_blocks = 100
 
@@ -568,7 +674,7 @@ def test_decode_bench_connector_no_refill():
     num_tokens = block_size * 2
     token_ids = [1] * num_tokens
 
-    runner.new_request(token_ids)
+    req = runner.new_request(token_ids)
 
     # Run first step - should fill KV cache
     _, metadata1 = runner.run_single_step()
@@ -577,6 +683,13 @@ def test_decode_bench_connector_no_refill():
     # Run second step - should NOT fill again (already filled)
     _, metadata2 = runner.run_single_step()
     assert len(metadata2.reqs_to_fill) == 0
+
+    # Preemption resets the computed count but retains generated tokens.
+    req.append_output_token_ids(0)
+    assert runner.scheduler_connector.get_num_new_matched_tokens(req, 0) == (
+        req.num_tokens - 1,
+        False,
+    )
 
 
 def test_decode_bench_connector_single_token():
@@ -1030,9 +1143,10 @@ def test_decode_bench_connector_startup_fill_skips_per_step_fill():
     }
     assert metadata.reqs_to_fill == {}
 
-    # A re-admitted (e.g. preempted) request is not reported again.
+    # A preempted request still gets a synthetic cache hit, but startup-filled
+    # attention groups need no per-request refill.
     assert runner.scheduler_connector.get_num_new_matched_tokens(req1, 0) == (
-        0,
+        req1.num_tokens - 1,
         False,
     )
     for kv_cache in runner.kv_caches.values():

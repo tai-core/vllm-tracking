@@ -472,6 +472,8 @@ class CommonAttentionMetadata:
 
     _num_computed_tokens_cache: torch.Tensor | None = None
     _token_to_req_indices_cache: torch.Tensor | None = None
+    kda_dp_plan: Any | None = None
+    kda_dp_dummy: bool = False
 
     def batch_size(self) -> int:
         return self.seq_lens.shape[0]

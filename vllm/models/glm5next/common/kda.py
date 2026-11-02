@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash KDA layer with separate convolutions and a bounded safe gate."""
 
+import functools
 from dataclasses import replace
 
 import torch
@@ -10,10 +11,10 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import Glm5NextTextConfig
 
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config.kda_parallel import kda_dp_compact_decode, kda_mamba_shared_pool
 from vllm.distributed import divide
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -49,7 +50,7 @@ from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
 from vllm.v1.worker.workspace import current_workspace_manager
 
 from .parallel import get_kda_parallel_spec
@@ -189,6 +190,693 @@ def _resolve_kda_prefill_backend(
     return "flashkda" if supported and backend != "triton" else "triton"
 
 
+def compact_gdn_rows_for_dp(
+    state_indices: torch.Tensor,
+    valid_rows: torch.Tensor,
+    out_order: torch.Tensor | None = None,
+    out_num_valid: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stably move real rows first without reading their count on the host."""
+    num_rows = state_indices.shape[0]
+    device = state_indices.device
+    valid_rows = valid_rows.to(torch.bool)
+    num_valid = valid_rows.sum(dim=0, keepdim=True, dtype=torch.int32)
+
+    real_positions = valid_rows.to(torch.int64).cumsum(dim=0) - 1
+    padding_positions = (
+        num_valid.to(torch.int64) + (~valid_rows).to(torch.int64).cumsum(dim=0) - 1
+    )
+    destinations = torch.where(valid_rows, real_positions, padding_positions)
+    source_rows = torch.arange(num_rows, dtype=torch.int64, device=device)
+    order = torch.empty_like(source_rows)
+    order.scatter_(dim=0, index=destinations, src=source_rows)
+
+    if out_order is not None and out_order.numel() >= num_rows:
+        out_order[:num_rows].copy_(order)
+        order = out_order[:num_rows]
+    if out_num_valid is not None and out_num_valid.numel() >= 1:
+        out_num_valid[:1].copy_(num_valid)
+        num_valid = out_num_valid[:1]
+    return state_indices.index_select(0, order), order, num_valid
+
+
+@functools.lru_cache(maxsize=8)
+def _get_kda_masked_gemm(tile_m: int, tile_n: int, stages: int, warps: int):
+    from mate.jit.gemm.deep_gemm.gemm import (
+        GEMM_TYPE_M_GROUPED_MASKED,
+        GemmJitConfig,
+        get_deep_gemm_gemm_module,
+    )
+
+    dispatch, module = get_deep_gemm_gemm_module(
+        kind="bf16",
+        gemm_type=GEMM_TYPE_M_GROUPED_MASKED,
+        config=GemmJitConfig(tile_m, tile_n, stages, warps),
+    )
+    return module.get_function(dispatch)
+
+
+def masked_bf16_linear_for_dp(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    num_valid: torch.Tensor,
+    *,
+    zero_tail: bool = False,
+) -> torch.Tensor:
+    """Single-group BF16 GEMM with a device-side valid row count."""
+    num_rows = x.shape[0]
+    output = torch.empty((1, num_rows, weight.shape[0]), dtype=x.dtype, device=x.device)
+    if num_rows <= 128:
+        if num_rows <= 32:
+            config = (32, 64, 4, 1)
+        elif num_rows <= 64:
+            config = (64, 64, 4, 1)
+        else:
+            config = (64, 128, 4, 1)
+        tile_m, tile_n, stages, warps = config
+        kernel = _get_kda_masked_gemm(tile_m, tile_n, stages, warps)
+        kernel(
+            x.unsqueeze(0),
+            weight.unsqueeze(0),
+            output,
+            num_valid,
+            tile_m,
+            0,
+        )
+    else:
+        import deep_gemm
+
+        deep_gemm.bf16_m_grouped_gemm_nt_masked(
+            x.unsqueeze(0), weight.unsqueeze(0), output, num_valid, num_rows
+        )
+    output = output[0]
+    if zero_tail:
+        valid = torch.arange(num_rows, dtype=torch.int32, device=x.device)
+        valid = valid < num_valid[0]
+        output = torch.where(valid.unsqueeze(1), output, output.new_zeros(()))
+    return output
+
+
+def _globalize_gdn_prefill_metadata_for_dp(
+    meta: GDNAttentionMetadata,
+    *,
+    group,
+    request_windows: int,
+    shared_state_pool: bool,
+    pool_num_blocks: int,
+    max_tokens: int,
+    plan=None,
+) -> GDNAttentionMetadata:
+    is_dp_dummy = getattr(meta, "kda_dp_dummy", False)
+    assert is_dp_dummy or (meta.num_spec_decodes == 0 and meta.num_decodes == 0), (
+        "KDA across DP ranks does not support mixed prefill and decode: "
+        f"prefills={meta.num_prefills}, decodes={meta.num_decodes}, "
+        f"spec_decodes={meta.num_spec_decodes}"
+    )
+    assert meta.checkpoint is None, (
+        "KDA across DP ranks does not support aligned prefill checkpoints"
+    )
+    k = request_windows
+    rows = max_tokens
+    if is_dp_dummy:
+        reference = meta.non_spec_state_indices_tensor
+        if reference is None:
+            reference = meta.spec_state_indices_tensor
+        assert reference is not None
+        device = reference.device
+        local_state = torch.empty(0, dtype=torch.int32, device=device)
+        local_qsl = torch.zeros(1, dtype=torch.int32, device=device)
+        local_has_initial = torch.empty(0, dtype=torch.bool, device=device)
+    else:
+        local_state = meta.non_spec_state_indices_tensor
+        local_qsl = meta.non_spec_query_start_loc
+        local_has_initial = meta.has_initial_state
+        assert local_state is not None
+        assert local_qsl is not None
+        if local_has_initial is None:
+            local_has_initial = torch.empty(
+                0, dtype=torch.bool, device=local_state.device
+            )
+        device = local_state.device
+
+    def pad_rows(t: torch.Tensor, fill: int) -> torch.Tensor:
+        n = t.shape[0]
+        assert n <= rows
+        if n == rows:
+            return t
+        extra = t.new_full((rows - n,) + t.shape[1:], fill)
+        return torch.cat([t, extra], 0)
+
+    local_query_lens = (local_qsl[1:] - local_qsl[:-1]).to(torch.int32)
+    gathered_state = (
+        plan.all_gather(pad_rows(local_state, 0).contiguous().to(torch.int32))
+        if plan is not None
+        else group.all_gather(pad_rows(local_state, 0).contiguous().to(torch.int32), 0)
+    )
+    gathered_query_lens = group.all_gather(
+        pad_rows(local_query_lens, 0).contiguous(), 0
+    )
+    gathered_has_initial = group.all_gather(
+        pad_rows(local_has_initial, 0).contiguous().to(torch.int32), 0
+    )
+    if not shared_state_pool:
+        assert pool_num_blocks % k == 0
+        rank_offsets = torch.arange(k, dtype=torch.int32, device=device)
+        rank_offsets = rank_offsets.repeat_interleave(rows) * (pool_num_blocks // k)
+        gathered_state = gathered_state + rank_offsets
+
+    local_token_totals = gathered_query_lens.view(k, rows).sum(dim=1)
+    request_mask = gathered_query_lens > 0
+    gathered_state = gathered_state[request_mask]
+    gathered_has_initial = gathered_has_initial[request_mask].to(torch.bool)
+    gathered_query_lens = gathered_query_lens[request_mask]
+    num_reqs = int(request_mask.sum().item())
+    num_tokens = int(gathered_query_lens.sum().item())
+    query_start_loc = gathered_query_lens.new_zeros(num_reqs + 1)
+    torch.cumsum(gathered_query_lens, dim=0, out=query_start_loc[1:])
+    query_start_loc_cpu = query_start_loc.cpu()
+
+    num_global = rows * k
+    token_positions = torch.arange(rows, dtype=torch.int32, device=device).repeat(k)
+    valid_tokens = token_positions < local_token_totals.repeat_interleave(rows)
+    token_rows = torch.arange(num_global, dtype=torch.int64, device=device)
+    _, non_spec_token_indx, num_valid = compact_gdn_rows_for_dp(
+        token_rows, valid_tokens
+    )
+
+    from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
+
+    nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
+        query_start_loc_cpu, device=device
+    )
+    global_meta = replace(
+        meta,
+        num_prefills=num_reqs,
+        num_prefill_tokens=num_tokens,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_spec_decodes=0,
+        num_spec_decode_tokens=0,
+        num_actual_tokens=num_global,
+        has_initial_state=gathered_has_initial,
+        checkpoint=None,
+        chunk_indices=None,
+        chunk_offsets=None,
+        prefill_query_start_loc=query_start_loc,
+        prefill_state_indices=gathered_state,
+        prefill_has_initial_state=gathered_has_initial,
+        aiter_prefill_metadata=None,
+        spec_query_start_loc=None,
+        non_spec_query_start_loc=query_start_loc,
+        non_spec_query_start_loc_cpu=query_start_loc_cpu,
+        spec_state_indices_tensor=None,
+        non_spec_state_indices_tensor=gathered_state,
+        spec_sequence_masks=None,
+        spec_sequence_masks_cpu=None,
+        spec_token_indx=None,
+        non_spec_token_indx=non_spec_token_indx,
+        num_accepted_tokens=None,
+        uniform_spec_sequence_length=None,
+        nums_dict=nums_dict,
+        batch_ptr=batch_ptr,
+        token_chunk_offset_ptr=token_chunk_offset_ptr,
+    )
+    global_meta._kda_dp_order = None
+    global_meta._kda_dp_num_valid = None
+    global_meta._kda_dp_prefill_num_valid = num_valid
+    meta._kda_global_metadata = global_meta
+    return global_meta
+
+
+def _globalize_gdn_spec_metadata_for_dp(
+    meta: GDNAttentionMetadata,
+    *,
+    group,
+    request_windows: int,
+    shared_state_pool: bool,
+    pool_num_blocks: int,
+    max_tokens: int,
+    max_requests: int,
+    out_state_indices: torch.Tensor | None,
+    out_qsl: torch.Tensor | None,
+    out_spec_token_indx: torch.Tensor | None,
+    out_spec_accepted: torch.Tensor | None,
+    out_num_valid: torch.Tensor | None,
+    plan=None,
+) -> GDNAttentionMetadata:
+    assert meta.num_decodes == 0, (
+        "KDA across DP ranks does not support mixed spec and non-spec decode"
+    )
+    k = request_windows
+    rows = max_requests
+    num_local = meta.num_spec_decodes
+    assert meta.spec_state_indices_tensor is not None
+    assert meta.spec_query_start_loc is not None
+    assert meta.num_accepted_tokens is not None
+    local_state = meta.spec_state_indices_tensor[:num_local]
+    local_qsl = meta.spec_query_start_loc
+    local_accepted = meta.num_accepted_tokens[:num_local]
+    num_slots = local_state.shape[1]
+    device = local_state.device
+
+    def pad_rows(t: torch.Tensor, fill: int) -> torch.Tensor:
+        n = t.shape[0]
+        assert n <= rows
+        if n == rows:
+            return t
+        extra = t.new_full((rows - n,) + t.shape[1:], fill)
+        return torch.cat([t, extra], 0)
+
+    if plan is None:
+        gathered_state = group.all_gather(
+            pad_rows(local_state, 0).contiguous().to(torch.int32), 0
+        )
+
+    shared = plan.spec_common if plan is not None else None
+    if shared is None:
+        local_query_lens = (local_qsl[1 : num_local + 1] - local_qsl[:num_local]).to(
+            torch.int32
+        )
+        gathered_query_lens = (
+            plan.all_gather(pad_rows(local_query_lens, 0).contiguous())
+            if plan is not None
+            else group.all_gather(pad_rows(local_query_lens, 0).contiguous(), 0)
+        )
+        gathered_accepted = (
+            plan.all_gather(pad_rows(local_accepted, 0).contiguous().to(torch.int32))
+            if plan is not None
+            else group.all_gather(
+                pad_rows(local_accepted, 0).contiguous().to(torch.int32), 0
+            )
+        )
+    else:
+        gathered_accepted = shared.accepted
+        query_start_loc = shared.query_start_loc
+        spec_token_indx = shared.spec_token_indx
+        num_valid = shared.num_valid
+
+    if plan is not None:
+        gathered_state = plan.all_gather(
+            pad_rows(local_state, 0).contiguous().to(torch.int32)
+        )
+    if not shared_state_pool:
+        assert pool_num_blocks % k == 0
+        rank_offsets = torch.arange(k, dtype=torch.int32, device=device)
+        rank_offsets = rank_offsets.repeat_interleave(rows) * (pool_num_blocks // k)
+        gathered_state = gathered_state + rank_offsets.unsqueeze(1)
+
+    num_global = rows * k
+    num_global_tokens = max_tokens * k
+    if shared is None:
+        query_start_loc = gathered_query_lens.new_zeros(num_global + 1)
+        torch.cumsum(gathered_query_lens, dim=0, out=query_start_loc[1:])
+
+        token_totals = gathered_query_lens.view(k, rows).sum(dim=1)
+        token_positions = torch.arange(
+            max_tokens, dtype=torch.int32, device=device
+        ).repeat(k)
+        valid_tokens = token_positions < token_totals.repeat_interleave(max_tokens)
+        token_rows = torch.arange(num_global_tokens, dtype=torch.int64, device=device)
+        _, spec_token_indx, num_valid = compact_gdn_rows_for_dp(
+            token_rows,
+            valid_tokens,
+            out_order=out_spec_token_indx,
+            out_num_valid=out_num_valid,
+        )
+
+    if out_state_indices is not None and out_state_indices.numel() >= (
+        num_global * num_slots
+    ):
+        state_buffer = out_state_indices[: num_global * num_slots].view(
+            num_global, num_slots
+        )
+        state_buffer.copy_(gathered_state)
+        gathered_state = state_buffer
+    if out_qsl is not None and out_qsl.numel() >= num_global + 1:
+        out_qsl[: num_global + 1].copy_(query_start_loc)
+        query_start_loc = out_qsl[: num_global + 1]
+    if shared is not None:
+        if out_spec_token_indx is not None and out_spec_token_indx.numel() >= (
+            num_global_tokens
+        ):
+            out_spec_token_indx[:num_global_tokens].copy_(spec_token_indx)
+            spec_token_indx = out_spec_token_indx[:num_global_tokens]
+        if out_num_valid is not None and out_num_valid.numel() >= 1:
+            out_num_valid[:1].copy_(num_valid)
+            num_valid = out_num_valid[:1]
+    if out_spec_accepted is not None and out_spec_accepted.numel() >= num_global:
+        out_spec_accepted[:num_global].copy_(gathered_accepted)
+        gathered_accepted = out_spec_accepted[:num_global]
+
+    extra_fields = {}
+    recoverssm_commit = getattr(meta, "recoverssm_commit", None)
+    if recoverssm_commit is not None:
+        assert recoverssm_commit.align is None, (
+            "KDA across DP ranks does not support RecoverSSM align metadata"
+        )
+        extra_fields["recoverssm_commit"] = replace(
+            recoverssm_commit,
+            state_indices=gathered_state,
+            query_start_loc=query_start_loc,
+            request_indices=None,
+            align=None,
+        )
+    if hasattr(meta, "spec_token_start"):
+        extra_fields["spec_token_start"] = None
+        extra_fields["non_spec_token_start"] = None
+
+    global_meta = replace(
+        meta,
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_spec_decodes=num_global,
+        num_spec_decode_tokens=num_global_tokens,
+        num_actual_tokens=num_global_tokens,
+        has_initial_state=None,
+        checkpoint=None,
+        spec_query_start_loc=query_start_loc,
+        non_spec_query_start_loc=None,
+        non_spec_query_start_loc_cpu=None,
+        spec_state_indices_tensor=gathered_state,
+        non_spec_state_indices_tensor=None,
+        spec_sequence_masks=None,
+        spec_sequence_masks_cpu=None,
+        spec_token_indx=spec_token_indx,
+        non_spec_token_indx=None,
+        num_accepted_tokens=gathered_accepted,
+        uniform_spec_sequence_length=None,
+        **extra_fields,
+    )
+    global_meta._kda_dp_order = None
+    global_meta._kda_dp_num_valid = None
+    global_meta._kda_dp_spec_num_valid = num_valid
+    global_meta._kda_dp_spec_group = group
+    global_meta._kda_dp_spec_rows = rows
+    recoverssm_context = getattr(global_meta, "recoverssm_context", None)
+    if recoverssm_context is not None and recoverssm_commit is not None:
+        recoverssm_context._dp_last_commit = (
+            global_meta.recoverssm_commit,
+            group,
+            rows,
+            num_global,
+        )
+    meta._kda_global_metadata = global_meta
+    return global_meta
+
+
+def globalize_gdn_metadata_for_dp(
+    meta: GDNAttentionMetadata,
+    *,
+    group,
+    request_windows: int,
+    shared_state_pool: bool,
+    pool_num_blocks: int,
+    max_tokens: int,
+    max_requests: int | None = None,
+    out_state_indices: torch.Tensor | None = None,
+    out_qsl: torch.Tensor | None = None,
+    out_order: torch.Tensor | None = None,
+    out_num_valid: torch.Tensor | None = None,
+    out_spec_token_indx: torch.Tensor | None = None,
+    out_spec_accepted: torch.Tensor | None = None,
+    out_spec_num_valid: torch.Tensor | None = None,
+    global_mode: int = 0,
+    plan=None,
+) -> GDNAttentionMetadata:
+    """Expand rank-local decode metadata to the gathered KDA batch.
+
+    This runs outside graph capture (the GDN metadata builder calls it), so the
+    KDA forward pass only reads the resulting tensors. Every rank contributes
+    exactly ``max_tokens`` request slots; slots past a rank's own token count
+    carry that rank's null block and their outputs are dropped on the way back.
+    """
+    cached = getattr(meta, "_kda_global_metadata", None)
+    if cached is not None:
+        return cached
+
+    if global_mode == 2:
+        return _globalize_gdn_prefill_metadata_for_dp(
+            meta,
+            group=group,
+            request_windows=request_windows,
+            shared_state_pool=shared_state_pool,
+            pool_num_blocks=pool_num_blocks,
+            max_tokens=max_tokens,
+            plan=plan,
+        )
+
+    assert meta.num_prefills == 0, (
+        "KDA across DP ranks supports decode batches only; "
+        "prefill token metadata is not globalised"
+    )
+    if meta.num_spec_decodes > 0:
+        assert out_order is None, (
+            "KDA DP row compaction is not supported with speculative decoding"
+        )
+        assert max_requests is not None
+        return _globalize_gdn_spec_metadata_for_dp(
+            meta,
+            group=group,
+            request_windows=request_windows,
+            shared_state_pool=shared_state_pool,
+            pool_num_blocks=pool_num_blocks,
+            max_tokens=max_tokens,
+            max_requests=max_requests,
+            out_state_indices=out_state_indices,
+            out_qsl=out_qsl,
+            out_spec_token_indx=out_spec_token_indx,
+            out_spec_accepted=out_spec_accepted,
+            out_num_valid=out_spec_num_valid,
+            plan=plan,
+        )
+
+    k = request_windows
+    assert meta.non_spec_state_indices_tensor is not None
+    device = meta.non_spec_state_indices_tensor.device
+    rows = max_tokens
+
+    def pad_rows(t: torch.Tensor, fill: int) -> torch.Tensor:
+        n = t.shape[0]
+        if n >= rows:
+            return t[:rows]
+        extra = t.new_full((rows - n,) + t.shape[1:], fill)
+        return torch.cat([t, extra], 0)
+
+    local_state = meta.non_spec_state_indices_tensor
+    assert local_state.shape[0] <= rows, (
+        f"request axis ({local_state.shape[0]}) exceeds the gathered token "
+        f"stride ({rows}); a decode batch has at most one request per token"
+    )
+
+    # Window-local pools shift each rank's rows into its own window so padding
+    # lands on that rank's null block. A globally addressed pool hands out
+    # global ids already, so no offset applies and every rank's padding uses
+    # the pool-wide null block 0.
+    gathered_state = (
+        plan.all_gather(pad_rows(local_state, 0).contiguous().to(torch.int32))
+        if plan is not None
+        else group.all_gather(pad_rows(local_state, 0).contiguous().to(torch.int32), 0)
+    )
+    if shared_state_pool:
+        state_indices = gathered_state
+    else:
+        assert pool_num_blocks % k == 0, (
+            f"mamba state pool holds {pool_num_blocks} blocks, which does not "
+            f"split into {k} request windows; the pool was sized without "
+            "kda_layer_tp"
+        )
+        state_indices = gathered_state + torch.arange(
+            k, dtype=torch.int32, device=device
+        ).repeat_interleave(rows) * (pool_num_blocks // k)
+
+    order = num_valid = None
+    if out_order is not None:
+        state_indices, order, num_valid = compact_gdn_rows_for_dp(
+            state_indices,
+            gathered_state > 0,
+            out_order=out_order,
+            out_num_valid=out_num_valid,
+        )
+
+    qsl = torch.arange(rows * k + 1, dtype=torch.int32, device=device)
+    if out_state_indices is not None and out_state_indices.numel() >= rows * k:
+        # FULL graph: write into the persistent buffer the graph captured.
+        out_state_indices[: rows * k].copy_(state_indices)
+        state_indices = out_state_indices[: rows * k]
+    if out_qsl is not None and out_qsl.numel() >= rows * k + 1:
+        out_qsl[: rows * k + 1].copy_(qsl)
+        qsl = out_qsl[: rows * k + 1]
+    global_meta = GDNAttentionMetadata(
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=rows * k,
+        num_decode_tokens=rows * k,
+        num_spec_decodes=0,
+        num_spec_decode_tokens=0,
+        num_actual_tokens=rows * k,
+        has_initial_state=None,
+        spec_query_start_loc=None,
+        non_spec_query_start_loc=qsl,
+        spec_state_indices_tensor=None,
+        non_spec_state_indices_tensor=state_indices,
+        spec_sequence_masks=None,
+        spec_token_indx=None,
+        non_spec_token_indx=None,
+        num_accepted_tokens=None,
+        uniform_spec_sequence_length=None,
+    )
+    global_meta._kda_dp_order = order
+    global_meta._kda_dp_num_valid = num_valid
+    meta._kda_global_metadata = global_meta
+    return global_meta
+
+
+def globalize_gdn_metadata_for_dp_config(
+    vllm_config,
+    kv_cache_spec,
+    meta,
+    out_state_indices: torch.Tensor | None = None,
+    out_qsl: torch.Tensor | None = None,
+    out_order: torch.Tensor | None = None,
+    out_num_valid: torch.Tensor | None = None,
+    out_spec_token_indx: torch.Tensor | None = None,
+    out_spec_accepted: torch.Tensor | None = None,
+    out_spec_num_valid: torch.Tensor | None = None,
+):
+    """Config-driven entry point used by the GDN metadata builder."""
+    from vllm.config.kda_parallel import (
+        get_kda_request_windows,
+        kda_mamba_shared_pool,
+    )
+    from vllm.models.glm5next.common.parallel import get_kda_parallel_spec
+    from vllm.utils.math_utils import cdiv
+
+    group = get_kda_parallel_spec(vllm_config).group
+    k = get_kda_request_windows(vllm_config)
+    shared = kda_mamba_shared_pool(vllm_config)
+    plan = getattr(meta, "kda_dp_plan", None) or getattr(meta, "_kda_dp_plan", None)
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        kv_cache_spec = kv_cache_spec.first_spec
+    blocks_per_request = cdiv(
+        kv_cache_spec.max_memory_usage_bytes(vllm_config),
+        kv_cache_spec.page_size_bytes,
+    )
+    pool_num_blocks = vllm_config.scheduler_config.max_num_seqs * blocks_per_request + 1
+
+    fc_available = is_forward_context_available()
+    cache = (
+        get_forward_context().additional_kwargs.setdefault("kda_group_max", {})
+        if fc_available
+        else {}
+    )
+    if plan is not None:
+        max_tokens = plan.max_tokens
+        cache["tokens"] = max_tokens
+    else:
+        max_tokens = cache.get("tokens")
+        if max_tokens is None:
+            dp_metadata = get_forward_context().dp_metadata if fc_available else None
+            if (
+                dp_metadata is not None
+                and group.world_size == dp_metadata.num_tokens_across_dp_cpu.numel()
+            ):
+                max_tokens = int(dp_metadata.num_tokens_across_dp_cpu.max())
+            else:
+                t = torch.tensor([meta.num_actual_tokens], dtype=torch.int32)
+                torch.distributed.all_reduce(
+                    t, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group
+                )
+                max_tokens = int(t[0])
+            cache["tokens"] = max_tokens
+
+    if plan is not None:
+        global_mode = plan.global_mode
+        cache["mode"] = global_mode
+    else:
+        global_mode = cache.get("mode")
+        if global_mode is None:
+            local_mode = 2 if meta.num_prefills > 0 else int(meta.num_spec_decodes > 0)
+            mode = torch.tensor([local_mode], dtype=torch.int32)
+            torch.distributed.all_reduce(
+                mode, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group
+            )
+            global_mode = int(mode[0])
+            cache["mode"] = global_mode
+
+    max_requests = None
+    if global_mode == 1:
+        if plan is not None:
+            max_requests = plan.max_requests
+            cache["spec_requests"] = max_requests
+        else:
+            max_requests = cache.get("spec_requests")
+            if max_requests is None:
+                t = torch.tensor([meta.num_spec_decodes], dtype=torch.int32)
+                torch.distributed.all_reduce(
+                    t, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group
+                )
+                max_requests = int(t[0])
+                cache["spec_requests"] = max_requests
+
+    global_meta = globalize_gdn_metadata_for_dp(
+        meta,
+        group=group,
+        request_windows=k,
+        shared_state_pool=shared,
+        pool_num_blocks=pool_num_blocks,
+        max_tokens=max_tokens,
+        max_requests=max_requests,
+        out_state_indices=out_state_indices,
+        out_qsl=out_qsl,
+        out_order=out_order,
+        out_num_valid=out_num_valid,
+        out_spec_token_indx=out_spec_token_indx,
+        out_spec_accepted=out_spec_accepted,
+        out_spec_num_valid=out_spec_num_valid,
+        global_mode=global_mode,
+        plan=plan,
+    )
+    if plan is not None:
+        plan.track_consumers(
+            global_meta.spec_state_indices_tensor,
+            global_meta.non_spec_state_indices_tensor,
+            global_meta.spec_query_start_loc,
+            global_meta.non_spec_query_start_loc,
+            global_meta.spec_token_indx,
+            global_meta.non_spec_token_indx,
+            global_meta.num_accepted_tokens,
+            getattr(global_meta, "_kda_dp_order", None),
+            getattr(global_meta, "_kda_dp_num_valid", None),
+            getattr(global_meta, "_kda_dp_spec_num_valid", None),
+        )
+        global_meta._kda_dp_plan = plan
+        if global_mode == 1:
+            accepted_semantics = (
+                "recoverssm"
+                if getattr(global_meta, "recoverssm_context", None) is not None
+                else "forward_offsets"
+            )
+            if plan.spec_accepted_semantics is None:
+                plan.spec_accepted_semantics = accepted_semantics
+            elif plan.spec_accepted_semantics != accepted_semantics:
+                raise RuntimeError(
+                    "KDA DP plan cannot share accepted metadata across builders "
+                    "with different RecoverSSM semantics"
+                )
+        if plan.spec_common is None and global_mode == 1:
+            from vllm.models.glm5next.common.kda_dp_plan import KdaDPSpecCommon
+
+            plan.spec_common = KdaDPSpecCommon(
+                query_start_loc=global_meta.spec_query_start_loc,
+                spec_token_indx=global_meta.spec_token_indx,
+                num_valid=global_meta._kda_dp_spec_num_valid,
+                accepted=global_meta.num_accepted_tokens,
+            )
+    return global_meta
+
+
 class Glm5NextLinearAttention(GatedDeltaNetAttention):
     head_dim: int
     num_heads: int
@@ -278,6 +966,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         self.kda_layer_tp = self.kda_parallel.kda_layer_tp
         self.kda_layer_rank = self.kda_parallel.kda_layer_rank
         self.request_windows = self.kda_parallel.request_windows
+        self.shared_state_pool = kda_mamba_shared_pool(vllm_config)
+        self.dp_compact_decode = kda_dp_compact_decode(vllm_config)
         if self.tp_over_dp:
             # Each rank holds the head slice of every request in the group, so
             # the Mamba state pool must be one window per rank wide. That only
@@ -564,6 +1254,18 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             )
         return out, final_state
 
+    def _dp_compact_metadata(
+        self,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        metadata = get_forward_context().attn_metadata
+        if not isinstance(metadata, dict):
+            return None, None
+        layer_metadata = metadata.get(self.prefix)
+        global_meta = getattr(layer_metadata, "_kda_global_metadata", None)
+        if global_meta is None:
+            return None, None
+        return global_meta._kda_dp_order, global_meta._kda_dp_num_valid
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -575,6 +1277,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # back the tokens this rank started with.
         gather = self.tp_over_dp
         num_local_tokens = hidden_states.size(0)
+        dp_order = dp_num_valid = None
         if gather:
             # Ranks can hold different token counts on an eager step, and the
             # collective needs equal shapes. Pad up to the group maximum; the
@@ -586,9 +1289,22 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     hidden_states, (0, 0, 0, max_tokens - num_local_tokens)
                 )
             hidden_states = self.kda_parallel.group.all_gather(hidden_states, 0)
+            if self.dp_compact_decode:
+                dp_order, dp_num_valid = self._dp_compact_metadata()
+                if dp_order is not None:
+                    hidden_states = hidden_states.index_select(0, dp_order)
         num_tokens = hidden_states.size(0)
+
+        def project(layer, inputs, *, zero_tail=False):
+            if dp_num_valid is None:
+                return layer(inputs)[0]
+            assert layer.bias is None
+            return masked_bf16_linear_for_dp(
+                inputs, layer.weight, dp_num_valid, zero_tail=zero_tail
+            )
+
         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
-        projected = self.in_proj_qkvbfg_a(hidden_states)[0]
+        projected = project(self.in_proj_qkvbfg_a, hidden_states)
         qkv, beta_raw, f_a, g_a = projected.split(
             [
                 3 * self.local_projection_size,
@@ -605,10 +1321,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # / spec-verify steps then skip the _cast_sigmoid kernel and its fp32
         # intermediate entirely.
         beta = beta_raw.unsqueeze(0)
-        g1 = self.f_b_proj(f_a)[0]
+        g1 = project(self.f_b_proj, f_a)
         g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
 
-        g_proj_states = self.g_b_proj(g_a)[0]
+        g_proj_states = project(self.g_b_proj, g_a)
         # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
         g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
 
@@ -631,7 +1347,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
-        core_attn_out = self.o_proj(core_attn_out)[0]
+        core_attn_out = project(self.o_proj, core_attn_out, zero_tail=True)
+        if dp_order is not None:
+            unpacked = torch.empty_like(core_attn_out)
+            unpacked.index_copy_(0, dp_order, core_attn_out)
+            core_attn_out = unpacked
         if gather:
             # o_proj left an unreduced partial sum over the KDA group; complete
             # it and hand each rank back the tokens it owns. The gather above
@@ -696,86 +1416,29 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         if cached is not None:
             return cached
 
-        assert meta.num_prefills == 0, (
-            "KDA across DP ranks supports decode batches only; "
-            "prefill token metadata is not globalised"
-        )
-        assert meta.num_spec_decodes == 0, (
-            "kda_layer_tp does not support speculative decoding yet"
-        )
-
-        group = self.kda_parallel.group
+        pool_blocks = self.kv_cache[1].shape[0]
         k = self.request_windows
-        device = meta.non_spec_state_indices_tensor.device
-        rows = max_tokens
-
-        def pad_rows(t: torch.Tensor, fill: int) -> torch.Tensor:
-            """Pad the request axis to ``rows`` with ``fill``."""
-            n = t.shape[0]
-            if n >= rows:
-                return t[:rows]
-            extra = t.new_full((rows - n,) + t.shape[1:], fill)
-            return torch.cat([t, extra], 0)
-
-        # Mamba block ids are per-rank: MUSA gives every rank its own pool, so
-        # each rank's rows shift into its own window of the combined slot
-        # space. A window is one whole local pool wide, null slot included, so
-        # each rank's padding lands on *its own* null block rather than racing
-        # with the next rank's real state.
-        blocks_per_rank = self.kv_cache[1].shape[0]
-        assert blocks_per_rank % k == 0, (
-            f"mamba state pool holds {blocks_per_rank} blocks, which does not "
-            f"split into {k} request windows (kda_layer_tp={self.kda_layer_tp}); "
-            "the pool was "
-            f"sized without kda_layer_tp"
-        )
-        blocks_per_rank //= k
-
-        local_state = meta.non_spec_state_indices_tensor
-        # One token per row is what makes the arange below valid. It holds for
-        # any decode batch: with no prefill and no spec rows every request
-        # schedules exactly one token (or none, for a graph-padded slot).
-        assert local_state.shape[0] <= rows, (
-            f"request axis ({local_state.shape[0]}) exceeds the gathered token "
-            f"stride ({rows}); a decode batch has at most one request per token"
-        )
-        state_indices = (
-            group.all_gather(pad_rows(local_state, 0).contiguous().to(torch.int32), 0)
-            + torch.arange(k, dtype=torch.int32, device=device).repeat_interleave(rows)
-            * blocks_per_rank
+        if not self.shared_state_pool:
+            assert pool_blocks % k == 0, (
+                f"mamba state pool holds {pool_blocks} blocks, which does not "
+                f"split into {k} request windows (kda_layer_tp={self.kda_layer_tp}); "
+                "the pool was sized without kda_layer_tp"
+            )
+        return globalize_gdn_metadata_for_dp(
+            meta,
+            group=self.kda_parallel.group,
+            request_windows=k,
+            shared_state_pool=self.shared_state_pool,
+            pool_num_blocks=pool_blocks,
+            max_tokens=max_tokens,
+            max_requests=(
+                (max_tokens + getattr(self, "num_spec", 7))
+                // (1 + getattr(self, "num_spec", 7))
+                if meta.num_spec_decodes > 0
+                else max_tokens
+            ),
         )
 
-        # Cumulative query lengths mirror the gathered buffer exactly: every
-        # row of it is a one-token sequence, real requests and padding slots
-        # alike, so the global ``cu_seqlens`` is just ``arange(k * rows + 1)``.
-        # Padding slots carry that rank's null block, which the recurrent
-        # kernel treats as "no state" and their outputs are dropped by the
-        # slice back to the local token count.
-        qsl = torch.arange(rows * k + 1, dtype=torch.int32, device=device)
-
-        global_meta = GDNAttentionMetadata(
-            num_prefills=0,
-            num_prefill_tokens=0,
-            num_decodes=rows * k,
-            num_decode_tokens=rows * k,
-            num_spec_decodes=0,
-            num_spec_decode_tokens=0,
-            num_actual_tokens=rows * k,
-            has_initial_state=None,
-            spec_query_start_loc=None,
-            non_spec_query_start_loc=qsl,
-            spec_state_indices_tensor=None,
-            non_spec_state_indices_tensor=state_indices,
-            spec_sequence_masks=None,
-            spec_token_indx=None,
-            non_spec_token_indx=None,
-            num_accepted_tokens=None,
-            uniform_spec_sequence_length=None,
-        )
-        meta._kda_global_metadata = global_meta
-        return global_meta
-
-    @eager_break_during_capture
     def _forward(
         self,
         qkv_proj_states: torch.Tensor,
@@ -796,15 +1459,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             return
         assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
         if self.tp_over_dp:
-            # Every rank holds a head slice for *all* requests, so the kernels
-            # must see the whole gathered batch, not just this rank's slice.
-            # The object is shared by all KDA layers and rebuilt each step, so
-            # caching on it keeps this to one round of collectives per step.
-            max_tokens = self._group_max(
-                "tokens", attn_metadata_narrowed.num_actual_tokens
-            )
-            attn_metadata_narrowed = self._dp_decode_metadata(
-                attn_metadata_narrowed, max_tokens
+            # The GDN metadata builder already expanded this to the gathered
+            # batch, so the captured forward only reads tensors -- no
+            # collectives and no host-side branching happen here.
+            attn_metadata_narrowed = getattr(
+                attn_metadata_narrowed, "_kda_global_metadata", attn_metadata_narrowed
             )
         has_initial_state = attn_metadata_narrowed.has_initial_state
         non_spec_query_start_loc = attn_metadata_narrowed.non_spec_query_start_loc
@@ -820,6 +1479,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         num_accepted_tokens = attn_metadata_narrowed.num_accepted_tokens
         num_spec_decodes = attn_metadata_narrowed.num_spec_decodes
         use_spec = num_spec_decodes > 0
+        dp_spec_num_valid = getattr(
+            attn_metadata_narrowed, "_kda_dp_spec_num_valid", None
+        )
+        dp_prefill_num_valid = getattr(
+            attn_metadata_narrowed, "_kda_dp_prefill_num_valid", None
+        )
         # Safe-gate checkpoints use the bounded sigmoid variant.
         safe_gate = self.kda_safe_gate
         lower_bound = self.kda_lower_bound
@@ -866,7 +1531,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # steady-state decode hot path. The outputs alias the inputs here;
             # the downstream conv/recurrent kernels read them without mutating
             # in place, so the aliasing is safe.
-            if non_spec_token_indx is None or non_spec_token_indx.numel() == 0:
+            if dp_spec_num_valid is not None:
+                assert spec_token_indx is not None
+                qkv_spec = qkv_proj_states.index_select(0, spec_token_indx)
+                g1_spec = g1.index_select(1, spec_token_indx)
+                beta_spec = beta.index_select(1, spec_token_indx)
+            elif non_spec_token_indx is None or non_spec_token_indx.numel() == 0:
                 qkv_spec = qkv_proj_states
                 g1_spec = g1
                 beta_spec = beta
@@ -908,6 +1578,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             q_spec, k_spec, v_spec = qkv_spec.split(self.local_projection_size, dim=-1)
 
         # --- causal conv1d: non-spec path (prefill or plain decode) ---
+        if dp_prefill_num_valid is not None:
+            assert not use_spec and non_spec_token_indx is not None
+            qkv_ns = qkv_proj_states.index_select(0, non_spec_token_indx)
+            g1_ns = g1.index_select(1, non_spec_token_indx)
+            beta_ns = beta.index_select(1, non_spec_token_indx)
         raw_qkv_ns = qkv_ns
         q_ns = k_ns = v_ns = None
         if attn_metadata_narrowed.num_prefills > 0:
@@ -950,7 +1625,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # spec_token_indx, so they keep the kernel-managed output.
         spec_out = (
             core_attn_out[0, :num_actual_tokens].unsqueeze(0)
-            if non_spec_token_indx is None or non_spec_token_indx.numel() == 0
+            if dp_spec_num_valid is None
+            and (non_spec_token_indx is None or non_spec_token_indx.numel() == 0)
             else None
         )
         if use_spec:
@@ -1019,7 +1695,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 # Non-spec step: write straight into the layer output buffer
                 # (dense token order, no merge copy). Step with spec-decode
                 # tokens: write to the workspace buffer and scatter below.
-                ns_out = None if use_spec else core_attn_out[:, :num_actual_tokens]
+                ns_out = (
+                    None
+                    if use_spec or dp_prefill_num_valid is not None
+                    else core_attn_out[:, :num_actual_tokens]
+                )
                 core_attn_out_non_spec, last_recurrent_state = self._flashkda_prefill(
                     q=_rearr(q_ns),
                     k=_rearr(k_ns),
@@ -1091,6 +1771,25 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             )
 
         # --- merge spec / non-spec outputs back into token order ---
+        if dp_spec_num_valid is not None:
+            assert core_attn_out_spec is not None
+            valid_tokens = (
+                torch.arange(
+                    core_attn_out_spec.shape[1], device=core_attn_out_spec.device
+                )
+                < dp_spec_num_valid[0]
+            )
+            core_attn_out_spec.masked_fill_(~valid_tokens.view(1, -1, 1, 1), 0)
+        if dp_prefill_num_valid is not None:
+            assert core_attn_out_non_spec is not None
+            valid_tokens = (
+                torch.arange(
+                    core_attn_out_non_spec.shape[1],
+                    device=core_attn_out_non_spec.device,
+                )
+                < dp_prefill_num_valid[0]
+            )
+            core_attn_out_non_spec.masked_fill_(~valid_tokens.view(1, -1, 1, 1), 0)
         if use_spec and core_attn_out_non_spec is not None:
             assert core_attn_out_spec is not None
             core_attn_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
@@ -1098,10 +1797,20 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         elif use_spec:
             assert core_attn_out_spec is not None
             if spec_out is None:
-                core_attn_out[0, :num_actual_tokens] = core_attn_out_spec.squeeze(0)
+                if dp_spec_num_valid is not None:
+                    assert spec_token_indx is not None
+                    core_attn_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
+                else:
+                    core_attn_out[0, :num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             assert core_attn_out_non_spec is not None
             if ns_out is None:
-                core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
-                    0, :num_actual_tokens
-                ]
+                if dp_prefill_num_valid is not None:
+                    assert non_spec_token_indx is not None
+                    core_attn_out.index_copy_(
+                        1, non_spec_token_indx, core_attn_out_non_spec
+                    )
+                else:
+                    core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
+                        0, :num_actual_tokens
+                    ]

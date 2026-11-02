@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.dp_batch_plan import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
@@ -42,11 +43,17 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    dp_sync_state: DPSyncState | None = None
+    kda_dp_plan: Any | None = None
+    is_dp_dummy: bool = False
 
     def get_extra_common_attn_kwargs(
         self, kv_cache_group_id: int, num_reqs: int
     ) -> dict[str, Any]:
-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
+        return {
+            "is_prefilling": self.is_prefilling[:num_reqs],
+            "kda_dp_dummy": self.is_dp_dummy,
+        }
 
     def get_extra_attn_kwargs(
         self, attn_metadata_builder: Any, num_reqs: int
@@ -74,6 +81,8 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
 class MambaHybridModelState(DefaultModelState):
     """Model state for hybrid attention + Mamba / linear-attention models."""
 
+    supports_dp_batch_plan = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -94,6 +103,7 @@ class MambaHybridModelState(DefaultModelState):
         self.recoverssm = (
             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
         )
+        self._kda_dp_plan: Any | None = None
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -227,6 +237,22 @@ class MambaHybridModelState(DefaultModelState):
             input_batch.idx_mapping,
         )
 
+    def flush_kda_dp_commits(self, attn_groups: list[list[AttentionGroup]]) -> None:
+        if self.recoverssm is None:
+            return
+        from vllm.models.kimi_k3.nvidia.kda_metadata import (
+            flush_recoverssm_dp_commit,
+        )
+
+        for groups in attn_groups:
+            for group in groups:
+                builder = group.get_metadata_builder(0)
+                flush_recoverssm_dp_commit(getattr(builder, "recoverssm_context", None))
+
+    def record_kda_dp_plan_buffers_free(self) -> None:
+        if self._kda_dp_plan is not None:
+            self._kda_dp_plan.record_buffers_free()
+
     def prepare_attn_with_pcp(
         self,
         input_batch: InputBatch,
@@ -284,6 +310,9 @@ class MambaHybridModelState(DefaultModelState):
         for_capture: bool = False,
         ubatch_idx: int = 0,
         model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
+        dp_sync_state: DPSyncState | None = None,
+        skip_commit: bool = False,
+        is_dp_dummy: bool = False,
     ) -> dict[str, Any]:
         assert ubatch_idx == 0, "DBO is not supported"
         assert model_specific_attn_metadata is None
@@ -363,10 +392,25 @@ class MambaHybridModelState(DefaultModelState):
                 for group_idx, builder in aligned_index_builders:
                     builder.mamba_aligned_state_indices = all_group_indices[group_idx]
 
+        if dp_sync_state is not None and dp_sync_state.use_plan:
+            from vllm.models.glm5next.common.kda_dp_plan import make_kda_dp_plan
+
+            self._kda_dp_plan = make_kda_dp_plan(
+                self.vllm_config,
+                dp_sync_state,
+                self._kda_dp_plan,
+                self.device,
+                use_padded_requests=skip_commit,
+            )
+        else:
+            self._kda_dp_plan = None
         mamba_attn_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            dp_sync_state=dp_sync_state,
+            kda_dp_plan=self._kda_dp_plan,
+            is_dp_dummy=is_dp_dummy,
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
@@ -389,7 +433,10 @@ class MambaHybridModelState(DefaultModelState):
         )
         if self.recoverssm is not None:
             self.recoverssm.record_step(
-                attn_metadata, attn_groups, for_capture=for_capture
+                attn_metadata,
+                attn_groups,
+                for_capture=for_capture,
+                skip_commit=skip_commit,
             )
         return attn_metadata
 

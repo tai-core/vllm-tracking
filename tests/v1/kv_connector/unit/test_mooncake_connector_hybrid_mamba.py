@@ -16,14 +16,20 @@ import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
 from vllm.config import set_current_vllm_config
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
+    mooncake_connector as mooncake_connector_module,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
     KVConnectorRole,
     MooncakeConnector,
+    MooncakeConnectorMetadata,
     MooncakeConnectorScheduler,
     MooncakeConnectorWorker,
     MooncakeXferMetadata,
+    PullReqMeta,
     SendBlockMeta,
     TransferRegion,
+    _compute_kda_dp_sender_transfer_plan,
 )
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -614,3 +620,247 @@ def test_hybrid_gdn_keeps_packed_fa_and_gdn_regions_whole(
         worker.shutdown()
         worker.shutdown = noop_shutdown
         connector.connector_worker = None
+
+
+def test_kda_dp_transfer_plan_only_matches_corresponding_rank():
+    should_send, src_offset, dst_offset, length = _compute_kda_dp_sender_transfer_plan(
+        2, 8, 2, 8, 128, 128
+    )
+    assert should_send
+    assert (src_offset, dst_offset, length) == (0, 0, 128)
+
+    should_send, *_ = _compute_kda_dp_sender_transfer_plan(1, 8, 2, 8, 128, 128)
+    assert not should_send
+
+    with pytest.raises(ValueError, match="matching producer/consumer KDA sizes"):
+        _compute_kda_dp_sender_transfer_plan(1, 8, 1, 4, 128, 128)
+    with pytest.raises(ValueError, match="state schema mismatch"):
+        _compute_kda_dp_sender_transfer_plan(1, 8, 1, 8, 128, 64)
+
+
+def test_kda_dp_producer_waits_for_every_state_consumer():
+    worker = object.__new__(MooncakeConnectorWorker)
+    worker.shutdown = noop_shutdown
+    send_meta = SendBlockMeta(
+        p_req_id="p-req",
+        transfer_id="xfer-req",
+        local_block_ids=[],
+        ready=asyncio.Event(),
+    )
+
+    worker.resolve_need_send(send_meta, [0], remote_kda_tp_size=8)
+
+    assert send_meta.need_send == 8
+
+
+def test_kda_dp_transfer_params_do_not_duplicate_state_shards():
+    kv_cache_config = make_hybrid_gdn_kv_cache_config(block_size=16)
+    layer_specs = {
+        layer_name: group.kv_cache_spec
+        for group in kv_cache_config.transfer_groups
+        for layer_name in group.layer_names
+    }
+    block_len = 0x100
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.1.linear_attn",
+            layer_index=1,
+            base_addr=0x5000,
+            block_len=2 * block_len,
+            kv_block_len=2 * block_len,
+            content_len=block_len,
+            group_index=1,
+        ),
+        TransferRegion(
+            layer_name="model.layers.0.self_attn",
+            layer_index=0,
+            base_addr=0x1000,
+            block_len=block_len,
+            kv_block_len=block_len,
+            group_index=0,
+        ),
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name=region.layer_name,
+            layer_index=region.layer_index,
+            base_addr=0x6000 if region.group_index == 1 else 0x2000,
+            block_len=block_len if region.group_index == 1 else 8 * block_len,
+            kv_block_len=block_len if region.group_index == 1 else 8 * block_len,
+            group_index=region.group_index,
+        )
+        for region in local_regions
+    ]
+
+    def build_for_rank(local_rank: int):
+        worker = object.__new__(MooncakeConnectorWorker)
+        worker.shutdown = noop_shutdown
+        worker.kv_cache_config = kv_cache_config
+        worker._physical_blocks_per_logical_kv_block = 1
+        worker._layer_specs = layer_specs
+        worker.tp_rank = local_rank
+        worker.tp_size = 8
+        worker.kda_layer_rank = local_rank
+        worker.kda_layer_tp = 8
+        worker.use_mla = False
+        worker.transfer_topo = SimpleNamespace(
+            local_replicates_kv_cache=False, total_num_kv_heads=1
+        )
+        send_meta = SendBlockMeta(
+            p_req_id="p-req",
+            transfer_id="xfer-req",
+            local_block_ids=[[10, 11], [4]],
+            ready=asyncio.Event(),
+        )
+        agent_meta = MooncakeXferMetadata(
+            remote_hostname="consumer-host",
+            remote_port=54321,
+            remote_tp_size=1,
+            remote_tp_rank=0,
+            remote_kda_tp_size=8,
+            remote_kda_tp_rank=1,
+            req_blocks={"d-req": ("xfer-req", [[30, 31], [7]])},
+            kv_caches_base_addr=[],
+            block_lens=[],
+            kv_block_lens=[],
+        )
+        assert (
+            worker._validate_kda_dp_regions(local_regions, remote_regions, agent_meta)
+            is None
+        )
+        return asyncio.run(
+            worker._build_transfer_params(
+                [("d-req", send_meta)], agent_meta, local_regions, remote_regions
+            )
+        )
+
+    src_ptrs, dst_ptrs, lengths, err_reqs, err_msg = build_for_rank(1)
+    assert err_reqs == [] and err_msg is None
+    assert src_ptrs == [
+        0x5000 + 4 * (2 * block_len),
+        0x1000 + 10 * block_len,
+        0x1000 + 11 * block_len,
+    ]
+    assert dst_ptrs == [
+        0x6000 + 7 * block_len,
+        0x2000 + (30 * 8 + 1) * block_len,
+        0x2000 + (31 * 8 + 1) * block_len,
+    ]
+    assert lengths == [block_len, block_len, block_len]
+
+    src_ptrs, dst_ptrs, lengths, err_reqs, err_msg = build_for_rank(2)
+    assert err_reqs == [] and err_msg is None
+    assert src_ptrs == [0x1000 + 10 * block_len, 0x1000 + 11 * block_len]
+    assert dst_ptrs == [
+        0x2000 + (30 * 8 + 2) * block_len,
+        0x2000 + (31 * 8 + 2) * block_len,
+    ]
+    assert lengths == [block_len, block_len]
+
+
+def test_dp_fanout_non_owner_only_receives_mamba_blocks():
+    kv_cache_config = make_hybrid_gdn_kv_cache_config(block_size=16)
+    mamba_group = kv_cache_config.transfer_groups[1]
+    transfer_groups = list(kv_cache_config.transfer_groups)
+    transfer_groups[1] = SimpleNamespace(
+        kv_cache_spec=SimpleNamespace(
+            kv_cache_specs={
+                layer_name: mamba_group.kv_cache_spec
+                for layer_name in mamba_group.layer_names
+            }
+        )
+    )
+    kv_cache_config = SimpleNamespace(transfer_groups=transfer_groups)
+    pull_meta = PullReqMeta(
+        d_req_id="owner-req",
+        local_block_ids=[[10, 11], [4]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://p-host:8998",
+        transfer_id="xfer-req",
+    )
+    gathered = [[("p-engine", "owner-req", pull_meta)], []]
+
+    def merge_for_rank(rank: int):
+        worker = object.__new__(MooncakeConnectorWorker)
+        worker.shutdown = noop_shutdown
+        worker.dp_rank = rank
+        worker.kv_cache_config = kv_cache_config
+        worker._dp_req_owners = {}
+        metadata = MooncakeConnectorMetadata()
+        return worker._merge_dp_pull_reqs(metadata, gathered)
+
+    owner_meta = merge_for_rank(0).reqs_to_recv["p-engine"]["xfer-req"]
+    assert owner_meta.d_req_id == "xfer-req"
+    assert owner_meta.local_block_ids == [[10, 11], [4]]
+
+    non_owner_meta = merge_for_rank(1).reqs_to_recv["p-engine"]["xfer-req"]
+    assert non_owner_meta.d_req_id == "xfer-req"
+    assert non_owner_meta.local_block_ids == [[], [4]]
+
+    gathered[0][0] = (
+        "p-engine",
+        "owner-req",
+        PullReqMeta(
+            d_req_id="owner-req",
+            local_block_ids=[],
+            remote_engine_id="p-engine",
+            remote_bootstrap_addr="http://p-host:8998",
+            transfer_id="xfer-req",
+        ),
+    )
+    release_meta = merge_for_rank(1).reqs_to_recv["p-engine"]["xfer-req"]
+    assert release_meta.local_block_ids == []
+
+
+def test_dp_completion_waits_for_all_ranks_and_only_notifies_owner(monkeypatch):
+    monkeypatch.setattr(
+        mooncake_connector_module,
+        "get_dp_group",
+        lambda: SimpleNamespace(world_size=2, cpu_group=object()),
+    )
+
+    def make_worker(rank: int):
+        worker = object.__new__(MooncakeConnectorWorker)
+        worker.shutdown = noop_shutdown
+        worker.dp_rank = rank
+        worker._dp_req_owners = {"xfer-req": (0, "owner-req")}
+        worker._dp_completed_reqs = set()
+        worker._dp_failed_reqs = set()
+        return worker
+
+    def gather_packets(monkeypatch, packets):
+        def fake_gather(gathered, _local, group):
+            gathered[:] = packets
+
+        monkeypatch.setattr(torch.distributed, "all_gather_object", fake_gather)
+
+    owner = make_worker(0)
+    gather_packets(monkeypatch, [({"xfer-req"}, set()), (set(), set())])
+    result = owner._get_dp_transfer_results(None, {"xfer-req"}, set())
+    assert result.finished_recving == set()
+    assert owner._dp_completed_reqs == {"xfer-req"}
+
+    gather_packets(
+        monkeypatch,
+        [({"xfer-req"}, set()), ({"xfer-req"}, set())],
+    )
+    result = owner._get_dp_transfer_results(None, None, set())
+    assert result.finished_recving == {"owner-req"}
+    assert owner._dp_completed_reqs == set()
+    assert owner._dp_req_owners == {}
+
+    non_owner = make_worker(1)
+    gather_packets(
+        monkeypatch,
+        [({"xfer-req"}, set()), ({"xfer-req"}, set())],
+    )
+    result = non_owner._get_dp_transfer_results(None, {"xfer-req"}, set())
+    assert result.finished_recving == set()
+    assert non_owner._dp_completed_reqs == set()
+
+    failed_owner = make_worker(0)
+    gather_packets(monkeypatch, [(set(), {"xfer-req"}), (set(), set())])
+    result = failed_owner._get_dp_transfer_results(None, None, set())
+    assert result.finished_recving == set()
+    assert result.failed_recving == {"owner-req"}
+    assert failed_owner._dp_failed_reqs == set()

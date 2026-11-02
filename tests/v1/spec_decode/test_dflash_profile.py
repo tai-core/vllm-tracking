@@ -5,8 +5,11 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 from vllm.v1.worker.gpu.spec_decode.speculator import BaseSpeculator
@@ -96,3 +99,66 @@ def test_dummy_run_keeps_already_fitting_parallel_draft_batch():
 def test_dummy_run_keeps_default_speculator_batch():
     scheduler_output = _run_dummy_batch(_DefaultSpeculator())
     assert len(scheduler_output.num_scheduled_tokens) == 512
+
+
+def test_dflash_dummy_propose_makes_sampling_rows_inert(monkeypatch):
+    """DP dummy sampling must not overwrite real per-request proposals."""
+    speculator = DFlashSpeculator.__new__(DFlashSpeculator)
+    speculator.num_query_per_req = 8
+    speculator.max_model_len = 64
+    speculator.hidden_states = torch.zeros(8, 1)
+    speculator.draft_kv_cache_group_id = 0
+    speculator.draft_kv_cache_group_ids = []
+    speculator.pcp_manager = None
+    speculator.sample_idx_mapping = torch.zeros(8, dtype=torch.int64)
+    speculator.draft_tokens = torch.zeros(1, 7, dtype=torch.int64)
+    monkeypatch.setattr(speculator, "prepare_context_anchor", lambda *args: None)
+    monkeypatch.setattr(speculator, "_precompute_context_kv", lambda *args: None)
+    monkeypatch.setattr(speculator, "_prepare_eplb_forward", lambda *args: None)
+    monkeypatch.setattr(speculator, "_build_uniform_attn_metadata", lambda **kwargs: {})
+    speculator._group_causal = False
+    speculator.query_cudagraph_manager = None
+    speculator.dp_size = 1
+    speculator.dp_rank = 0
+    speculator.kv_cache_config = None
+    speculator.block_tables = SimpleNamespace(
+        slot_mappings=torch.zeros(1, 8, dtype=torch.int64)
+    )
+    sampled_mappings = []
+
+    def generate_draft(*args, **kwargs):
+        sampled_mappings.append(speculator.sample_idx_mapping.clone())
+
+    monkeypatch.setattr(speculator, "_generate_draft", generate_draft)
+    batch_desc = SimpleNamespace(cg_mode=CUDAGraphMode.NONE, num_tokens=8)
+    monkeypatch.setattr(
+        dflash_speculator,
+        "dispatch_cg_and_sync_dp",
+        lambda *args, **kwargs: (batch_desc, None),
+    )
+    monkeypatch.setattr(
+        dflash_speculator, "build_slot_mappings_by_layer", lambda *args: {}
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_tokens=8,
+        seq_lens_cpu_upper_bound=torch.tensor([8]),
+    )
+
+    speculator.propose(
+        input_batch=input_batch,
+        attn_metadata={},
+        slot_mappings={},
+        last_hidden_states=torch.zeros(8, 1),
+        aux_hidden_states=None,
+        num_sampled=torch.ones(1, dtype=torch.int32),
+        num_rejected=torch.zeros(1, dtype=torch.int32),
+        last_sampled=torch.zeros(1, dtype=torch.int64),
+        next_prefill_tokens=torch.zeros(1, dtype=torch.int64),
+        temperature=torch.ones(1),
+        seeds=torch.zeros(1, dtype=torch.int64),
+        dummy_run=True,
+    )
+
+    assert len(sampled_mappings) == 1
+    assert torch.all(sampled_mappings[0] == -1)

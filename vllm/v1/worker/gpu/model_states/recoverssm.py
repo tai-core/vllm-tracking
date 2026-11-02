@@ -22,8 +22,9 @@ class RecoverSSMState:
         attn_groups: list[list[AttentionGroup]],
         *,
         for_capture: bool,
+        skip_commit: bool = False,
     ) -> None:
-        if for_capture:
+        if for_capture or skip_commit:
             self._step = None
             return
 

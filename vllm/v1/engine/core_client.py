@@ -7,7 +7,7 @@ import sys
 import uuid
 import weakref
 from abc import ABC, abstractmethod
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -1585,14 +1585,35 @@ class DPAsyncMPClient(AsyncMPClient):
         request.current_wave = self.current_wave
         request.client_index = self.client_index
 
-        chosen_engine = self.get_core_engine_for_request(request)
-        to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
-        if not self.engines_running:
-            # Notify coordinator that we're sending a request
-            req_msg = msgspec.msgpack.encode(("FIRST_REQ", chosen_engine))
-            await self.first_req_send_socket.send(req_msg)
+        if self._mamba_leases_enabled and request.mamba_slot is None:
+            # Backpressure waits here, on the async admission path, never in
+            # an engine's decode step. The event loop stays free for other
+            # requests and for the release reports that wake this wait up.
+            while not self._mamba_free_slots:
+                self._mamba_slot_event.clear()
+                await self._mamba_slot_event.wait()
+            request.mamba_slot = self._mamba_free_slots.popleft()
 
-        await to_await
+        chosen_engine = self.get_core_engine_for_request(request)
+        try:
+            to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
+            if not self.engines_running:
+                # Notify coordinator that we're sending a request
+                req_msg = msgspec.msgpack.encode(("FIRST_REQ", chosen_engine))
+                await self.first_req_send_socket.send(req_msg)
+
+            await to_await
+        except Exception:
+            # The engine may or may not have received the request, so the slot
+            # cannot be reclaimed safely here. If it was received, the engine's
+            # release report recycles it; otherwise it stays allocated rather
+            # than aliasing two requests onto one state.
+            logger.warning(
+                "add_request failed; Mamba slot %s stays allocated until the "
+                "engine reports a release",
+                request.mamba_slot,
+            )
+            raise
 
         self._ensure_output_queue_task()
 
@@ -1621,6 +1642,37 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
         # Exact per-engine count of this client's unfinished requests.
         self.engine_inflight: Counter[EngineIdentity] = Counter()
+
+        # Global Mamba state slots, granted together with the routing decision
+        # and returned by the engine once the blocks are actually freed. This
+        # is the only place a slot changes hands, so no per-step coordination
+        # between engine cores is needed.
+        from vllm.config.kda_parallel import (
+            get_kda_mamba_global_num_seqs,
+            kda_mamba_admission_leases,
+        )
+
+        self._mamba_free_slots: deque[int] = deque()
+        self._mamba_leases_enabled = kda_mamba_admission_leases(vllm_config)
+        self._mamba_slot_event = asyncio.Event()
+        if self._mamba_leases_enabled:
+            # Partition the global slots across front-end clients. Every slot
+            # still has exactly one writer, but each client hands out its own
+            # range, so api_server_count does not have to be 1. The trade-off:
+            # a slot freed on one client cannot be reused by another, so skew
+            # between clients can strand slots -- the price of keeping this
+            # allocator coordination-free.
+            total = get_kda_mamba_global_num_seqs(vllm_config)
+            if total < client_count:
+                raise ValueError(
+                    f"kda_mamba_global_num_seqs={total} is smaller than "
+                    f"api_server_count={client_count}; every front-end client "
+                    "needs at least one state slot"
+                )
+            start = total * client_index // client_count
+            end = total * (client_index + 1) // client_count
+            self._mamba_free_slots.extend(range(start, end))
+            self._mamba_slot_event.set()
 
         super().__init__(
             vllm_config,
@@ -1691,6 +1743,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             self.eng_start_index = (self.eng_start_index + 1) % num_engines
 
         chosen_engine = self.core_engines[eng_index]
+        # Mamba slots are granted in add_request_async, which can wait for one
+        # without blocking anything but this request's own admission.
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
         self.engine_inflight[chosen_engine] += 1
@@ -1704,6 +1758,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     async def process_engine_outputs(
         self: "DPLBAsyncMPClient", outputs: EngineCoreOutputs
     ):
+        if outputs.released_mamba_slots:
+            self._mamba_free_slots.extend(outputs.released_mamba_slots)
+            self._mamba_slot_event.set()
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
                 if (engine := self.reqs_in_flight.pop(req_id, None)) is not None:

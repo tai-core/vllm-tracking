@@ -361,10 +361,13 @@ class SingleTypeKVCacheManager(ABC):
         num_new_blocks = max(
             0, cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
         )
-        allocated_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+        allocated_blocks = self._take_new_blocks(request_id, num_new_blocks)
         req_blocks.extend(allocated_blocks)
         if self._record_new_block_ids and record_for_zeroing:
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
+
+    def _take_new_blocks(self, request_id: str, num_blocks: int) -> list[KVCacheBlock]:
+        return self.block_pool.get_new_blocks(num_blocks)
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
@@ -391,7 +394,7 @@ class SingleTypeKVCacheManager(ABC):
             # correct; the extra block was reserved by
             # get_num_blocks_to_allocate.
             block_idx, source_block = self._partial_hit_reqs.pop(request_id)
-            cow_block = self.block_pool.get_new_blocks(1)[0]
+            cow_block = self._take_new_blocks(request_id, 1)[0]
             self._apply_cow(request_id, block_idx, source_block, cow_block)
             self.new_block_ids.append(cow_block.block_id)
             cow_blocks.append(cow_block)
@@ -402,7 +405,7 @@ class SingleTypeKVCacheManager(ABC):
         if num_new_blocks <= 0:
             return cow_blocks
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            new_blocks = self._take_new_blocks(request_id, num_new_blocks)
             req_blocks.extend(new_blocks)
             if self._record_new_block_ids:
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
@@ -1426,6 +1429,10 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> None:
         super().__init__(kv_cache_spec, block_pool, **kwargs)
         self._dedicated_pool = False
+        # Globally addressed pool shared with other KDA ranks: another rank
+        # reusing a slot would invalidate this rank's cached copy of it, so
+        # cross-request state retention is disabled outright.
+        self._shared_global_pool = False
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         self.has_prefill_checkpoint_blocks = (
@@ -1450,6 +1457,54 @@ class MambaManager(SingleTypeKVCacheManager):
             # connector; a request that finishes first hands off this table
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+
+        # Admission-leased state blocks, per request, in allocation order.
+        self._state_leases: dict[str, list[int]] = {}
+        self._state_lease_slots: dict[str, int] = {}
+        self._lease_blocks_per_request = (
+            2 + self.num_speculative_blocks + kv_cache_spec.num_prefill_checkpoint_blocks
+            if self.mamba_cache_mode == "align"
+            else 1 + self.num_speculative_blocks
+        )
+
+    def set_state_lease(self, request_id: str, slot: int) -> None:
+        """Bind a request to the state slots the front-end granted it.
+
+        Block 0 is the pool-wide null block, so request slot ``s`` owns the
+        ``blocks_per_request`` ids starting at ``1 + s * blocks_per_request``.
+        """
+        start = 1 + slot * self._lease_blocks_per_request
+        self._state_lease_slots[request_id] = slot
+        self._state_leases[request_id] = list(
+            range(start, start + self._lease_blocks_per_request)
+        )
+
+    def clear_state_lease(self, request_id: str) -> None:
+        self._state_leases.pop(request_id, None)
+        self._state_lease_slots.pop(request_id, None)
+
+    def _take_new_blocks(self, request_id: str, num_blocks: int) -> list[KVCacheBlock]:
+        if not self.block_pool.lease_only:
+            return super()._take_new_blocks(request_id, num_blocks)
+        lease = self._state_leases.get(request_id)
+        assert lease is not None, (
+            f"request {request_id} has no admission state lease; the front-end "
+            "must grant a slot before the engine admits it"
+        )
+        assert num_blocks <= len(lease), (
+            f"request {request_id} needs {num_blocks} state blocks but its "
+            f"lease only has {len(lease)} left"
+        )
+        ids, self._state_leases[request_id] = lease[:num_blocks], lease[num_blocks:]
+        return self.block_pool.get_leased_blocks(ids)
+
+    def free(self, request_id: str) -> None:
+        # Preemption also frees blocks, and a preempted request keeps its
+        # slot: rewind the lease so resume allocates from it again. Finished
+        # requests drop the entry through clear_state_lease().
+        if (slot := self._state_lease_slots.get(request_id)) is not None:
+            self.set_state_lease(request_id, slot)
+        super().free(request_id)
 
     @classmethod
     def find_longest_cache_hit(
@@ -1861,7 +1916,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 if not blocks_allocated:
                     max_new_blocks += self.num_speculative_blocks
                 assert num_new_blocks <= max_new_blocks
-                new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                new_blocks = self._take_new_blocks(request_id, num_new_blocks)
                 returned_blocks = req_blocks[prev_block_len:]
                 if partial_hit is not None:
                     block_idx, source_block = partial_hit
@@ -1952,6 +2007,10 @@ class MambaManager(SingleTypeKVCacheManager):
                 if entry[0] != request_id
             ]
         blocks = super().pop_blocks_for_free(request_id)
+        # Deferred frees bypass free(); rewind the lease here too so a resumed
+        # request reallocates from the start of its slot.
+        if (slot := self._state_lease_slots.get(request_id)) is not None:
+            self.set_state_lease(request_id, slot)
         if self._dedicated_pool:
             return [block for block in blocks if block is not self._null_block]
         return blocks
@@ -1975,6 +2034,8 @@ class MambaManager(SingleTypeKVCacheManager):
         # prefix hits.  Dense caching would materialize the whole prompt's
         # block table in the dedicated pool (e.g. every block of a 20k
         # request), defeating the bounded resident-state design.
+        if self._shared_global_pool:
+            return
         if self.mamba_cache_mode == "align" and retention_interval is None:
             retention_interval = 0
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)

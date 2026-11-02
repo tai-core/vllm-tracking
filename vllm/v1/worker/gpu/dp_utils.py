@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+import time
+from dataclasses import replace
 
 import torch
 import torch.distributed as dist
@@ -15,30 +16,125 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CudaGraphManager,
 )
+from vllm.v1.worker.gpu.dp_batch_plan import (
+    DPBatchPlanKey,
+    DPBatchShapePlan,
+    DPSyncState,
+)
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
 
 
-@dataclass(frozen=True)
-class DPSyncState:
-    """What a `dispatch_cg_and_sync_dp` call agreed across DP ranks.
+def issue_dp_shape_agreement(
+    cudagraph_manager: CudaGraphManager | None,
+    desired_batch_desc: BatchExecutionDescriptor,
+    num_tokens: int,
+    num_reqs: int,
+    uniform_token_count: int | None,
+    dp_size: int,
+    dp_rank: int,
+    epoch: int,
+    global_mode: int = 0,
+    fallback_reason: str | None = None,
+    max_query_len: int | None = None,
+    num_active_loras: int = 0,
+    parallel_config: ParallelConfig | None = None,
+    allow_ubatching: bool = False,
+    uniform_decode: bool = False,
+    async_op: bool = True,
+    pad_spec_requests: bool = False,
+) -> DPBatchShapePlan:
+    """Issue a non-blocking DP shape agreement for a later batch plan."""
+    assert dp_size > 1
+    group = get_dp_group().cpu_group
+    tensor = torch.zeros(10, dp_size, dtype=torch.int32, device="cpu")
+    tensor[0][dp_rank] = num_tokens
+    tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
+    tensor[2][dp_rank] = uniform_token_count or 0
+    tensor[3][dp_rank] = max_query_len or -1
+    tensor[4][dp_rank] = int(allow_ubatching)
+    tensor[5][dp_rank] = num_reqs
+    tensor[6][dp_rank] = epoch
+    tensor[7][dp_rank] = global_mode
+    tensor[8][dp_rank] = int(fallback_reason is not None)
+    tensor[9][dp_rank] = int(pad_spec_requests)
+    if should_skip_dp_coordination():
+        tensor[:] = tensor[:, dp_rank, None].clone()
+        work = None
+    else:
+        if async_op:
+            work = dist.all_reduce(tensor, group=group, async_op=True)
+        else:
+            dist.all_reduce(tensor, group=group)
+            work = None
+    return DPBatchShapePlan(
+        key=DPBatchPlanKey(epoch=epoch, dp_size=dp_size, global_mode=global_mode),
+        work=work,
+        tensor_cpu=tensor,
+        fallback_reason=fallback_reason,
+    )
 
-    Every field is identical on every rank, so callers can branch on them
-    without disagreeing about whether to run a collective. Never add a per-rank
-    value here.
-    """
 
-    # Per-rank token counts, for the forward context. All entries hold the
-    # agreed padded count, unless `eager`, where nothing was padded.
-    num_tokens_across_dp: torch.Tensor
-    # Agreed uniform decode length. None means the ranks disagreed, which is an
-    # answer, not "unknown".
-    uniform_token_count: int | None
-    # Whether the ranks agreed to run eager. A dispatch reusing this must run
-    # eager too; no shape was agreed, so picking a graph per rank would diverge.
-    eager: bool
-    # Agreed upper bound on any rank's request count. Holds the padded count when
-    # a FULL descriptor imposed one, else the most any rank scheduled.
-    num_reqs: int
+def resolve_dp_shape_agreement(
+    plan: DPBatchShapePlan,
+    cudagraph_manager: CudaGraphManager | None,
+    desired_batch_desc: BatchExecutionDescriptor,
+    num_tokens: int,
+    num_reqs: int,
+    uniform_token_count: int | None,
+    dp_rank: int,
+    max_query_len: int | None = None,
+    num_active_loras: int = 0,
+    parallel_config: ParallelConfig | None = None,
+    allow_ubatching: bool = False,
+    uniform_decode: bool = False,
+) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
+    """Resolve an issued agreement once and validate its global plan vote."""
+    if plan.batch_desc is not None:
+        return plan.batch_desc, plan.sync_state
+    started = time.monotonic()
+    if plan.work is not None:
+        plan.work.wait()
+    plan.shape_wait_ms += (time.monotonic() - started) * 1000
+    tensor = plan.tensor_cpu
+    epochs_match = bool(torch.all(tensor[6] == plan.key.epoch).item())
+    fallback_votes = int(tensor[8].sum().item())
+    plan.use_plan = epochs_match and fallback_votes == 0
+    if not epochs_match:
+        plan.fallback_reason = "epoch_mismatch"
+    elif fallback_votes and plan.fallback_reason is None:
+        plan.fallback_reason = "fallback_vote"
+    batch_desc, sync_state = sync_cudagraph_and_dp_padding(
+        cudagraph_manager,
+        desired_batch_desc,
+        num_tokens,
+        num_reqs,
+        uniform_token_count,
+        plan.key.dp_size,
+        dp_rank,
+        max_query_len=max_query_len,
+        num_active_loras=num_active_loras,
+        parallel_config=parallel_config,
+        allow_ubatching=allow_ubatching,
+        uniform_decode=uniform_decode,
+        _agreement=plan,
+    )
+    plan.batch_desc = batch_desc
+    if sync_state is not None:
+        global_mode = int(tensor[7].max().item())
+        max_spec_reqs = None
+        if global_mode == 1:
+            max_spec_reqs = sync_state.max_num_reqs_across_dp
+            if bool(torch.any(tensor[9] != 0).item()):
+                max_spec_reqs = max(sync_state.num_reqs, max_spec_reqs or 0)
+        sync_state = replace(
+            sync_state,
+            max_spec_reqs_across_dp=max_spec_reqs,
+            global_mode=global_mode,
+            use_plan=plan.use_plan,
+            fallback_reason=plan.fallback_reason,
+        )
+    plan.sync_state = sync_state
+    return batch_desc, sync_state
 
 
 def sync_cudagraph_and_dp_padding(
@@ -54,6 +150,7 @@ def sync_cudagraph_and_dp_padding(
     parallel_config: ParallelConfig | None = None,
     allow_ubatching: bool = False,
     uniform_decode: bool = False,
+    _agreement: DPBatchShapePlan | None = None,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """Coordinates the batch descriptor and DP padding across all ranks.
 
@@ -63,18 +160,21 @@ def sync_cudagraph_and_dp_padding(
     Returns (synced_batch_desc, sync). `sync` is None when no rank has work.
     """
     assert dp_size > 1, "DP size must be greater than 1"
-    group = get_dp_group().cpu_group
-    tensor = torch.zeros(6, dp_size, dtype=torch.int32, device="cpu")
-    tensor[0][dp_rank] = num_tokens
-    tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
-    tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
-    tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
-    tensor[4][dp_rank] = int(allow_ubatching)
-    tensor[5][dp_rank] = num_reqs
-    if should_skip_dp_coordination():
-        tensor[:] = tensor[:, dp_rank, None].clone()
+    if _agreement is not None:
+        tensor = _agreement.tensor_cpu
     else:
-        dist.all_reduce(tensor, group=group)
+        group = get_dp_group().cpu_group
+        tensor = torch.zeros(6, dp_size, dtype=torch.int32, device="cpu")
+        tensor[0][dp_rank] = num_tokens
+        tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
+        tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
+        tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
+        tensor[4][dp_rank] = int(allow_ubatching)
+        tensor[5][dp_rank] = num_reqs
+        if should_skip_dp_coordination():
+            tensor[:] = tensor[:, dp_rank, None].clone()
+        else:
+            dist.all_reduce(tensor, group=group)
 
     num_tokens_across_dp = tensor[0]
     cg_mode_across_dp = tensor[1]
@@ -150,6 +250,7 @@ def sync_cudagraph_and_dp_padding(
                 uniform_token_count=synced_uniform_token_count,
                 eager=ubatch_desc.cg_mode == CUDAGraphMode.NONE,
                 num_reqs=num_reqs,
+                max_num_reqs_across_dp=int(num_reqs_across_dp.max()),
             )
 
     synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min()))
@@ -168,6 +269,7 @@ def sync_cudagraph_and_dp_padding(
                 uniform_token_count=synced_uniform_token_count,
                 eager=True,
                 num_reqs=int(num_reqs_across_dp.max()),
+                max_num_reqs_across_dp=int(num_reqs_across_dp.max()),
             ),
         )
 
@@ -207,6 +309,7 @@ def sync_cudagraph_and_dp_padding(
             and synced_desc.num_reqs is not None
             else int(num_reqs_across_dp.max())
         ),
+        max_num_reqs_across_dp=int(num_reqs_across_dp.max()),
     )
 
 
@@ -224,6 +327,10 @@ def dispatch_cg_and_sync_dp(
     allow_ubatching: bool = False,
     uniform_decode: bool = False,
     dp_sync_state: DPSyncState | None = None,
+    global_mode: int = 0,
+    plan_epoch: int | None = None,
+    fallback_reason: str | None = None,
+    pad_spec_requests: bool = False,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """Pick a cudagraph descriptor for this batch, agreeing it across DP ranks.
 
@@ -259,6 +366,10 @@ def dispatch_cg_and_sync_dp(
             same `uniform_token_count`; `num_reqs` may differ, as neither
             depends on it. Passing a sync from a different batch is a caller
             error and trips an assert.
+        global_mode: KDA batch mode shared across the DP group.
+        plan_epoch: Monotonic epoch for the optional DPBatchPlan.
+        fallback_reason: Why the plan cannot be used, when applicable.
+        pad_spec_requests: Whether dummy requests may use speculative padding.
 
     Returns:
         (batch_desc, sync), where `sync` is this batch's agreement for a later
@@ -308,6 +419,41 @@ def dispatch_cg_and_sync_dp(
                 ),
             )
         return batch_desc, dp_sync_state
+
+    if plan_epoch is not None:
+        shape_plan = issue_dp_shape_agreement(
+            cudagraph_manager,
+            batch_desc,
+            num_tokens,
+            num_reqs,
+            uniform_token_count,
+            dp_size,
+            dp_rank,
+            epoch=plan_epoch,
+            global_mode=global_mode,
+            fallback_reason=fallback_reason,
+            max_query_len=max_query_len,
+            num_active_loras=num_active_loras,
+            parallel_config=parallel_config,
+            allow_ubatching=allow_ubatching,
+            uniform_decode=uniform_decode,
+            async_op=False,
+            pad_spec_requests=pad_spec_requests,
+        )
+        return resolve_dp_shape_agreement(
+            shape_plan,
+            cudagraph_manager,
+            batch_desc,
+            num_tokens,
+            num_reqs,
+            uniform_token_count,
+            dp_rank,
+            max_query_len=max_query_len,
+            num_active_loras=num_active_loras,
+            parallel_config=parallel_config,
+            allow_ubatching=allow_ubatching,
+            uniform_decode=uniform_decode,
+        )
 
     return sync_cudagraph_and_dp_padding(
         cudagraph_manager,

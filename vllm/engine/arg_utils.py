@@ -535,6 +535,9 @@ class EngineArgs:
     dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
     cp_kv_cache_interleave_size: int | None = None
     kda_layer_tp: int | None = ParallelConfig.kda_layer_tp
+    kda_dp_compact_decode: bool = ParallelConfig.kda_dp_compact_decode
+    kda_mamba_shared_pool: bool = ParallelConfig.kda_mamba_shared_pool
+    kda_mamba_global_num_seqs: int | None = ParallelConfig.kda_mamba_global_num_seqs
     data_parallel_size: int = ParallelConfig.data_parallel_size
     data_parallel_rank: int | None = None
     data_parallel_start_rank: int | None = None
@@ -1210,6 +1213,31 @@ class EngineArgs:
                 "Defaults to the TP group, which replicates KDA weights on "
                 "every DP rank. Set to TP * PCP to shard across PCP, or TP * DP "
                 "to shard across DP (decode only). Only complete groups are supported."
+            ),
+        )
+        parallel_group.add_argument(
+            "--kda-dp-compact-decode",
+            action="store_true",
+            help=(
+                "Pack real KDA-over-DP decode rows and use device-masked BF16 "
+                "DeepGEMM projections with a static CUDA-graph shape."
+            ),
+        )
+        parallel_group.add_argument(
+            "--kda-mamba-shared-pool",
+            action="store_true",
+            help=(
+                "Address the Mamba state pool globally across the KDA DP group "
+                "instead of one window per rank. Requires --kda-layer-tp over DP."
+            ),
+        )
+        parallel_group.add_argument(
+            "--kda-mamba-global-num-seqs",
+            type=int,
+            default=None,
+            help=(
+                "Requests the shared Mamba state pool holds across the KDA "
+                "group. Defaults to max_num_seqs * DP width."
             ),
         )
         parallel_group.add_argument(
@@ -2591,6 +2619,9 @@ class EngineArgs:
                 else ParallelConfig.cp_kv_cache_interleave_size
             ),
             kda_layer_tp=self.kda_layer_tp,
+            kda_dp_compact_decode=self.kda_dp_compact_decode,
+            kda_mamba_shared_pool=self.kda_mamba_shared_pool,
+            kda_mamba_global_num_seqs=self.kda_mamba_global_num_seqs,
             _allow_auto_resolve_cp_interleave_size=(
                 self.cp_kv_cache_interleave_size is None
             ),

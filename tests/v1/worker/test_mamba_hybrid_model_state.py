@@ -241,6 +241,33 @@ def _prepare_attn_metadata(
     return captured["model_specific_attn_metadata"]
 
 
+def test_prepare_attn_passes_dp_dummy_flag_to_kda_builders(monkeypatch):
+    state = _mamba_hybrid_state(3)
+    input_batch = _input_batch([4], [3], [False])
+    captured = {}
+
+    def fake_build_attn_metadata(**kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(mamba_hybrid, "build_attn_metadata", fake_build_attn_metadata)
+    state.prepare_attn(
+        input_batch=input_batch,
+        cudagraph_mode=CUDAGraphMode.NONE,
+        block_tables=(),
+        slot_mappings={},
+        attn_groups=[],
+        kv_cache_config=Mock(),
+        dp_sync_state=SimpleNamespace(global_mode=2, use_plan=False),
+        skip_commit=True,
+        is_dp_dummy=True,
+    )
+
+    model_metadata = captured["model_specific_attn_metadata"]
+    assert model_metadata.is_dp_dummy
+    assert model_metadata.get_extra_common_attn_kwargs(0, 1)["kda_dp_dummy"]
+
+
 def test_prepare_attn_keeps_the_accepted_offset_when_the_batch_drafted_nothing(
     monkeypatch,
 ):
@@ -391,6 +418,52 @@ def test_recoverssm_commits_accepted_window_after_v2_sampling() -> None:
     )
 
     metadata.commit_recoverssm_state.assert_called_once_with(num_sampled)
+
+
+def test_recoverssm_dummy_step_is_not_committed() -> None:
+    state = RecoverSSMState()
+    metadata = Mock(spec=RecoverSSMMetadata)
+    group = SimpleNamespace(layer_names=["layer"])
+
+    state.record_step(
+        {"layer": metadata},
+        [[group]],
+        for_capture=False,
+        skip_commit=True,
+    )
+    state.commit_step(
+        torch.tensor([1], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        state_indices=None,
+        num_accepted_tokens=torch.ones(1, dtype=torch.int32),
+    )
+
+    metadata.commit_recoverssm_state.assert_not_called()
+
+
+def test_kda_dp_commit_flush_uses_stable_group_order(monkeypatch) -> None:
+    from vllm.models.kimi_k3.nvidia import kda_metadata
+
+    state = object.__new__(MambaHybridModelState)
+    state.recoverssm = RecoverSSMState()
+    contexts = [SimpleNamespace(name=f"group_{i}") for i in range(3)]
+    flushed = []
+    monkeypatch.setattr(
+        kda_metadata,
+        "flush_recoverssm_dp_commit",
+        lambda context: flushed.append(context),
+    )
+
+    def attention_group(context):
+        builder = SimpleNamespace(recoverssm_context=context)
+        return SimpleNamespace(get_metadata_builder=lambda _: builder)
+
+    state.flush_kda_dp_commits(
+        [[attention_group(contexts[0])], [attention_group(contexts[1])], []]
+    )
+    state.flush_kda_dp_commits([[attention_group(contexts[2])]])
+
+    assert flushed == contexts
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")

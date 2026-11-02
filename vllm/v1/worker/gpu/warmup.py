@@ -98,8 +98,18 @@ def _warmup_block_allocator(
     # MUSA: each Mamba group may own a dedicated pool sized for max_num_seqs
     # requests, with its own block-id space.
     dedicated = bool(kv_cache_config.musa_mamba_num_blocks)
+    lease_start = kv_cache_config.musa_mamba_lease_start
     shared = len(groups)
     next_block_ids = [1] * (len(groups) + 1)
+    if lease_start is not None:
+        # Globally addressed state pool: warmup draws from this rank's lease,
+        # whose first id is not 1 (block 0 is the pool-wide null block).
+        for group_id, group in enumerate(groups):
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.first_spec
+            if isinstance(spec, MambaSpec):
+                next_block_ids[group_id] = lease_start
 
     def alloc(group_id: int, num_blocks: int) -> list[int]:
         pool = shared
@@ -356,15 +366,23 @@ def _warmup_kernels(
     if decode_only:
         # Each scheduler owns only one window of the gathered state pool.
         # Using the full tensor's block count here could allocate another
-        # DP owner's slots; forward adds the owner-window offset separately.
-        allocatable = model_runner.kv_cache_config.musa_mamba_alloc_num_blocks
+        # DP owner's slots. Window mode adds the owner offset in forward;
+        # lease mode hands out global ids from this rank's lease instead.
+        # Window mode: alloc includes its own null block. Static lease: the
+        # count is the lease alone. Admission leases: the whole global pool is
+        # available to warmup, minus the pool-wide null block.
+        cfg = model_runner.kv_cache_config
+        allocatable = cfg.musa_mamba_alloc_num_blocks or cfg.musa_mamba_num_blocks
         if allocatable is None:
             raise ValueError("DP KDA decode warmup requires its dedicated state pool")
+        usable = (
+            allocatable if cfg.musa_mamba_lease_start is not None else allocatable - 1
+        )
         for spec, blocks in zip(kv_cache_specs, decode_block_counts):
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 spec = spec.first_spec
             if isinstance(spec, MambaSpec) and blocks:
-                num_reqs = min(num_reqs, (allocatable - 1) // blocks)
+                num_reqs = min(num_reqs, usable // blocks)
         if num_reqs < 1:
             raise ValueError("No KDA state slots available for decode warmup")
 

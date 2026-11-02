@@ -117,6 +117,7 @@ class DFlashSpeculator(DraftModelSpeculator):
     def attn_vllm_config(self) -> VllmConfig:
         # The draft's attention differs from the target's in causality.
         config = copy.copy(super().attn_vllm_config)
+        config = self.speculative_config.apply_draft_overrides(config)
         config.attention_config = replace(
             self.vllm_config.attention_config,
             use_non_causal=self.requires_non_causal,
@@ -450,6 +451,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_model_len,
                 self.sample_from_anchor,
             )
+
+        if dummy_run:
+            # Dummy batches name real request-state slots. Keep their sampling
+            # from overwriting proposals needed by the next real verification.
+            self.sample_idx_mapping.fill_(-1)
 
         batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(

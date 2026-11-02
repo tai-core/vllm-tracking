@@ -146,6 +146,101 @@ def test_mamba_retirement_crosses_null_gaps():
     assert manager.req_to_blocks["r"][1].ref_cnt == 1
 
 
+def test_block_pool_lease_hands_out_only_leased_global_ids():
+    # Globally addressed Mamba pool: block 0 is the pool-wide null block and
+    # this rank may only allocate inside its own lease.
+    pool = BlockPool(
+        num_gpu_blocks=9,
+        enable_caching=False,
+        hash_block_size=4,
+        allocatable_block_ids=range(5, 9),
+    )
+    assert pool.null_block.block_id == 0
+    assert pool.get_num_free_blocks() == 4
+    assert pool.get_usage() == 0.0
+    blocks = pool.get_new_blocks(4)
+    assert [b.block_id for b in blocks] == [5, 6, 7, 8]
+    assert pool.get_usage() == 1.0
+    with pytest.raises(ValueError):
+        pool.get_new_blocks(1)
+    pool.free_blocks(blocks)
+    assert pool.get_num_free_blocks() == 4
+
+
+def _admission_lease_manager():
+    spec = MambaSpec(
+        block_size=4,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="none",
+        num_speculative_blocks=1,
+    )
+    pool = BlockPool(
+        num_gpu_blocks=9,
+        enable_caching=False,
+        hash_block_size=4,
+        allocatable_block_ids=range(0, 0),
+        lease_only=True,
+    )
+    manager = MambaManager(
+        spec,
+        block_pool=pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+    )
+    manager._shared_global_pool = True
+    return manager, pool
+
+
+def test_admission_lease_allocates_granted_ids_and_rewinds_on_preempt():
+    manager, pool = _admission_lease_manager()
+    with pytest.raises(RuntimeError):
+        pool.get_new_blocks(1)  # no local general allocation in lease mode
+
+    # Two blocks per request, so slot 2 owns ids 5 and 6 (block 0 is null).
+    manager.set_state_lease("r", slot=2)
+    blocks = manager._take_new_blocks("r", 2)
+    manager.req_to_blocks["r"] = blocks
+    assert [b.block_id for b in blocks] == [5, 6]
+    assert all(b.ref_cnt == 1 for b in blocks)
+    with pytest.raises(AssertionError):
+        manager._take_new_blocks("r", 1)  # lease exhausted
+
+    # Preemption frees the blocks but the request keeps its slot.
+    manager.free("r")
+    assert pool.get_num_free_blocks() == 0  # freed blocks stay out of the queue
+    assert all(b.ref_cnt == 0 for b in blocks)
+    assert [b.block_id for b in manager._take_new_blocks("r", 2)] == [5, 6]
+
+    manager.clear_state_lease("r")
+    with pytest.raises(AssertionError):
+        manager._take_new_blocks("r", 1)
+
+
+def test_shared_global_pool_registers_no_state_hashes():
+    from types import SimpleNamespace
+
+    manager, pool = _admission_lease_manager()
+    manager.set_state_lease("r", slot=1)
+    blocks = manager._take_new_blocks("r", 2)
+    manager.req_to_blocks["r"] = blocks
+    manager.cache_blocks(SimpleNamespace(request_id="r"), 8, replay_boundaries=[])
+    # No hash means no cross-request hit can ever alias this slot's state.
+    assert all(b.block_hash is None for b in blocks)
+    assert not manager.cached_blocks_this_step
+
+
+def test_admission_lease_rejects_a_slot_still_in_use():
+    manager, pool = _admission_lease_manager()
+    manager.set_state_lease("r", slot=1)
+    manager._take_new_blocks("r", 2)
+    # Re-granting the same slot before the blocks were freed must fail loudly
+    # rather than alias two requests onto one state.
+    with pytest.raises(AssertionError, match="still referenced"):
+        pool.get_leased_blocks([3, 4])
+
+
 @pytest.mark.parametrize("block_size", [3584, 4608])
 @pytest.mark.parametrize("in_flight_chunks", [0, 1, 2])
 def test_mamba_retirement_bounds_prefill_states(block_size, in_flight_chunks):

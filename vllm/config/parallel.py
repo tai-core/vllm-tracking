@@ -425,6 +425,31 @@ class ParallelConfig:
     not implemented. Cross-DP KDA currently supports decode batches only.
     """
 
+    kda_dp_compact_decode: bool = False
+    """Pack real KDA-over-DP decode rows before the BF16 projections.
+
+    The gathered shape stays static for CUDA graphs while DeepGEMM reads the
+    valid row count from device memory. Requires KDA TP over DP.
+    """
+
+    kda_mamba_shared_pool: bool = False
+    """Address the MUSA Mamba state pool globally across the KDA DP group.
+
+    Off (default): every rank owns one window of its state tensor and block ids
+    are window-local, with the window offset applied in the KDA forward pass.
+    On: block ids are global -- slot i names the same request on every rank --
+    so no offset is applied and the pool is sized from the global request bound
+    instead of one window per rank. Requires KDA TP over DP.
+    """
+
+    kda_mamba_global_num_seqs: int | None = None
+    """Requests the shared Mamba state pool holds across the whole KDA group.
+
+    Defaults to max_num_seqs * DP width, which reproduces the capacity of the
+    per-rank windows. Smaller values need leases handed out at admission rather
+    than the static per-rank ranges, and are rejected for now.
+    """
+
     cp_kv_cache_interleave_size: int = 1
     """Interleave size of kv_cache storage while using DCP.
     Store interleave_size tokens on dcp_rank i, then store next
@@ -569,6 +594,31 @@ class ParallelConfig:
             from vllm.config.kda_parallel import kda_layer_tp_axis
 
             kda_layer_tp_axis(self)
+
+        if self.kda_dp_compact_decode:
+            from vllm.config.kda_parallel import kda_layer_tp_axis
+
+            if kda_layer_tp_axis(self) != "dp":
+                raise ValueError(
+                    "kda_dp_compact_decode requires KDA TP over the DP group"
+                )
+
+        if self.kda_mamba_shared_pool:
+            from vllm.config.kda_parallel import kda_layer_tp_axis
+
+            if kda_layer_tp_axis(self) != "dp":
+                raise ValueError(
+                    "kda_mamba_shared_pool requires KDA TP over the DP group"
+                )
+            if self.kda_mamba_global_num_seqs is not None and (
+                self.data_parallel_external_lb or self.data_parallel_hybrid_lb
+            ):
+                # Only the internal load balancer can grant a slot alongside
+                # the routing decision; external LB has no such agent.
+                raise ValueError(
+                    "a global Mamba slot bound requires the internal DP load "
+                    "balancer, not external/hybrid LB"
+                )
 
         if self.enable_eplb:
             if not current_platform.is_cuda_alike() and not current_platform.is_xpu():

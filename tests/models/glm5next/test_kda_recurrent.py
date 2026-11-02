@@ -575,3 +575,485 @@ def test_recoverssm_preserves_checkpoint_and_commits_only_accepted_prefix(state_
                 atol=2e-3 if state_dtype == torch.bfloat16 else 1e-6,
             )
         torch.testing.assert_close(state[0], before[0], rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_dp_decode_forward_matches_rank_local_batches(monkeypatch):
+    """Ragged DP non-spec decode must match each rank-local recurrent step."""
+    from types import SimpleNamespace
+
+    from vllm.models.glm5next.common import kda
+    from vllm.models.glm5next.common.kda import globalize_gdn_metadata_for_dp
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+    torch.manual_seed(41)
+    device = torch.device(current_platform.device_type)
+    heads, rows, proj, pool_blocks = 2, 4, 2 * D, 10
+    conv = torch.randn(pool_blocks, 3 * proj, 5, device=device, dtype=torch.bfloat16)
+    recurrent = torch.randn(pool_blocks, heads, D, D, device=device) * 0.1
+    layer = object.__new__(kda.Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.prefix = "layer.0"
+    layer.kda_parallel = SimpleNamespace(token_layout="dp")
+    layer.local_num_heads = heads
+    layer.head_dim = D
+    layer.conv_size = 4
+    layer.local_projection_size = proj
+    layer.kda_safe_gate = True
+    layer.kda_lower_bound = LOWER_BOUND
+    layer.use_recoverssm = False
+    layer.num_spec = 2
+    layer._conv_state_dim_first = True
+    layer._merged_conv_weight = torch.randn(
+        3 * proj, 4, device=device, dtype=torch.bfloat16
+    )
+    layer.q_conv1d = SimpleNamespace(bias=None)
+    layer.A_log = torch.randn(1, 1, heads, 1, device=device) * 0.1
+    layer.dt_bias = torch.randn(heads * D, device=device) * 0.1
+
+    qkv = torch.randn(rows * 2, 3 * proj, device=device, dtype=torch.bfloat16)
+    gate = torch.randn(1, rows * 2, heads, D, device=device, dtype=torch.bfloat16)
+    beta = torch.randn(1, rows * 2, heads, device=device, dtype=torch.bfloat16)
+    local_states = (
+        torch.tensor([1, 2], device=device, dtype=torch.int32),
+        torch.tensor([3], device=device, dtype=torch.int32),
+    )
+    counts = (2, 1)
+
+    def local_meta(rank):
+        count = counts[rank]
+        return GDNAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=count,
+            num_decode_tokens=count,
+            num_spec_decodes=0,
+            num_spec_decode_tokens=0,
+            num_actual_tokens=count,
+            non_spec_query_start_loc=torch.arange(
+                count + 1, device=device, dtype=torch.int32
+            ),
+            non_spec_state_indices_tensor=local_states[rank],
+            spec_token_indx=torch.empty(0, device=device, dtype=torch.int32),
+            non_spec_token_indx=torch.arange(count, device=device, dtype=torch.int32),
+        )
+
+    other_state = torch.tensor([3, 0, 0, 0], device=device, dtype=torch.int32)
+    group = SimpleNamespace(
+        all_gather=lambda tensor, dim: torch.cat([tensor, other_state])
+    )
+    global_meta = globalize_gdn_metadata_for_dp(
+        local_meta(0),
+        group=group,
+        request_windows=2,
+        shared_state_pool=True,
+        pool_num_blocks=pool_blocks,
+        max_tokens=rows,
+    )
+
+    current: dict[str, object] = {}
+    monkeypatch.setattr(
+        kda,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={layer.prefix: current["meta"]}),
+    )
+
+    def run(meta, cache, qkv_, gate_, beta_):
+        layer.kv_cache = cache
+        current["meta"] = meta
+        out = torch.zeros(
+            1, qkv_.shape[0], heads, D, device=device, dtype=torch.bfloat16
+        )
+        layer._forward(qkv_, gate_, beta_, out)
+        return out
+
+    def make_cache():
+        return conv.clone(), recurrent.clone()
+
+    global_cache = make_cache()
+    local_qkv, local_gate, local_beta = qkv.clone(), gate.clone(), beta.clone()
+    global_out = run(global_meta, global_cache, qkv, gate, beta)
+    local_out = []
+    for rank, count in enumerate(counts):
+        tokens = slice(rank * rows, rank * rows + count)
+        cache = make_cache()
+        out = run(
+            local_meta(rank),
+            cache,
+            local_qkv[tokens].contiguous(),
+            local_gate[:, tokens].contiguous(),
+            local_beta[:, tokens].contiguous(),
+        )
+        local_out.append(out)
+        used_slots = local_states[rank].long()
+        for global_tensor, local_tensor in zip(global_cache, cache):
+            torch.testing.assert_close(
+                global_tensor[used_slots], local_tensor[used_slots], rtol=0, atol=0
+            )
+
+    real_rows = torch.tensor([0, 1, 4], device=device)
+    expected = torch.cat(local_out, dim=1)
+    torch.testing.assert_close(global_out[:, real_rows], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("use_recoverssm", [False, True], ids=["native", "recoverssm"])
+@torch.inference_mode()
+def test_dp_spec_forward_matches_rank_local_batches(monkeypatch, use_recoverssm):
+    """Ragged DP spec batches must be bitwise equivalent to local verification."""
+    from types import SimpleNamespace
+
+    from vllm.models.glm5next.common import kda
+    from vllm.models.glm5next.common.kda import globalize_gdn_metadata_for_dp
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+    torch.manual_seed(37)
+    device = torch.device(current_platform.device_type)
+    heads, rows, num_slots = 2, 4, 3
+    request_rows = 2
+    proj = heads * D
+    pool_blocks = 10
+    conv = torch.randn(pool_blocks, 3 * proj, 5, device=device, dtype=torch.bfloat16)
+    recurrent = torch.randn(pool_blocks, heads, D, D, device=device) * 0.1
+    layer = object.__new__(kda.Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.prefix = "layer.0"
+    layer.kda_parallel = SimpleNamespace(token_layout="dp")
+    layer.local_num_heads = heads
+    layer.head_dim = D
+    layer.conv_size = 4
+    layer.local_projection_size = proj
+    layer.kda_safe_gate = True
+    layer.kda_lower_bound = LOWER_BOUND
+    layer.use_recoverssm = use_recoverssm
+    layer.num_spec = num_slots - 1
+    layer._conv_state_dim_first = True
+    layer._merged_conv_weight = torch.randn(
+        3 * proj, 4, device=device, dtype=torch.bfloat16
+    )
+    layer.q_conv1d = SimpleNamespace(bias=None)
+    layer.A_log = torch.randn(1, 1, heads, 1, device=device) * 0.1
+    layer.dt_bias = torch.randn(heads * D, device=device) * 0.1
+
+    qkv = torch.randn(rows * 2, 3 * proj, device=device, dtype=torch.bfloat16)
+    gate = torch.randn(1, rows * 2, heads, D, device=device, dtype=torch.bfloat16)
+    beta = torch.randn(1, rows * 2, heads, device=device, dtype=torch.bfloat16)
+    if use_recoverssm:
+        local_states = (
+            torch.tensor([[1], [2]], device=device, dtype=torch.int32),
+            torch.tensor([[3]], device=device, dtype=torch.int32),
+        )
+    else:
+        local_states = (
+            torch.tensor([[1, 2, 3], [4, 5, 6]], device=device, dtype=torch.int32),
+            torch.tensor([[7, 8, 9]], device=device, dtype=torch.int32),
+        )
+    local_qsl = (
+        torch.tensor([0, 1, 3], device=device, dtype=torch.int32),
+        torch.tensor([0, 3], device=device, dtype=torch.int32),
+    )
+    local_accepted = (
+        torch.ones(2, device=device, dtype=torch.int32),
+        torch.ones(1, device=device, dtype=torch.int32),
+    )
+
+    def local_meta(rank):
+        count = len(local_accepted[rank])
+        if use_recoverssm:
+            from vllm.models.kimi_k3.nvidia.kda_metadata import KimiK3KDAMetadata
+
+            metadata_type = KimiK3KDAMetadata
+        else:
+            metadata_type = GDNAttentionMetadata
+        return metadata_type(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_spec_decodes=count,
+            num_spec_decode_tokens=3,
+            num_actual_tokens=3,
+            spec_query_start_loc=local_qsl[rank],
+            spec_state_indices_tensor=local_states[rank],
+            spec_token_indx=torch.arange(3, device=device, dtype=torch.int32),
+            non_spec_token_indx=torch.empty(0, device=device, dtype=torch.int32),
+            num_accepted_tokens=local_accepted[rank],
+        )
+
+    other_tensors = (
+        torch.cat(
+            [
+                local_states[1],
+                torch.zeros(
+                    request_rows - 1,
+                    local_states[0].shape[1],
+                    device=device,
+                    dtype=torch.int32,
+                ),
+            ]
+        ),
+        torch.tensor([3, 0], device=device, dtype=torch.int32),
+        torch.tensor([1, 0], device=device, dtype=torch.int32),
+    )
+    calls = iter(other_tensors)
+    group = SimpleNamespace(
+        all_gather=lambda tensor, dim: torch.cat([tensor, next(calls)])
+    )
+    global_meta = globalize_gdn_metadata_for_dp(
+        local_meta(0),
+        group=group,
+        request_windows=2,
+        shared_state_pool=True,
+        pool_num_blocks=pool_blocks,
+        max_tokens=rows,
+        max_requests=request_rows,
+    )
+
+    current: dict[str, object] = {}
+    monkeypatch.setattr(
+        kda,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={layer.prefix: current["meta"]}),
+    )
+
+    def run(meta, cache, qkv_, gate_, beta_):
+        layer.kv_cache = cache
+        current["meta"] = meta
+        out = torch.zeros(
+            1, qkv_.shape[0], heads, D, device=device, dtype=torch.bfloat16
+        )
+        layer._forward(qkv_, gate_, beta_, out)
+        return out
+
+    def make_cache():
+        caches = [conv.clone(), recurrent.clone()]
+        if use_recoverssm:
+            caches.extend(
+                [
+                    torch.zeros(pool_blocks, heads, num_slots, D, device=device),
+                    torch.zeros(pool_blocks, heads, num_slots, 2 * D, device=device),
+                ]
+            )
+        return tuple(caches)
+
+    global_cache = make_cache()
+    global_out = run(global_meta, global_cache, qkv, gate, beta)
+    local_out = []
+    local_caches = []
+    for rank in range(2):
+        tokens = slice(rank * rows, rank * rows + 3)
+        cache = make_cache()
+        local_caches.append(cache)
+        out = run(
+            local_meta(rank),
+            cache,
+            qkv[tokens].contiguous(),
+            gate[:, tokens].contiguous(),
+            beta[:, tokens].contiguous(),
+        )
+        local_out.append(out)
+        used_slots = local_states[rank].flatten().long()
+        for global_tensor, local_tensor in zip(global_cache, cache):
+            torch.testing.assert_close(
+                global_tensor[used_slots], local_tensor[used_slots], rtol=0, atol=0
+            )
+
+    real_rows = torch.tensor([0, 1, 2, 4, 5, 6], device=device)
+    expected = torch.cat(local_out, dim=1)
+    torch.testing.assert_close(global_out[:, real_rows], expected, rtol=0, atol=0)
+
+    if use_recoverssm:
+        from vllm.models.kimi_k3.nvidia.kda_metadata import (
+            KDARecoverSSMCommitMetadata,
+        )
+        from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+            KDARecoverSSMCommitContext,
+        )
+
+        accepted_after = (
+            torch.tensor([1, 3], device=device, dtype=torch.int32),
+            torch.tensor([2], device=device, dtype=torch.int32),
+        )
+        global_meta.recoverssm_context = KDARecoverSSMCommitContext.create(
+            [SimpleNamespace(kv_cache=global_cache)],
+            spec_query_len=num_slots,
+            max_num_reqs=global_meta.num_spec_decodes,
+        )
+        global_meta.recoverssm_commit = KDARecoverSSMCommitMetadata(
+            state_indices=global_meta.spec_state_indices_tensor,
+            query_start_loc=global_meta.spec_query_start_loc,
+            request_indices=None,
+            align=None,
+        )
+        other_accepted = torch.tensor([2, 0], device=device, dtype=torch.int32)
+        global_meta._kda_dp_spec_group = SimpleNamespace(
+            all_gather=lambda tensor, dim: torch.cat([tensor, other_accepted])
+        )
+        global_meta.recoverssm_context._dp_last_commit = (
+            global_meta.recoverssm_commit,
+            global_meta._kda_dp_spec_group,
+            request_rows,
+            global_meta.num_spec_decodes,
+        )
+        global_meta.commit_recoverssm_state(accepted_after[0])
+        from vllm.models.kimi_k3.nvidia.kda_metadata import (
+            flush_recoverssm_dp_commit,
+        )
+
+        flush_recoverssm_dp_commit(global_meta.recoverssm_context)
+
+        for rank in range(2):
+            local_context = KDARecoverSSMCommitContext.create(
+                [SimpleNamespace(kv_cache=local_caches[rank])],
+                spec_query_len=num_slots,
+                max_num_reqs=len(accepted_after[rank]),
+            )
+            local_context.commit(
+                accepted_after[rank], local_states[rank][:, 0], local_qsl[rank]
+            )
+            used_slots = local_states[rank].flatten().long()
+            for global_tensor, local_tensor in zip(global_cache, local_caches[rank]):
+                torch.testing.assert_close(
+                    global_tensor[used_slots],
+                    local_tensor[used_slots],
+                    rtol=0,
+                    atol=0,
+                )
+
+
+@torch.inference_mode()
+def test_dp_prefill_forward_matches_rank_local_batches(monkeypatch):
+    """Ragged DP prefills must be bitwise equivalent to local prefill."""
+    from types import SimpleNamespace
+
+    from vllm.models.glm5next.common import kda
+    from vllm.models.glm5next.common.kda import globalize_gdn_metadata_for_dp
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+    from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
+
+    torch.manual_seed(38)
+    device = torch.device(current_platform.device_type)
+    heads, rows = 2, 4
+    proj = heads * D
+    pool_blocks = 4
+    conv = torch.randn(pool_blocks, 3 * proj, 5, device=device, dtype=torch.bfloat16)
+    recurrent = torch.randn(pool_blocks, heads, D, D, device=device) * 0.1
+    layer = object.__new__(kda.Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.prefix = "layer.0"
+    layer.kda_parallel = SimpleNamespace(token_layout="dp")
+    layer.local_num_heads = heads
+    layer.head_dim = D
+    layer.conv_size = 4
+    layer.local_projection_size = proj
+    layer.kda_safe_gate = True
+    layer.kda_lower_bound = LOWER_BOUND
+    layer.kda_prefill_backend = "triton"
+    layer.use_recoverssm = False
+    layer.num_spec = 2
+    layer._conv_state_dim_first = True
+    layer._merged_conv_weight = torch.randn(
+        3 * proj, 4, device=device, dtype=torch.bfloat16
+    )
+    layer.q_conv1d = SimpleNamespace(bias=None)
+    layer.A_log = torch.randn(1, 1, heads, 1, device=device) * 0.1
+    layer.dt_bias = torch.randn(heads * D, device=device) * 0.1
+
+    qkv = torch.randn(rows * 2, 3 * proj, device=device, dtype=torch.bfloat16)
+    gate = torch.randn(1, rows * 2, heads, D, device=device, dtype=torch.bfloat16)
+    beta = torch.randn(1, rows * 2, heads, device=device, dtype=torch.bfloat16)
+    local_states = (
+        torch.tensor([1, 2], device=device, dtype=torch.int32),
+        torch.tensor([3], device=device, dtype=torch.int32),
+    )
+    local_qsl = (
+        torch.tensor([0, 1, 3], device=device, dtype=torch.int32),
+        torch.tensor([0, 3], device=device, dtype=torch.int32),
+    )
+
+    def local_meta(rank):
+        count = local_states[rank].shape[0]
+        has_initial = torch.zeros(count, dtype=torch.bool, device=device)
+        nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
+            local_qsl[rank].cpu(), device=device
+        )
+        return GDNAttentionMetadata(
+            num_prefills=count,
+            num_prefill_tokens=3,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_spec_decodes=0,
+            num_spec_decode_tokens=0,
+            num_actual_tokens=3,
+            has_initial_state=has_initial,
+            prefill_query_start_loc=local_qsl[rank],
+            prefill_state_indices=local_states[rank],
+            prefill_has_initial_state=has_initial,
+            non_spec_query_start_loc=local_qsl[rank],
+            non_spec_query_start_loc_cpu=local_qsl[rank].cpu(),
+            non_spec_state_indices_tensor=local_states[rank],
+            non_spec_token_indx=torch.arange(3, device=device, dtype=torch.int32),
+            nums_dict=nums_dict,
+            batch_ptr=batch_ptr,
+            token_chunk_offset_ptr=token_chunk_offset_ptr,
+        )
+
+    other_tensors = (
+        torch.tensor([3, 0, 0, 0], device=device, dtype=torch.int32),
+        torch.tensor([3, 0, 0, 0], device=device, dtype=torch.int32),
+        torch.zeros(rows, device=device, dtype=torch.int32),
+    )
+    calls = iter(other_tensors)
+    group = SimpleNamespace(
+        all_gather=lambda tensor, dim: torch.cat([tensor, next(calls)])
+    )
+    global_meta = globalize_gdn_metadata_for_dp(
+        local_meta(0),
+        group=group,
+        request_windows=2,
+        shared_state_pool=True,
+        pool_num_blocks=pool_blocks,
+        max_tokens=rows,
+        global_mode=2,
+    )
+
+    current: dict[str, object] = {}
+    monkeypatch.setattr(
+        kda,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={layer.prefix: current["meta"]}),
+    )
+
+    def run(meta, cache, qkv_, gate_, beta_):
+        layer.kv_cache = cache
+        current["meta"] = meta
+        out = torch.zeros(
+            1, qkv_.shape[0], heads, D, device=device, dtype=torch.bfloat16
+        )
+        layer._forward(qkv_, gate_, beta_, out)
+        return out
+
+    global_cache = (conv.clone(), recurrent.clone())
+    global_out = run(global_meta, global_cache, qkv, gate, beta)
+    local_out = []
+    for rank in range(2):
+        tokens = slice(rank * rows, rank * rows + 3)
+        cache = (conv.clone(), recurrent.clone())
+        out = run(
+            local_meta(rank),
+            cache,
+            qkv[tokens].contiguous(),
+            gate[:, tokens].contiguous(),
+            beta[:, tokens].contiguous(),
+        )
+        local_out.append(out)
+        used_slots = local_states[rank].long()
+        torch.testing.assert_close(
+            global_cache[0][used_slots], cache[0][used_slots], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            global_cache[1][used_slots], cache[1][used_slots], rtol=0, atol=0
+        )
+
+    real_rows = torch.tensor([0, 1, 2, 4, 5, 6], device=device)
+    expected = torch.cat(local_out, dim=1)
+    torch.testing.assert_close(global_out[:, real_rows], expected, rtol=0, atol=0)

@@ -1508,6 +1508,7 @@ class Worker(WorkerBase):
         self.model_runner._dummy_run(
             num_tokens,
             uniform_decode=True,
+            is_dp_dummy=True,
             randomize_inputs=self.randomize_dummy_inputs,
         )
 

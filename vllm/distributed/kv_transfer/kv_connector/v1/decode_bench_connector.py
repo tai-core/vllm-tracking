@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.config.kda_parallel import kda_tp_over_dp
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
     KVConnectorRole,
@@ -66,6 +67,7 @@ from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     KVCacheSpec,
     KVQuantMode,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
     iter_layer_specs,
 )
@@ -118,6 +120,21 @@ def _get_startup_fill_group_ids(kv_cache_config: "KVCacheConfig") -> set[int]:
             continue
         group_ids.add(group_idx)
     return group_ids
+
+
+def _get_dp_global_state_group_ids(
+    vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig"
+) -> set[int]:
+    if not kda_tp_over_dp(vllm_config):
+        return set()
+    return {
+        group_idx
+        for group_idx, group in enumerate(kv_cache_config.kv_cache_groups)
+        if any(
+            isinstance(spec, MambaSpec)
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        )
+    }
 
 
 @dataclass
@@ -208,6 +225,11 @@ class DecodeBenchConnector(KVConnectorBase_V1, SupportsHMA):
             request, num_computed_tokens
         )
 
+    def get_loaded_kv_cache_group_ids(self, request: "Request") -> tuple[int, ...]:
+        """All cache groups are synthetically restored for decode-only tests."""
+        assert self.connector_scheduler is not None
+        return tuple(range(len(self.connector_scheduler.kv_cache_groups)))
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
@@ -257,6 +279,9 @@ class DecodeBenchConnectorScheduler:
         )
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
         self.kv_cache_groups = kv_cache_config.kv_cache_groups
+        self._dp_global_state_group_ids = _get_dp_global_state_group_ids(
+            vllm_config, kv_cache_config
+        )
         self.group_block_sizes = tuple(
             resolve_dcp_kv_block_size(group.kv_cache_spec, dcp_world_size)
             for group in self.kv_cache_groups
@@ -286,12 +311,8 @@ class DecodeBenchConnectorScheduler:
             - is_async: False (synchronous filling)
 
         """
-        req_id = request.request_id
-
-        # Only fill once per request on first scheduling
-        if req_id in self._filled_requests:
-            return 0, False
-
+        # A preempted request returns with num_computed_tokens=0 and needs its
+        # synthetic KV restored again instead of replaying the prompt.
         # Calculate how many tokens we need to fill
         # Fill all uncomputed tokens except the last one (which will be decoded)
         # This simulates having processed a long prefill
@@ -333,7 +354,10 @@ class DecodeBenchConnectorScheduler:
                 strict=True,
             )
         ):
-            if group_idx in self._startup_fill_group_ids:
+            if (
+                group_idx in self._startup_fill_group_ids
+                and group_idx not in self._dp_global_state_group_ids
+            ):
                 block_ids_per_group_list.append([])
                 continue
             is_circular_buffer = all(
@@ -441,6 +465,9 @@ class DecodeBenchConnectorWorker:
                     self._fp8_dtypes[layer_name] = fp8_dtype
 
         # Mapping from KV cache group index to list of layer names in that group
+        self._dp_global_state_group_ids = _get_dp_global_state_group_ids(
+            vllm_config, kv_cache_config
+        )
         self.group_to_layers = {
             group_idx: list(group.layer_names)
             for group_idx, group in enumerate(kv_cache_config.kv_cache_groups)
@@ -517,20 +544,17 @@ class DecodeBenchConnectorWorker:
         )
 
     def start_fill_kv(self, metadata: DecodeBenchConnectorMetadata):
-        """Fill the allocated KV cache blocks with dummy values.
-
-        This simulates having a populated KV cache from a prefill phase,
-        allowing decode performance testing with larger context sizes.
-
-        Supports both single- and multi-group KV cache configurations.
-        """
+        """Fill allocated KV blocks and synchronize KDA-over-DP state fills."""
+        if self._dp_global_state_group_ids:
+            self._start_fill_kv_with_dp_state(metadata)
+            return
         if not metadata.reqs_to_fill:
             return
+        self._fill_request_metadata(metadata)
 
+    def _fill_request_metadata(self, metadata: DecodeBenchConnectorMetadata) -> None:
         assert self.kv_caches is not None, "KV caches must be registered before filling"
-
         for req_id, (block_ids_per_group, num_tokens) in metadata.reqs_to_fill.items():
-            # Fill blocks for each KV cache group
             for group_idx, block_ids in enumerate(block_ids_per_group):
                 self._fill_blocks(group_idx, block_ids, num_tokens)
 
@@ -544,6 +568,34 @@ class DecodeBenchConnectorWorker:
                 req_id,
                 ", ".join(map(str, block_counts)),
             )
+
+    def _start_fill_kv_with_dp_state(
+        self, metadata: DecodeBenchConnectorMetadata
+    ) -> None:
+        """Ensure every rank resets its head slice for newly admitted requests."""
+        from vllm.distributed.parallel_state import get_dp_group
+
+        dp_group = get_dp_group()
+        local_fills = [
+            (req_id, group_idx, block_ids, num_tokens)
+            for req_id, (
+                block_ids_per_group,
+                num_tokens,
+            ) in metadata.reqs_to_fill.items()
+            for group_idx, block_ids in enumerate(block_ids_per_group)
+            if group_idx in self._dp_global_state_group_ids
+        ]
+        gathered_fills = [None] * dp_group.world_size
+        torch.distributed.all_gather_object(
+            gathered_fills, local_fills, group=dp_group.cpu_group
+        )
+        self._fill_request_metadata(metadata)
+        for rank, fills in enumerate(gathered_fills):
+            if rank == dp_group.rank_in_group:
+                continue
+            assert fills is not None
+            for _req_id, group_idx, block_ids, num_tokens in fills:
+                self._fill_blocks(group_idx, block_ids, num_tokens)
 
     def _fill_blocks(self, group_idx: int, block_ids: list[int], num_tokens: int):
         """Fill specified blocks with dummy values for a specific KV cache group.

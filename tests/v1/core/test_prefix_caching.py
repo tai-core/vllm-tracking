@@ -6398,7 +6398,9 @@ def test_scheduler_free_blocks_preserves_pool_ownership_and_order(release_path):
         scheduler._free_cow_retained_blocks(blocks[::-1], fence_seq=0)
     else:
         if release_path == "deferred":
-            scheduler.deferred_frees.append((1, blocks))
+            # Entries carry (fence, blocks, mamba_slot, client_index); no
+            # global state lease is involved here.
+            scheduler.deferred_frees.append((1, blocks, None, 0))
         else:
             scheduler._free_cow_retained_blocks(blocks[::-1], fence_seq=1)
         scheduler._drain_deferred_frees()

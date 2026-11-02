@@ -283,6 +283,19 @@ def test_kda_recoverssm_derivation_is_revalidated():
     with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
         VllmConfig.validate_mamba_cached_kernel(config)
 
+    config.parallel_config.pipeline_parallel_size = 1
+    config.mamba_config.backend = MambaBackendEnum.TRITON
+    config.kv_transfer_config = SimpleNamespace(
+        is_kv_transfer_instance=True, kv_connector="DecodeBenchConnector"
+    )
+    VllmConfig.validate_mamba_cached_kernel(config)
+    config.kv_transfer_config.kv_connector = "LMCacheConnector"
+    with pytest.raises(ValueError, match="incompatible with KV connectors"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+    config.kv_transfer_config.kv_connector = "MooncakeConnector"
+    VllmConfig.validate_mamba_cached_kernel(config)
+
 
 def test_mamba_cache_mode_all_is_rejected():
     """The removed 'all' mode must fail validation instead of being ignored."""

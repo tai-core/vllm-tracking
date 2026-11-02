@@ -35,7 +35,7 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.compilation.wrapper import compile_model_with_stock_torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
-from vllm.config.kda_parallel import kda_tp_over_pcp
+from vllm.config.kda_parallel import kda_tp_over_dp, kda_tp_over_pcp
 from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
@@ -519,7 +519,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             optimization_contract = resolve_optimization_contract(
                 model_config=self.model_config
             )
-            self.sampler._musa_optimization_contract = optimization_contract
+            self.sampler._musa_optimization_contract = optimization_contract  # type: ignore[union-attr]
             topk_topp_sampler = getattr(self.sampler, "topk_topp_sampler", None)
             if topk_topp_sampler is not None:
                 topk_topp_sampler._musa_optimization_contract = optimization_contract
@@ -839,6 +839,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
+        is_dp_dummy: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -918,6 +919,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 context_len=context_len,
                 valid_dummy_state_slots=valid_dummy_state_slots,
                 randomize_inputs=randomize_inputs,
+                is_dp_dummy=is_dp_dummy,
             )
         self.kv_connector.set_disabled(False)
 
@@ -1549,11 +1551,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
 
-        max_seq_len_np = None
-        if self.use_pp:
-            # Used only by pipeline-parallel sampled-mask handling.
-            max_seq_len_np = self.req_states.max_seq_len[idx_mapping_np]
-
         prompt_lens = None
         if self.model_config.rswa_window is not None:
             # prompt_lens is only used in R-SWA case.
@@ -1785,7 +1782,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
+        is_dp_dummy: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if (
+            kda_tp_over_dp(self.vllm_config)
+            and envs.VLLM_KDA_DP_BATCH_PLAN
+            and getattr(self.model_state, "supports_dp_batch_plan", False)
+        ):
+            # Finish old accepted-prefix commits before request slots or state
+            # blocks can be recycled into this scheduler batch.
+            self.model_state.flush_kda_dp_commits(  # type: ignore[attr-defined]
+                getattr(self, "attn_groups", ())
+            )
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1839,6 +1847,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        global_mode = 0
+        plan_epoch = None
+        fallback_reason = None
+        if kda_tp_over_dp(self.vllm_config) and envs.VLLM_KDA_DP_BATCH_PLAN:
+            has_prefill = batch_req_state is not None and batch_req_state.has_prefill
+            global_mode = (
+                2 if has_prefill else int(self.vllm_config.num_speculative_tokens > 0)
+            )
+            self._kda_dp_plan_epoch = getattr(self, "_kda_dp_plan_epoch", -1) + 1
+            plan_epoch = self._kda_dp_plan_epoch
+            if has_prefill:
+                fallback_reason = "prefill"
+            elif self.ubatch_runner is not None:
+                fallback_reason = "ubatching"
+            else:
+                from vllm.models.glm5next.common.parallel import (
+                    get_kda_parallel_spec,
+                )
+
+                kda_group = get_kda_parallel_spec(self.vllm_config).group
+                if (
+                    kda_group.world_size != self.dp_size
+                    or kda_group.rank_in_group != self.dp_rank
+                ):
+                    fallback_reason = "kda_group_mismatch"
+
         batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
@@ -1854,6 +1888,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.ubatch_runner is not None and not skip_attn_for_dummy_run
             ),
             uniform_decode=uniform_tok_count == self.decode_query_len,
+            global_mode=global_mode,
+            plan_epoch=plan_epoch,
+            fallback_reason=fallback_reason,
+            pad_spec_requests=dummy_run,
         )
 
         if batch_desc.num_tokens == 0:
@@ -1993,10 +2031,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     for groups in attn_groups
                 ]
             prepare_metadata = self.model_state.prepare_attn
-            metadata_kwargs = {}
+            metadata_kwargs: dict[str, Any] = {}
             if global_attn_inputs is not None:
-                prepare_metadata = self.model_state.prepare_attn_with_pcp
+                prepare_metadata = self.model_state.prepare_attn_with_pcp  # type: ignore[attr-defined]
                 metadata_kwargs["global_attn_inputs"] = global_attn_inputs
+            elif getattr(self.model_state, "supports_dp_batch_plan", False):
+                metadata_kwargs["dp_sync_state"] = dp_sync_state
+                metadata_kwargs["skip_commit"] = dummy_run
+                metadata_kwargs["is_dp_dummy"] = is_dp_dummy
             attn_metadata = prepare_metadata(
                 input_batch,
                 batch_desc.cg_mode,
@@ -2142,6 +2184,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        if getattr(self.model_state, "supports_dp_batch_plan", False):
+            self.model_state.record_kda_dp_plan_buffers_free()  # type: ignore[attr-defined]
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

@@ -162,6 +162,8 @@ class BlockPool:
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
         medium: str = MEDIUM_GPU,
+        allocatable_block_ids: range | None = None,
+        lease_only: bool = False,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -172,10 +174,26 @@ class BlockPool:
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx, pool=self) for idx in range(num_gpu_blocks)
         ]
+        # A lease restricts which ids this pool may hand out while the block
+        # objects still span the whole (globally addressed) pool. Block 0 stays
+        # the null block and is never part of a lease.
+        free_blocks = (
+            self.blocks
+            if allocatable_block_ids is None
+            else [self.blocks[i] for i in allocatable_block_ids]
+        )
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.free_block_queue = FreeKVCacheBlockQueue(free_blocks)
+        # Capacity accounting uses the lease, not the globally addressed pool:
+        # ids outside the lease belong to other ranks and are never free here.
+        self.num_allocatable_blocks = len(free_blocks)
+        self.leased = allocatable_block_ids is not None
+        # Lease-only pools hand blocks out by id (granted at admission time),
+        # never from a local free queue, and freed blocks stay out of the queue
+        # so a peer rank's lease cannot race a local allocation.
+        self.lease_only = lease_only
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -183,8 +201,12 @@ class BlockPool:
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
-        # avoid freeing it.
-        self.null_block = self.free_block_queue.popleft()
+        # avoid freeing it. With a lease, block 0 belongs to no lease and is
+        # simply never enqueued.
+        if allocatable_block_ids is None:
+            self.null_block = self.free_block_queue.popleft()
+        else:
+            self.null_block = self.blocks[0]
         self.null_block.is_null = True
 
         self.enable_kv_cache_events = enable_kv_cache_events
@@ -684,6 +706,10 @@ class BlockPool:
             A list of new block.
 
         """
+        if self.lease_only:
+            raise RuntimeError(
+                "lease-only pool allocates through get_leased_blocks()"
+            )
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
@@ -706,6 +732,25 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        return ret
+
+    def get_leased_blocks(self, block_ids: list[int]) -> list[KVCacheBlock]:
+        """Redeem blocks granted to one request at admission time.
+
+        The ids come from the front-end's global lease, not from this rank's
+        free queue, so they must be unreferenced here. A block still referenced
+        means the slot was re-granted before this rank released it.
+        """
+        ret = []
+        for block_id in block_ids:
+            block = self.blocks[block_id]
+            assert not block.is_null, "the pool-wide null block cannot be leased"
+            assert block.ref_cnt == 0, (
+                f"state block {block_id} was leased while still referenced; "
+                "the slot was re-granted before this rank released it"
+            )
+            block.ref_cnt = 1
+            ret.append(block)
         return ret
 
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:
@@ -798,6 +843,10 @@ class BlockPool:
                 other_pools.setdefault(block.pool, []).append(block)
                 continue
             block.ref_cnt -= 1
+            if self.lease_only:
+                # Leased blocks stay out of the free queue; the front-end
+                # re-grants the slot once every rank released it.
+                continue
             if block.ref_cnt == 0 and not block.is_null:
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
@@ -843,12 +892,15 @@ class BlockPool:
             False otherwise.
 
         """
-        num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
-        if num_used_blocks != 1:  # The null block is always marked as used
+        num_used_blocks = self.num_allocatable_blocks - self.get_num_free_blocks()
+        # The null block counts as used only when it was popped from this
+        # pool's own queue; a lease never contains it.
+        idle_used = 0 if self.leased else 1
+        if num_used_blocks != idle_used:
             logger.warning(
                 "Failed to reset prefix cache because some "
                 "blocks (%d) are not freed yet",
-                num_used_blocks - 1,
+                num_used_blocks - idle_used,
             )
             return False
 
@@ -890,8 +942,8 @@ class BlockPool:
             The KV cache usage (between 0.0 and 1.0).
 
         """
-        # Subtract 1 to account for null block.
-        total_gpu_blocks = self.num_gpu_blocks - 1
+        # Subtract 1 to account for null block, unless the lease excludes it.
+        total_gpu_blocks = self.num_allocatable_blocks - (0 if self.leased else 1)
         if not total_gpu_blocks:
             return 0
         return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)

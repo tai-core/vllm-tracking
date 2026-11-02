@@ -3608,6 +3608,7 @@ def test_auto_fit_max_model_len_reserves_dedicated_mamba_pool(
         lambda: True,
     )
     from transformers import OPTConfig
+
     from vllm.utils.math_utils import cdiv
 
     OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
@@ -3644,6 +3645,53 @@ def test_auto_fit_max_model_len_reserves_dedicated_mamba_pool(
     # The dedicated pool covers max_num_seqs requests, not just the one the
     # shared-pool formula charges.
     assert mamba_bytes > groups[1].kv_cache_spec.max_memory_usage_bytes(vllm_config)
+
+
+def test_musa_shared_mamba_pool_bytes_uses_global_bound(tmp_path, monkeypatch):
+    """Shared pool: one null block plus the global request bound, no windows."""
+    monkeypatch.setattr(
+        "vllm.v1.core.kv_cache_utils.musa_mamba_separate_pool_enabled",
+        lambda: True,
+    )
+    from transformers import OPTConfig
+
+    from vllm.utils.math_utils import cdiv
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(model=str(tmp_path), max_model_len=1024),
+        scheduler_config=SchedulerConfig(
+            max_model_len=1024, is_encoder_decoder=False, max_num_seqs=4
+        ),
+    )
+    vllm_config.parallel_config.kda_layer_tp = 8
+    vllm_config.parallel_config.data_parallel_size = 8
+    vllm_config.parallel_config.kda_mamba_shared_pool = True
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
+    groups = [
+        KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=new_kv_cache_spec()),
+        KVCacheGroupSpec(
+            layer_names=["mamba"],
+            kv_cache_spec=new_mamba_spec(mamba_cache_mode="align"),
+        ),
+    ]
+    spec = groups[1].kv_cache_spec
+    per_request = cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
+    attn_only = kv_cache_utils._shared_pool_max_memory_usage_bytes(
+        vllm_config, groups[:1]
+    )
+
+    # Default global bound: max_num_seqs per rank across 8 KDA ranks.
+    mamba_bytes = kv_cache_utils._musa_mamba_pool_bytes(vllm_config, groups)
+    assert mamba_bytes == spec.page_size_bytes * (1 + 32 * per_request)
+    needed = kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
+    assert needed == mamba_bytes + attn_only
+
+    # A smaller global bound (admission leases) shrinks the pool accordingly.
+    vllm_config.parallel_config.kda_mamba_global_num_seqs = 16
+    assert kv_cache_utils._musa_mamba_pool_bytes(
+        vllm_config, groups
+    ) == spec.page_size_bytes * (1 + 16 * per_request)
 
 
 def test_auto_fit_max_model_len_not_triggered():
@@ -4542,3 +4590,28 @@ def test_hybrid_pool_detection_accepts_single_pass_specs(kinds, expected):
         new_mamba_spec() if kind == "mamba" else new_kv_cache_spec() for kind in kinds
     )
     assert kv_cache_utils._has_mamba_and_attention(specs) is expected
+
+
+def test_mooncake_kda_shared_pool_allows_dedicated_mamba_pool():
+    parallel = SimpleNamespace(
+        kda_layer_tp=8,
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        data_parallel_size=8,
+        use_sequence_parallel_moe=False,
+        kda_mamba_shared_pool=True,
+    )
+    config = SimpleNamespace(
+        parallel_config=parallel,
+        kv_transfer_config=SimpleNamespace(kv_connector="MooncakeConnector"),
+    )
+
+    assert kv_cache_utils._musa_zero_state_connector(config)
+
+    parallel.kda_mamba_shared_pool = False
+    assert not kv_cache_utils._musa_zero_state_connector(config)
+
+    parallel.kda_mamba_shared_pool = True
+    config.kv_transfer_config.kv_connector = "NixlConnector"
+    assert not kv_cache_utils._musa_zero_state_connector(config)

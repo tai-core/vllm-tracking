@@ -411,6 +411,11 @@ class KVCacheManager:
                 if pool is self.block_pool
                 else 0
             )
+            if pool.lease_only:
+                # Admission-leased pools keep no free queue: the request's
+                # blocks were granted by the front-end along with the request,
+                # so capacity was decided there, not here.
+                continue
             if required_blocks + extra > pool.get_num_free_blocks():
                 return False
         return True
@@ -662,6 +667,12 @@ class KVCacheManager:
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def set_mamba_state_lease(self, request_id: str, slot: int) -> None:
+        self.coordinator.set_mamba_state_lease(request_id, slot)
+
+    def clear_mamba_state_lease(self, request_id: str) -> None:
+        self.coordinator.clear_mamba_state_lease(request_id)
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.

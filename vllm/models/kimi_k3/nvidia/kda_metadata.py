@@ -257,6 +257,36 @@ class KDARecoverSSMCommitMetadata:
     align: KDARecoverSSMAlignMetadata | None
 
 
+def flush_recoverssm_dp_commit(context) -> None:
+    """Commit the previous step before building the next forward's metadata."""
+    if context is None:
+        return
+    pending = getattr(context, "_dp_last_commit", None)
+    if pending is None:
+        return
+    commit, dp_group, rows, num_global = pending
+    local_counts = getattr(context, "_dp_local_accepted", None)
+    if local_counts is None:
+        local_counts = torch.empty(
+            0, dtype=torch.int32, device=commit.state_indices.device
+        )
+    assert local_counts.shape[0] <= rows
+    padded_counts = local_counts.new_zeros(rows)
+    padded_counts[: local_counts.shape[0]].copy_(local_counts)
+    accepted = dp_group.all_gather(padded_counts.contiguous(), 0)
+    context.commit(
+        accepted,
+        commit.state_indices[:num_global, 0],
+        commit.query_start_loc[: num_global + 1],
+        request_indices=commit.request_indices,
+        block_table=None,
+        num_computed_tokens=None,
+        mamba_block_size=None,
+    )
+    context._dp_last_commit = None
+    context._dp_local_accepted = None
+
+
 @dataclass
 class KimiK3KDAMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
     spec_token_start: int | None = None
@@ -271,11 +301,18 @@ class KimiK3KDAMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
     def commit_recoverssm_state(
         self, num_accepted_tokens: torch.Tensor
     ) -> RecoverSSMPostprocessMetadata | None:
+        global_meta = getattr(self, "_kda_global_metadata", None)
+        if global_meta is not None and global_meta is not self:
+            return global_meta.commit_recoverssm_state(num_accepted_tokens)
         commit = self.recoverssm_commit
         if commit is None:
             return None
         context = self.recoverssm_context
         assert context is not None
+        dp_group = getattr(self, "_kda_dp_spec_group", None)
+        if dp_group is not None:
+            context._dp_local_accepted = num_accepted_tokens.clone()
+            return None
         align = commit.align
         context.commit(
             num_accepted_tokens,
@@ -347,10 +384,20 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
 
         forward_context = self.vllm_config.compilation_config.static_forward_context
         layers = [forward_context[layer_name] for layer_name in self.layer_names]
+        max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs
+        from vllm.config.kda_parallel import (
+            get_kda_request_windows,
+            kda_tp_over_dp,
+        )
+
+        if kda_tp_over_dp(self.vllm_config):
+            max_num_reqs *= get_kda_request_windows(self.vllm_config) * (
+                1 + self.vllm_config.num_speculative_tokens
+            )
         context = KDARecoverSSMCommitContext.create(
             layers,
             spec_query_len=1 + self.vllm_config.num_speculative_tokens,
-            max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,
+            max_num_reqs=max_num_reqs,
         )
         self.recoverssm_context = context
         return context

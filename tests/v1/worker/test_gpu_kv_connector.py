@@ -16,6 +16,8 @@ from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
 def _make_connector(
     monkeypatch: pytest.MonkeyPatch,
     events: list[str],
+    dp_decode_bench: bool = False,
+    dp_mooncake: bool = False,
 ) -> ActiveKVConnector:
     backend = Mock()
     backend.handle_preemptions.side_effect = lambda _: events.append("handle")
@@ -34,12 +36,28 @@ def _make_connector(
     )
     monkeypatch.setattr(kv_connector_module, "get_forward_context", object)
 
+    connector_name = "NixlConnector"
+    if dp_decode_bench:
+        connector_name = "DecodeBenchConnector"
+    elif dp_mooncake:
+        connector_name = "MooncakeConnector"
     kv_config = KVTransferConfig(
-        kv_connector="NixlConnector",
+        kv_connector=connector_name,
         kv_role="kv_consumer",
         kv_buffer_device="cpu",
     )
-    connector = ActiveKVConnector(SimpleNamespace(kv_transfer_config=kv_config), {})
+    vllm_config = SimpleNamespace(kv_transfer_config=kv_config)
+    if dp_decode_bench or dp_mooncake:
+        vllm_config.parallel_config = SimpleNamespace(
+            kda_layer_tp=8,
+            kda_mamba_shared_pool=dp_mooncake,
+            tensor_parallel_size=1,
+            data_parallel_size=8,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            use_sequence_parallel_moe=False,
+        )
+    connector = ActiveKVConnector(vllm_config, {})
     events.clear()
     return connector
 
@@ -95,3 +113,63 @@ def test_no_forward_starts_deferred_load_once(monkeypatch: pytest.MonkeyPatch):
     connector.no_forward(_scheduler_output(False))
 
     assert events == ["handle", "bind", "start", "wait", "clear"]
+
+
+def test_dp_decode_bench_no_forward_leaves_fill_to_dummy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    events: list[str] = []
+    connector = _make_connector(monkeypatch, events, dp_decode_bench=True)
+
+    connector.no_forward(_scheduler_output(False))
+    assert events == []
+
+    connector.set_disabled(True)
+    dummy_output = _scheduler_output(False)
+    dummy_output.kv_connector_metadata = None
+    connector.pre_forward(dummy_output)
+
+    assert events == ["handle", "bind", "start"]
+
+
+def test_dp_mooncake_no_forward_defers_collectives_to_dummy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    events: list[str] = []
+    connector = _make_connector(monkeypatch, events, dp_mooncake=True)
+    output = _scheduler_output(False)
+    pending = output.kv_connector_metadata
+
+    connector.no_forward(output)
+
+    assert connector._dp_pending_metadata is pending
+    assert events == ["wait", "clear"]
+
+    def poll(_):
+        events.append("poll")
+        return KVConnectorTransferResults()
+
+    connector.kv_connector.get_transfer_results.side_effect = poll
+    dummy_output = _scheduler_output(False)
+    dummy_output.kv_connector_metadata = None
+    connector.pre_forward(dummy_output)
+
+    assert connector._dp_pending_metadata is None
+    connector.kv_connector.bind_connector_metadata.assert_called_once_with(pending)
+    assert events == ["wait", "clear", "handle", "bind", "start", "poll"]
+
+
+def test_dp_mooncake_no_forward_returns_previous_dummy_results(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    events: list[str] = []
+    connector = _make_connector(monkeypatch, events, dp_mooncake=True)
+    connector._dp_transfer_results = KVConnectorTransferResults(
+        failed_recving={"req-1"}
+    )
+
+    output = connector.no_forward(_scheduler_output(False))
+
+    assert output.kv_connector_output is not None
+    assert output.kv_connector_output.failed_recving == {"req-1"}
+    connector.kv_connector.get_transfer_results.assert_not_called()

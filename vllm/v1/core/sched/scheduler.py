@@ -412,10 +412,14 @@ class Scheduler(SchedulerInterface):
         # is called once per scheduled step in FIFO order, so these stay in sync.
         self.sched_step_seq = 0
         self.processed_step_seq = 0
-        # FIFO of (fence_seq, blocks): blocks become safe to free once
-        # processed_step_seq >= fence_seq.
-        self.deferred_frees: deque[tuple[int, list[KVCacheBlock]]] = deque()
-
+        # FIFO of (fence_seq, blocks, mamba_slot, client_index): blocks become
+        # safe to free once processed_step_seq >= fence_seq. The slot is
+        # reported back to the front-end only at that point, so a peer rank can
+        # never be handed a slot this rank's GPU may still be writing.
+        self.deferred_frees: deque[
+            tuple[int, list[KVCacheBlock], int | None, int]
+        ] = deque()
+        self.released_mamba_slots: dict[int, list[int]] = defaultdict(list)
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -1586,7 +1590,7 @@ class Scheduler(SchedulerInterface):
         )
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
-        self._free_request_blocks(request)
+        self._free_request_blocks(request, release_lease=False)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
@@ -2405,6 +2409,18 @@ class Scheduler(SchedulerInterface):
                     )
             finished_req_ids.clear()
 
+        if self.released_mamba_slots:
+            # Return state slots only after their blocks were actually freed
+            # (deferred frees included), never at request-finish time.
+            for client_index, slots in self.released_mamba_slots.items():
+                if (eco := engine_core_outputs.get(client_index)) is not None:
+                    eco.released_mamba_slots = slots
+                else:
+                    engine_core_outputs[client_index] = EngineCoreOutputs(
+                        released_mamba_slots=slots
+                    )
+            self.released_mamba_slots.clear()
+
         if (
             stats := self.make_stats(
                 spec_decoding_stats,
@@ -2628,6 +2644,12 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            if request.mamba_slot is not None:
+                # The front-end granted this request a global state slot along
+                # with the routing decision; bind it before any allocation.
+                self.kv_cache_manager.set_mamba_state_lease(
+                    request.request_id, request.mamba_slot
+                )
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
@@ -2740,6 +2762,9 @@ class Scheduler(SchedulerInterface):
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
             self._free_blocks(request)
+        # A finished request never allocates again; its lease entry can go even
+        # when the block free (and the slot's release report) is deferred.
+        self.kv_cache_manager.clear_mamba_state_lease(request_id)
 
         return kv_xfer_params, ec_xfer_params
 
@@ -2763,16 +2788,30 @@ class Scheduler(SchedulerInterface):
             request.last_sched_seq <= self.processed_step_seq
         )
 
-    def _free_request_blocks(self, request: Request):
+    def _free_request_blocks(self, request: Request, release_lease: bool = True):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
+
+        ``release_lease`` is False for preemption: a preempted request keeps
+        its global state slot and re-allocates from it on resume, so the slot
+        must not return to the front-end's free list.
         """
+        slot = request.mamba_slot if release_lease else None
         if self._request_blocks_can_be_freed(request):
             self.kv_cache_manager.free(request)
+            self._note_mamba_slot_release(slot, request.client_index)
             return
         blocks = self.kv_cache_manager.pop_blocks_for_free(request)
         if blocks:
-            self.deferred_frees.append((self.sched_step_seq, blocks))
+            self.deferred_frees.append(
+                (self.sched_step_seq, blocks, slot, request.client_index)
+            )
+        else:
+            self._note_mamba_slot_release(slot, request.client_index)
+
+    def _note_mamba_slot_release(self, slot: int | None, client_index: int) -> None:
+        if slot is not None:
+            self.released_mamba_slots[client_index].append(slot)
 
     def _free_cow_retained_blocks(
         self, blocks: list[KVCacheBlock], fence_seq: int
@@ -2783,7 +2822,7 @@ class Scheduler(SchedulerInterface):
         if not self.defer_block_free or fence_seq <= self.processed_step_seq:
             self.kv_cache_manager.block_pool.free_blocks(blocks)
             return
-        self.deferred_frees.append((fence_seq, blocks[::-1]))
+        self.deferred_frees.append((fence_seq, blocks[::-1], None, 0))
 
     def _drain_deferred_frees(self):
         """Return deferred blocks whose fence step has completed.
@@ -2793,12 +2832,13 @@ class Scheduler(SchedulerInterface):
         pending one; any satisfied entry behind it is merely freed later.
         """
         while self.deferred_frees:
-            fence, _ = self.deferred_frees[0]
+            fence, _, _, _ = self.deferred_frees[0]
             if fence > self.processed_step_seq:
                 break
-            _, blocks = self.deferred_frees.popleft()
+            _, blocks, slot, client_index = self.deferred_frees.popleft()
             # Free in reverse order so that the tail blocks are evicted first.
             self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+            self._note_mamba_slot_release(slot, client_index)
 
     def get_num_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:

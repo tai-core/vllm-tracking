@@ -32,7 +32,8 @@ def kda_layer_tp_axis(parallel: "ParallelConfig") -> str:
     if size != group_size:
         raise ValueError(
             f"kda_layer_tp ({size}) must equal TP ({tp}) or the complete "
-            f"TP x {axis.upper()} group ({group_size}); partial groups are not implemented"
+            f"TP x {axis.upper()} group ({group_size}); "
+            "partial groups are not implemented"
         )
     if axis == "pcp" and parallel.decode_context_parallel_size != 1:
         raise ValueError("KDA TP over PCP currently requires DCP=1")
@@ -46,7 +47,9 @@ def kda_tp_over_pcp(config: "VllmConfig") -> bool:
 
 
 def kda_tp_over_dp(config: "VllmConfig") -> bool:
-    return kda_layer_tp_axis(getattr(config, "parallel_config", None)) == "dp"
+    parallel = getattr(config, "parallel_config", None)
+    assert parallel is not None
+    return kda_layer_tp_axis(parallel) == "dp"
 
 
 def get_kda_layer_tp(config: "VllmConfig") -> int:
@@ -60,3 +63,55 @@ def get_kda_request_windows(config: "VllmConfig") -> int:
     if kda_tp_over_dp(config):
         return get_kda_layer_tp(config) // config.parallel_config.tensor_parallel_size
     return 1
+
+
+def kda_dp_compact_decode(config: "VllmConfig") -> bool:
+    """Whether to pack KDA-over-DP rows for device-masked BF16 GEMMs."""
+    return kda_tp_over_dp(config) and bool(
+        getattr(config.parallel_config, "kda_dp_compact_decode", False)
+    )
+
+
+def kda_mamba_shared_pool(config: "VllmConfig") -> bool:
+    """Whether Mamba state block ids are global across the KDA DP group."""
+    return kda_tp_over_dp(config) and bool(
+        getattr(config.parallel_config, "kda_mamba_shared_pool", False)
+    )
+
+
+def get_kda_mamba_global_num_seqs(config: "VllmConfig") -> int:
+    """Requests the shared state pool holds across the whole KDA group."""
+    explicit = getattr(config.parallel_config, "kda_mamba_global_num_seqs", None)
+    if explicit is not None:
+        return explicit
+    return config.scheduler_config.max_num_seqs * get_kda_request_windows(config)
+
+
+def kda_mamba_admission_leases(config: "VllmConfig") -> bool:
+    """Whether the front-end hands out state slots at admission time.
+
+    A global bound below the static per-rank ranges only works if slots are
+    assigned per request instead of partitioned per rank.
+    """
+    return kda_mamba_shared_pool(config) and (
+        get_kda_mamba_global_num_seqs(config)
+        < config.scheduler_config.max_num_seqs * get_kda_request_windows(config)
+    )
+
+
+def get_kda_mamba_lease(
+    config: "VllmConfig", blocks_per_request: int
+) -> tuple[int, int] | None:
+    """This rank's static slice of the shared pool, as ``(start, num_blocks)``.
+
+    Block 0 is the pool-wide null block, so leases start at 1. Static leases
+    cover ``max_num_seqs`` requests per rank, which is what the per-rank windows
+    used to provide. Returns None in admission-lease mode, where the front-end
+    assigns slots per request and no static range exists.
+    """
+    if kda_mamba_admission_leases(config):
+        return None
+    parallel = config.parallel_config
+    lease = config.scheduler_config.max_num_seqs * blocks_per_request
+    rank = getattr(parallel, "data_parallel_rank", 0)
+    return 1 + rank * lease, lease

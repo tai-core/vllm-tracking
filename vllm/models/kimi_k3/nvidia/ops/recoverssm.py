@@ -3,7 +3,7 @@
 """KDA verification records and accepted-state recovery."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -729,6 +729,10 @@ class KDARecoverSSMCommitContext:
     boundary_state_indices: torch.Tensor
     boundary_recovery_lens: torch.Tensor
     spec_query_len: int
+    _dp_last_commit: Any | None = field(default=None, init=False, repr=False)
+    _dp_local_accepted: torch.Tensor | None = field(
+        default=None, init=False, repr=False
+    )
 
     @classmethod
     def create(
