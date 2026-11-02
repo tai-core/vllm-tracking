@@ -20,6 +20,7 @@ from vllm.v1.worker.utils import allocate_kv_cache
 @dataclass
 class Metadata:
     block_table: torch.Tensor
+    seq_lens: torch.Tensor
 
 
 class Group:
@@ -30,6 +31,117 @@ class Group:
         output = [torch.empty_like(tensor) for _ in range(self.world_size)]
         dist.all_gather(output, tensor)
         return torch.cat(output, dim=dim)
+
+
+def check_compose_alignment(group, device):
+    """Compare native plane packing and owner writes with a CPU byte reference."""
+    from vllm_musa.distributed.device_communicators.pcp_native_pages import PCPNativeIPC
+
+    rank, size = group.rank_in_group, group.world_size
+    # Vector records, split FP32 scales, odd pages, and unaligned byte records.
+    for rows, row_bytes, head_bytes, staging_stride, offset in (
+        (64, 656, 656, 656, 0),
+        (64, 132, 128, 656, 0),
+        (3, 132, 128, 656, 0),
+        (5, 20, 16, 20, 4),
+        (3, 15, 11, 17, 1),
+    ):
+        page_bytes = rows * row_bytes
+        stride = 2 * page_bytes
+        root = torch.full(
+            (4 * stride + offset,), rank + 11, dtype=torch.uint8, device=device
+        )
+        reader = PCPNativeIPC(root, group)
+        try:
+            reader.register_current_staging(2, staging_stride)
+            owners = torch.tensor([0, 1, -1], dtype=torch.int64)
+            pages = torch.tensor([1, 2, 0], dtype=torch.int64)
+            sources = torch.full((3, rows), -1, dtype=torch.int64)
+            sources[0, 0] = (size - 1) * 2 + 1
+            sources[1, -1] = 0
+            output = torch.empty((3, page_bytes), dtype=torch.uint8, device=device)
+            gpu_owners, gpu_pages, gpu_sources = [
+                tensor.to(device) for tensor in (owners, pages, sources)
+            ]
+            for generation in range(2):
+                encoded = (
+                    torch.arange(2 * staging_stride).reshape(2, staging_stride)
+                    + rank * 17
+                    + generation
+                ).to(torch.uint8)
+                reader.current_staging.root[0].copy_(encoded)
+                root.fill_(rank + 11)
+                expected = torch.stack(
+                    [
+                        torch.full(
+                            (page_bytes,),
+                            owner + 11 if owner >= 0 else 0,
+                            dtype=torch.uint8,
+                        )
+                        for owner in owners.tolist()
+                    ]
+                )
+                persistent = root.cpu()
+                for page, row in ((0, 0), (1, rows - 1)):
+                    source = sources[page, row].item()
+                    record = (
+                        torch.arange(row_bytes)
+                        + (source % 2) * staging_stride
+                        + (source // 2) * 17
+                        + generation
+                    ).to(torch.uint8)
+                    head = slice(row * head_bytes, (row + 1) * head_bytes)
+                    tail_start = rows * head_bytes + row * (row_bytes - head_bytes)
+                    tail = slice(tail_start, tail_start + row_bytes - head_bytes)
+                    expected[page, head] = record[:head_bytes]
+                    expected[page, tail] = record[head_bytes:]
+                    if owners[page] == rank:
+                        start = offset + pages[page].item() * stride
+                        persistent[start : start + page_bytes] = expected[page]
+                reader.module.pcp_compose_current_launch(
+                    reader.pointers,
+                    reader.current_staging.pointers,
+                    reader.signal_pointers,
+                    gpu_owners,
+                    gpu_pages,
+                    gpu_sources,
+                    output,
+                    rank,
+                    size,
+                    page_bytes,
+                    stride,
+                    offset,
+                    rows,
+                    row_bytes,
+                    head_bytes,
+                    2,
+                    staging_stride,
+                )
+                torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+                torch.testing.assert_close(root.cpu(), persistent, rtol=0, atol=0)
+            # Empty selections still participate in the publication/reuse barrier.
+            reader.module.pcp_compose_current_launch(
+                reader.pointers,
+                reader.current_staging.pointers,
+                reader.signal_pointers,
+                gpu_owners[:0],
+                gpu_pages[:0],
+                gpu_sources[:0],
+                output[:0],
+                rank,
+                size,
+                page_bytes,
+                stride,
+                offset,
+                rows,
+                row_bytes,
+                head_bytes,
+                2,
+                staging_stride,
+            )
+            torch.testing.assert_close(root.cpu(), persistent, rtol=0, atol=0)
+        finally:
+            reader.close()
 
 
 def run_rank(rank, size, rendezvous, device_kind):
@@ -90,7 +202,9 @@ def run_rank(rank, size, rendezvous, device_kind):
             maintenance.storage[physical_id].fill_(logical_id * 7)
         source_table = torch.tensor([[rank + 1]], dtype=torch.int32, device=device)
         for layer in layers.values():
-            dense, metadata = layer.pcp_pages.materialize(Metadata(source_table))
+            dense, metadata = layer.pcp_pages.materialize(
+                Metadata(source_table, source_table.new_full((1,), 16))
+            )
             assert dense.shape[0] == size
             assert metadata.block_table.item() == rank
             for page in range(size):
@@ -115,7 +229,7 @@ def run_rank(rank, size, rendezvous, device_kind):
         width = (slots.numel() + size - 1) // size
         row = torch.arange(slots.numel(), device=device)
         sources = (row % size) * width + row // size
-        metadata = Metadata(ids[None].to(torch.int32))
+        metadata = Metadata(ids[None].to(torch.int32), ids.new_tensor([48]))
         for head_bytes in (32, 28):
             with override_forward_context(SimpleNamespace()):
                 for layer_id, layer in enumerate(layers.values()):
@@ -209,7 +323,10 @@ def run_rank(rank, size, rendezvous, device_kind):
             packed = direct
             store = PCPNativePages(raw, size * 2, group, max_materialize_pages=size * 2)
             store.ipc_reader = reader
-            metadata = Metadata(torch.tensor([[1]], dtype=torch.int32, device=device))
+            metadata = Metadata(
+                torch.tensor([[1]], dtype=torch.int32, device=device),
+                torch.tensor([64], device=device),
+            )
             with override_forward_context(SimpleNamespace()):
                 store.compose_current(
                     metadata,
@@ -222,6 +339,8 @@ def run_rank(rank, size, rendezvous, device_kind):
                 torch.testing.assert_close(result, reference[1:2], rtol=0, atol=0)
                 persisted = store.materialize_ids(torch.tensor([1], device=device))
                 torch.testing.assert_close(persisted, reference[1:2], rtol=0, atol=0)
+        if device_kind == "musa":
+            check_compose_alignment(group, device)
         if rank == 0:
             print(
                 "PASS: native allocation, COW, current staging, fused owner writes; "
