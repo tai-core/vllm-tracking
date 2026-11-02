@@ -1,5 +1,10 @@
 # Cache critical-path optimization
 
+Update: the original 15 RPS baseline was reproduced after rebuilding the test
+environment and Host L2 on 2026-11-02. See the clean-environment replay below;
+the later 11 RPS candidate result remains a historical run in the degraded
+environment and has not been requalified against this recovered baseline.
+
 The changes remove idle Core model RPCs, reuse Indexer metadata within a batch,
 and bypass MLA replicated-row filtering for pure Prefill. Stream restore stays
 enabled. The model-service runs use the original node07 weights daemon, CP8+EP8, GPU L1,
@@ -161,3 +166,49 @@ Raw artifacts are retained in the shared BW1000 workspace under
 `experiments/cache-free-meal-mla-20261101/`. These are workspace paths, not files
 in this repository. The final summary is
 `experiments/cache-free-meal-mla-20261101/qualification-summary.json`.
+
+## Clean-environment replay (2026-11-02)
+
+The original product snapshot reproduced its previous 15 RPS result after the
+user-authorized test-environment cleanup. The original node07 weights daemon
+(PID 383180, started 2026-10-25T16:34:29.147352108Z) remained running. Twelve retired
+PCP/Prefill containers were removed, the old L2 owner and its eight servers were
+stopped, and an empty 582 GiB L2 was recreated at `/runstate/l2clean20261102` using
+the same L2 product source. Source, model, native/JIT dependencies and historical
+artifacts were retained. Node08 was untouched.
+
+The model used the original `client-lmcache-cachefreecore20261101` snapshot,
+manifest `b39a89ba909a7158ef0594d72ad239a26d42e5bbfb604bb68c5a2d56fbc07572`.
+The original 64 prefixes were regenerated from empty L2 and verified on all eight
+shards. CP8+EP8, GPU L1, stream restore, 3561888728 KV bytes/rank and the 8192-token
+batch cap stayed unchanged. AIPerf ran the original 14/15 RPS Poisson windows,
+300 seconds plus 15 seconds warmup each, without profiling.
+
+| Point | Original | Clean replay |
+|---|---:|---:|
+|14 RPS: logical TPS|124622.483|124419.353|
+|14 RPS: TTFT P90|2.840583s|2.608783s|
+|15 RPS: actual arrivals/s|14.637916|14.634639|
+|15 RPS: completions/s|14.677047|14.647732|
+|15 RPS: logical TPS|133590.478|133323.659|
+|15 RPS: logical TPM|8015428.707|7999419.521|
+|15 RPS: TTFT P90|6.335650s|6.197620s|
+|15 RPS: successful requests|4725/4725|4725/4725|
+
+Both replay points passed the original SLA/queue qualification; waiting,
+capacity and deferred queues did not show sustained growth. Every response at
+both points reported 9102 input tokens and 8192 cached tokens (90.002197%). At 15
+RPS, GPU L1/Host L2 accounted for 25.619673%/64.382524% of input tokens, compared
+with 25.105375%/64.896822% originally. The total cache-hit rate did not change.
+
+This restores the original finite-window baseline with a 0.20% throughput
+difference and no new product optimization. It does not isolate which retained
+runtime resource caused the earlier slowdown. The later Indexer/MLA candidate
+must be compared again in a matched clean environment; its degraded-run 11 RPS
+result is not a current capacity ceiling. No new cold peak or 180k TPS claim is
+made. Test API/FakeD processes were cleaned; the original daemon and new L2
+remain available.
+
+Workspace artifacts: `experiments/clean15-environment-20261102/comparison.json`
+and `REPORT.md`; raw outputs under `experiments/clean15-replay-20261102/output/`.
+These paths refer to the shared BW1000 workspace, not this repository.
