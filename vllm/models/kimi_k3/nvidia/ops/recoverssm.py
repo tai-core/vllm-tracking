@@ -447,6 +447,7 @@ def _commit_kda_state_kernel(
     BV: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     ALIGN_MODE: tl.constexpr,
+    EVEN_SHAPE: tl.constexpr,
 ):
     pid_v = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -504,7 +505,10 @@ def _commit_kda_state_kernel(
         + offs_v[:, None] * stride_state_v
         + offs_k[None, :] * stride_state_k
     )
-    initial_state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
+    if EVEN_SHAPE:
+        initial_state = tl.load(state_ptrs).to(tl.float32)
+    else:
+        initial_state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
     state = initial_state
     boundary_state = initial_state
     for token_offset in range(commit_len):
@@ -512,21 +516,28 @@ def _commit_kda_state_kernel(
             correction_cache_ptr + token_offset * stride_correction_cache_pos
         )
         kg_ptr = kg_cache_ptr + token_offset * stride_kg_cache_pos
-        normalized_k = tl.load(
-            kg_ptr + offs_k * stride_kg_cache_dim,
-            mask=mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        correction = tl.load(
-            correction_ptr + offs_v * stride_correction_cache_dim,
-            mask=mask_v,
-            other=0.0,
-        ).to(tl.float32)
-        decay = tl.load(
-            kg_ptr + (K + offs_k) * stride_kg_cache_dim,
-            mask=mask_k,
-            other=0.0,
-        ).to(tl.float32)
+        if EVEN_SHAPE:
+            normalized_k = tl.load(kg_ptr + offs_k * stride_kg_cache_dim).to(tl.float32)
+            correction = tl.load(
+                correction_ptr + offs_v * stride_correction_cache_dim
+            ).to(tl.float32)
+            decay = tl.load(kg_ptr + (K + offs_k) * stride_kg_cache_dim).to(tl.float32)
+        else:
+            normalized_k = tl.load(
+                kg_ptr + offs_k * stride_kg_cache_dim,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            correction = tl.load(
+                correction_ptr + offs_v * stride_correction_cache_dim,
+                mask=mask_v,
+                other=0.0,
+            ).to(tl.float32)
+            decay = tl.load(
+                kg_ptr + (K + offs_k) * stride_kg_cache_dim,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
         # Preserve the verify operation order using its exact fp32 factors.
         state *= decay[None, :]
         state += correction[:, None] * normalized_k[None, :]
@@ -543,11 +554,18 @@ def _commit_kda_state_kernel(
             + offs_v[:, None] * stride_state_v
             + offs_k[None, :] * stride_state_k
         )
-        tl.store(
-            boundary_ptrs,
-            boundary_state,
-            mask=mask_state & (boundary_state_idx > null_block_id),
-        )
+        if EVEN_SHAPE:
+            tl.store(
+                boundary_ptrs,
+                boundary_state,
+                mask=boundary_state_idx > null_block_id,
+            )
+        else:
+            tl.store(
+                boundary_ptrs,
+                boundary_state,
+                mask=mask_state & (boundary_state_idx > null_block_id),
+            )
 
     final_ptrs = (
         state_ptr
@@ -556,7 +574,10 @@ def _commit_kda_state_kernel(
         + offs_v[:, None] * stride_state_v
         + offs_k[None, :] * stride_state_k
     )
-    tl.store(final_ptrs, state, mask=mask_state)
+    if EVEN_SHAPE:
+        tl.store(final_ptrs, state)
+    else:
+        tl.store(final_ptrs, state, mask=mask_state)
 
 
 def kda_recoverssm_verify(
@@ -975,7 +996,7 @@ class KDARecoverSSMCommitContext:
         state_ref = self.checkpoints[0]
         _, num_heads, value_dim, key_dim = state_ref.shape
         block_k = triton.next_power_of_2(key_dim)
-        block_v = min(triton.next_power_of_2(value_dim), 32)
+        block_v = min(triton.next_power_of_2(value_dim), 8)
         grid = (
             triton.cdiv(value_dim, block_v),
             batch,
@@ -1013,7 +1034,8 @@ class KDARecoverSSMCommitContext:
             BV=block_v,
             NUM_HEADS=num_heads,
             ALIGN_MODE=block_table is not None,
-            num_warps=4,
+            EVEN_SHAPE=(key_dim == block_k and value_dim % block_v == 0),
+            num_warps=2,
             num_stages=2,
         )
 

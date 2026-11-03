@@ -495,6 +495,7 @@ def invoke_moe_batched_triton_kernel(
 
     use_td = (
         use_tensor_descriptor()
+        and not current_platform.is_musa()
         and A.stride(2) == 1
         and B.stride(2) == 1
         and (K * A.element_size()) % 16 == 0
@@ -505,6 +506,9 @@ def invoke_moe_batched_triton_kernel(
     if use_td:
         set_triton_allocator(A.device)
 
+    launch_options = {
+        key: config[key] for key in ("num_warps", "num_stages") if key in config
+    }
     batched_triton_kernel[grid](
         A,
         B,
@@ -547,6 +551,7 @@ def invoke_moe_batched_triton_kernel(
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
         USE_TD=use_td,
+        **launch_options,
     )
 
 
