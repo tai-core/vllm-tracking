@@ -566,6 +566,101 @@ def silu_mul_per_token_group_quant_fp8_colmajor(
 
 
 @triton.jit
+def _silu_mul_per_token_group_quant_fp8_rowmajor(
+    y_ptr,
+    y_q_ptr,
+    y_s_ptr,
+    eps,
+    clamp_limit,
+    alpha,
+    beta,
+    fp8_min: tl.constexpr,
+    fp8_max: tl.constexpr,
+    N: tl.constexpr,
+    HAS_CLAMP: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    groups_per_row: tl.constexpr = (N // 2) // GROUP_SIZE
+    row = (pid // groups_per_row).to(tl.int64)
+    group = pid % groups_per_row
+    offsets = group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+
+    act_in = tl.load(y_ptr + row * N + offsets)
+    mul_in = tl.load(y_ptr + row * N + N // 2 + offsets)
+    if HAS_CLAMP:
+        act_in = tl.minimum(act_in.to(tl.float32), clamp_limit).to(
+            y_ptr.dtype.element_ty
+        )
+        mul_in = tl.clamp(mul_in.to(tl.float32), -clamp_limit, clamp_limit).to(
+            y_ptr.dtype.element_ty
+        )
+
+    act_in = act_in.to(tl.float32)
+    glu = (act_in / (1.0 + tl.exp(-act_in * alpha))).to(y_ptr.dtype.element_ty)
+    up = (mul_in.to(tl.float32) + beta).to(y_ptr.dtype.element_ty)
+    y = (glu * up).to(tl.float32)
+
+    absmax = tl.maximum(tl.max(tl.abs(y), axis=0), eps)
+    scale = absmax * (1.0 / fp8_max)
+    y_q = tl.clamp(y / scale, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    tl.store(y_q_ptr + row * (N // 2) + offsets, y_q)
+    tl.store(y_s_ptr + row * groups_per_row + group, scale)
+
+
+def silu_mul_per_token_group_quant_fp8_rowmajor(
+    input: torch.Tensor,
+    output: torch.Tensor | None = None,
+    eps: float = 1e-10,
+    clamp_limit: float | None = None,
+    group_size: int = 128,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gated activation and FP8 quantization with row-major scales.
+
+    Unlike the DeepGEMM col-major variant, this accepts any row count and
+    preserves the C++ activation kernel's intermediate dtype rounding.
+    """
+    assert input.ndim == 2 and input.is_contiguous()
+    assert input.size(1) % (group_size * 2) == 0
+    assert group_size == 128
+
+    M, N = input.size()
+    output_width = N // 2
+    fp8_dtype = current_platform.fp8_dtype()
+    if output is None:
+        output = torch.empty((M, output_width), dtype=fp8_dtype, device=input.device)
+    else:
+        assert output.shape == (M, output_width) and output.is_contiguous()
+    output_scales = torch.empty(
+        (M, output_width // group_size), dtype=torch.float32, device=input.device
+    )
+
+    finfo = torch.finfo(fp8_dtype)
+    fp8_min = -224.0 if current_platform.is_fp8_fnuz() else finfo.min
+    fp8_max = 224.0 if current_platform.is_fp8_fnuz() else finfo.max
+    has_clamp = clamp_limit is not None
+    _silu_mul_per_token_group_quant_fp8_rowmajor[(M * (output_width // group_size),)](
+        input,
+        output,
+        output_scales,
+        eps,
+        clamp_limit if has_clamp else 0.0,
+        alpha,
+        beta,
+        fp8_min,
+        fp8_max,
+        N=N,
+        HAS_CLAMP=has_clamp,
+        GROUP_SIZE=group_size,
+        num_warps=4,
+        num_stages=2,
+    )
+    return output, output_scales
+
+
+@triton.jit
 def _per_token_group_quant_fp8_colmajor(
     # Pointers to inputs and output
     y_ptr,

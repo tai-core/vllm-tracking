@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 from vllm.model_executor.custom_op import CustomOp
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import RCP_LN2, cdiv, next_power_of_2
 
@@ -526,6 +527,18 @@ class FusedRMSNormGated(CustomOp):
             prenorm=prenorm,
             residual_in_fp32=residual_in_fp32,
         )
+
+    def forward_oot(
+        self,
+        x: torch.Tensor,
+        g: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        prenorm: bool = False,
+        residual_in_fp32: bool = False,
+    ) -> torch.Tensor:
+        if current_platform.is_musa():
+            return self.forward_cuda(x, g, residual, prenorm, residual_in_fp32)
+        return self.forward_native(x, g, residual, prenorm, residual_in_fp32)
 
     def forward_xpu(
         self,

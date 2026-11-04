@@ -37,6 +37,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     is_deep_gemm_e8m0_used,
+    silu_mul_per_token_group_quant_fp8_rowmajor,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     FP8_DTYPE,
@@ -496,24 +497,32 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
 
         a2q_scale: torch.Tensor | None = None
 
-        # Fuse SiLU+Mul + FP8 block quantize into a single kernel
-        # when conditions permit (gated SiLU, fp8 block quant with
-        # group_size=128, no LoRA requiring the BF16 intermediate).
-        # The fused kernel has no clamp parameter, so a configured
-        # SwiGLU clamp limit falls through to the unfused path.
+        # Fuse SiLU+Mul + FP8 block quantize when the backend and activation
+        # contract permit it. MUSA also has a general-M row-major variant that
+        # supports the configured SwiGLU clamp.
         if (
             activation == MoEActivation.SILU
-            and self.activation_config.clamp_limit is None
+            and (
+                self.activation_config.clamp_limit is None or current_platform.is_musa()
+            )
             and self.quant_config.use_fp8_w8a8
             and self.block_shape == [128, 128]
             and lora_context is None
             and not is_deep_gemm_e8m0_used()
         ):
-            qintermediate_cache2, a2q_scale = ops.silu_and_mul_per_block_quant(
-                intermediate_cache1.view(-1, N),
-                group_size=128,
-                quant_dtype=current_platform.fp8_dtype(),
-            )
+            if self.activation_config.clamp_limit is None:
+                qintermediate_cache2, a2q_scale = ops.silu_and_mul_per_block_quant(
+                    intermediate_cache1.view(-1, N),
+                    group_size=128,
+                    quant_dtype=current_platform.fp8_dtype(),
+                )
+            else:
+                qintermediate_cache2, a2q_scale = (
+                    silu_mul_per_token_group_quant_fp8_rowmajor(
+                        intermediate_cache1.view(-1, N),
+                        clamp_limit=self.activation_config.clamp_limit,
+                    )
+                )
         else:
             self.activation(
                 activation, intermediate_cache2, intermediate_cache1.view(-1, N)

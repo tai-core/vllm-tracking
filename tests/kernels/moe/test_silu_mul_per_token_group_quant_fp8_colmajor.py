@@ -6,7 +6,9 @@ import torch
 
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _per_token_group_quant_fp8_colmajor,
+    per_token_group_quant_fp8,
     silu_mul_per_token_group_quant_fp8_colmajor,
+    silu_mul_per_token_group_quant_fp8_rowmajor,
     silu_mul_quant_fp8_packed_triton,
 )
 from vllm.platforms import current_platform
@@ -221,6 +223,48 @@ def test_silu_mul_fp8_quant_deep_gemm_clamp(T: int, N: int, clamp_limit: float):
 
     # Reference
     ref_output, ref_output_scales = reference_with_clamp(input, use_ue8m0, clamp_limit)
+
+    torch.testing.assert_close(output.to(torch.float32), ref_output.to(torch.float32))
+    torch.testing.assert_close(output_scales, ref_output_scales)
+
+
+def reference_rowmajor(
+    x: torch.Tensor, clamp_limit: float | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ref_act = torch.empty(
+        (x.size(0), x.size(1) // 2), dtype=torch.bfloat16, device=x.device
+    )
+    if clamp_limit is None:
+        torch.ops._C.silu_and_mul(ref_act, x)
+    else:
+        torch.ops._C.silu_and_mul_with_clamp(ref_act, x, clamp_limit, 1.0, 0.0)
+    return per_token_group_quant_fp8(
+        ref_act,
+        GROUP_SIZE,
+        eps=1e-10,
+        dtype=FLOAT8_DTYPE,
+        use_ue8m0=False,
+    )
+
+
+@pytest.mark.parametrize("T", [1, 7, 48, 192, 383])
+@pytest.mark.parametrize("N", [128 * 2, 256 * 2, 768 * 2])
+@pytest.mark.parametrize("clamp_limit", [None, 10.0])
+@pytest.mark.skipif(
+    current_platform.is_rocm(),
+    reason="ROCm does not support DeepGemm.",
+)
+def test_silu_mul_fp8_quant_rowmajor_general_m(T: int, N: int, clamp_limit):
+    set_random_seed(42)
+    input = torch.randn((T, N), dtype=torch.bfloat16, device=DEVICE) * 8.0
+    if T > 1:
+        input[0].zero_()
+        input[1] = torch.linspace(-20, 20, N, device=DEVICE).bfloat16()
+
+    output, output_scales = silu_mul_per_token_group_quant_fp8_rowmajor(
+        input, clamp_limit=clamp_limit
+    )
+    ref_output, ref_output_scales = reference_rowmajor(input, clamp_limit)
 
     torch.testing.assert_close(output.to(torch.float32), ref_output.to(torch.float32))
     torch.testing.assert_close(output_scales, ref_output_scales)
